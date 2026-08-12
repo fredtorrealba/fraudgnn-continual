@@ -1,0 +1,51 @@
+# =============================================================================
+# FraudGNN — qué NO va al repositorio
+# =============================================================================
+
+# --- Credenciales: NUNCA se versionan ---------------------------------------
+# El dataset se baja con las credenciales de cada usuario (ver README §2).
+kaggle.json
+.kaggle/
+access_token
+.env
+*.pem
+*.key
+
+# --- Datos y artefactos: se regeneran corriendo el pipeline ------------------
+data/raw/*
+data/processed/*
+data/graph/*
+models/*
+artifacts/*
+reports/*
+# ...pero se conserva la estructura de carpetas y los resultados archivados
+!**/.gitkeep
+!reports/smoke_synthetic/
+!reports/smoke_synthetic/**
+
+# --- Entornos virtuales ------------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+
+# --- Python ------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# --- Logs de corridas y temporales de escritura atómica ----------------------
+*.log
+*.tmp
+
+# --- Caché de herramientas ---------------------------------------------------
+scripts/.vis-network.min.js
+
+# --- Sistema operativo / editores --------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
