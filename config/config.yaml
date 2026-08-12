@@ -1,0 +1,126 @@
+# =============================================================================
+# FraudGNN — Configuración central
+# Capstone MIA UAI — Freddy Torrealba (Grupo 18)
+# Todos los hiperparámetros del sistema viven acá. Los scripts leen este
+# archivo, así que cualquier ajuste (mezcla 40/60, LRs, umbrales del gatillo)
+# se hace en un solo lugar.
+# =============================================================================
+
+paths:
+  raw_dir: "data/raw"              # train_transaction.csv + train_identity.csv (IEEE-CIS)
+  processed_dir: "data/processed"  # parquet procesados + splits temporales
+  graph_dir: "data/graph"          # grafo PyG serializado (.pt)
+  models_dir: "models"             # checkpoints de modelos
+  artifacts_dir: "artifacts"       # buffer, control set, logs de ciclos CL
+  reports_dir: "reports"           # métricas, comparaciones, gráficos
+
+kaggle:
+  # Descarga del dataset. OJO: este archivo SE VERSIONA — el token NUNCA va acá.
+  # `token_env` y `token_file` dicen DÓNDE buscar la credencial, no cuál es.
+  # El script src/data/download_ieee_cis.py la busca en este orden:
+  #   1. KAGGLE_USERNAME + KAGGLE_KEY   (recomendado: NO expira)
+  #   2. variable de entorno token_env  (token de `kaggle auth login`, expira en horas)
+  #   3. archivo .env en la raíz        (no versionado, ver .env.example)
+  #   4. token_file o ~/.kaggle/kaggle.json ya instalados
+  # Si encuentra el token por entorno o .env y no está instalado, lo escribe en
+  # token_file con permisos 600 automáticamente.
+  competition: "ieee-fraud-detection"
+  token_env: "KAGGLE_API_TOKEN"        # el nombre que lee el SDK de Kaggle
+  token_file: "~/.kaggle/access_token"
+  # Solo estos dos archivos: el test de Kaggle no trae etiquetas, así que los
+  # 6 "meses" del split temporal se cortan dentro de train_transaction.csv.
+  files: ["train_transaction.csv", "train_identity.csv"]
+  files_extra: ["test_transaction.csv", "test_identity.csv", "sample_submission.csv"]
+
+data:
+  # División temporal estricta (walk-forward, sin data leakage)
+  # TransactionDT es segundos desde un t0 de referencia -> mes = DT // (86400*30)
+  seconds_per_month: 2592000       # 86400 * 30
+  train_months: [1, 2, 3, 4]       # entrenamiento original (~470K txn)
+  val_month: 5                     # validación
+  test_month: 6                    # test -> se divide en semanas ("futuro que llega")
+  test_weeks: 4                    # el mes 6 se trata como 4 semanas de operación
+
+graph:
+  # Nodos = transacciones, aristas = entidades compartidas
+  edge_entities:                   # columnas que definen "misma entidad"
+    card: ["card1", "card2", "card3", "card5", "addr1"]  # huella de tarjeta
+    email: ["P_emaildomain"]
+    device: ["DeviceInfo", "id_30", "id_31"]             # huella de dispositivo
+  window_days: 30                  # ventana temporal para conectar
+  max_edges_per_node: 50           # tope anti-hub
+
+gnn:
+  in_dim: 432                      # features por transacción
+  hidden_dims: [256, 128, 64]      # 3 capas GNN: 432 -> 256 -> 128 -> 64
+  mlp_head_dim: 32                 # cabeza clasificadora 64 -> 32 -> 1
+  dropout: 0.3
+  fanouts: [15, 10, 5]             # neighbor sampling por capa (~750 nodos/subgrafo)
+  batch_size: 1024
+  lr: 0.001
+  epochs: 30
+  patience: 5                      # early stopping sobre AUC de validación
+  log_every: 50                    # avance dentro de la época cada N batches (0 = callado)
+  seeds: [42, 123, 2026]           # 3 corridas para la comparación GraphSAGE vs GAT
+  gat_heads: 4
+  threshold: 0.5                   # umbral de alerta P(fraude) >= 0.5
+  kpi_auc: 0.93                    # KPI OE2: AUC-ROC > 0.93
+
+xgboost:
+  # Baseline CONGELADO: entrenado solo meses 1-4, nunca se reentrena
+  smote:
+    sampling_strategy: 0.5         # fraudes sintéticos hasta ratio 1:2 (solo en TRAIN)
+    k_neighbors: 5
+  optuna_trials: 30                # búsqueda bayesiana de hiperparámetros
+  early_stopping_rounds: 50
+
+continual_learning:
+  trigger:
+    score_threshold: 0.5           # fraude confirmado con score < 0.5 = patrón nuevo
+    min_cases: 50                  # disparo por conteo
+    miss_rate: 0.30                # o disparo por tasa (>30% de fraudes no detectados)
+  split:
+    adaptation: 0.70               # entrena (luego va al buffer)
+    verification: 0.30             # NUNCA entrena (luego va al control)
+  replay_buffer:
+    size: 10000
+    class_balance: 0.5             # 50/50 fraude-legítima por selección real (sin SMOTE)
+    frontier_range: [0.4, 0.7]     # casos frontera: los más fáciles de olvidar
+    historical_floor: 0.60         # piso de base histórica al actualizar
+    max_intake_per_pattern: 800    # patrones grandes se samplean
+  control_set:
+    size: 5000
+    max_intake_per_pattern: 200
+  finetune:
+    mix_new: 0.40                  # 40% casos nuevos por batch
+    mix_buffer: 0.60               # 60% replay buffer
+    batch_size: 64
+    epochs: 8                      # 5-10 épocas -> minutos, no horas
+    # LR diferenciado: el drift mueve la FRONTERA, no la estructura
+    lr_layer1: 0.0                 # congelada (representaciones estructurales)
+    lr_layer2: 0.00001             # 1e-5
+    lr_layer3: 0.0001              # 1e-4
+    lr_classifier: 0.001           # 1e-3
+  validation:
+    recall_verification_min: 0.70  # ¿aprendió? KPI >= 70%
+    control_max_drop: 0.02         # ¿olvidó? caída máxima tolerada en control
+    max_hours: 48                  # KPI ciclo completo < 48h
+    max_retries: 3                 # reintentos con el dial estabilidad-plasticidad
+  # Dial estabilidad-plasticidad (ajustes por reintento)
+  dial:
+    stability:                     # falló recall histórico (olvidó)
+      mix_new: 0.30
+      lr_scale: 0.5
+      freeze_layer3: true
+      epochs: 5
+    plasticity:                    # falló recall nuevo (no aprendió)
+      mix_new: 0.50
+      lr_scale: 2.0
+      unfreeze_layer2: true
+      epochs: 12
+
+comparison:
+  # OE4: GNN+CL vs XGBoost congelado sobre el mes 6, mismo threshold
+  kpi_recall_gap: 0.20             # recall >= 20% superior sobre patrones emergentes
+  avg_fraud_amount_usd: 120        # para impacto económico (ajustable al dataset real)
+

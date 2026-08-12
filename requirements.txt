@@ -1,0 +1,26 @@
+# Núcleo
+numpy>=1.26
+pandas>=2.1
+pyarrow>=14.0
+pyyaml>=6.0
+scikit-learn>=1.4
+
+# Grafos / Deep Learning
+# torch se instala aparte (CPU, CUDA o Apple Silicon según la máquina):
+#   Linux CPU : pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   Linux CUDA: ver https://pytorch.org/get-started/locally/
+#   macOS     : pip install torch   (la rueda de PyPI ya trae soporte MPS)
+torch>=2.2
+torch-geometric>=2.5
+
+# Baseline tabular
+# En macOS, XGBoost necesita el runtime de OpenMP:  brew install libomp
+xgboost>=2.0
+imbalanced-learn>=0.12
+optuna>=3.5
+
+# Visualización (scripts/plot_embeddings.py)
+matplotlib>=3.8
+
+# Dataset (opcional, para descarga automática)
+kaggle>=1.6
