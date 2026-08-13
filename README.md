@@ -166,13 +166,16 @@ más lento.
 
 ```bash
 tmux new -s fraudgnn             # que no muera al cerrar el SSH
-bash scripts/run_pipeline.sh 2>&1 | tee pipeline.log
+bash scripts/run_pipeline.sh
 ```
 
-Ctrl-B luego D para salir dejándolo corriendo. Desde otra terminal:
+Ctrl-B luego D para salir dejándolo corriendo; `tmux attach -t fraudgnn` para
+volver. **Si se cae el SSH, el proceso sigue** — solo se cae tu terminal.
+
+Desde otra terminal:
 
 ```bash
-tail -f pipeline.log
+tail -f pipeline.log             # el log se escribe SOLO, sin tee
 watch -n 2 nvidia-smi            # si GPU-Util < 50%, el cuello es el sampler
 ```
 
@@ -193,7 +196,7 @@ sin vuelta atrás.
 ```bash
 pip install -r requirements.txt        # macOS: brew install libomp (XGBoost)
 cp .env.example .env && nano .env      # KAGGLE_USERNAME / KAGGLE_KEY
-bash scripts/run_pipeline.sh
+bash scripts/run_pipeline.sh          # el log queda en pipeline.log
 ```
 
 Sin GPU funciona, pero el paso `gnn` se va a días: en CPU una época de GAT sobre
@@ -226,6 +229,31 @@ bash scripts/run_pipeline.sh --only gnn --force   # rehacer lo seleccionado
 
 `--force` no elige etapas: **fuerza las que dejen `--only`/`--skip`/`--from`**.
 Borra sus salidas antes de relanzarlas.
+
+---
+
+## El log
+
+Toda corrida escribe en **`pipeline.log`** en la raíz del proyecto, sin que haya
+que acordarse del `| tee`. Se **anexa**, nunca se pisa: como el pipeline es
+reanudable, una corrida puede continuar a otra y conviene conservar el hilo.
+Cada arranque queda separado por una cabecera con la fecha y los argumentos.
+
+Las consultas (`--status`, `--steps`, `--history`, `--archive`) no escriben nada:
+no ejecutan un entrenamiento.
+
+```bash
+tail -f pipeline.log                        # en vivo, desde otra terminal
+grep "Época" pipeline.log | tail -20        # solo el avance de las épocas
+grep -E "WARNING|ERROR" pipeline.log        # solo lo que salió mal
+grep "LISTA —" pipeline.log                 # el resumen de cada corrida GNN
+grep -c "^════" pipeline.log                # cuántas veces se ha relanzado
+```
+
+Cambiar la ruta: `FRAUDGNN_LOG=/otro/sitio.log bash scripts/run_pipeline.sh`
+
+El log sirve para mirar el avance; **la evidencia real está en `reports/`**, que
+no depende de él.
 
 ---
 

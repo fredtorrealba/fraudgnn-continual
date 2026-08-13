@@ -6,6 +6,11 @@
 #   bash scripts/run_pipeline.sh --steps    qué hace cada etapa (no ejecuta)
 #   bash scripts/run_pipeline.sh --status   en qué va ahora    (no ejecuta)
 #
+# Toda corrida se guarda automáticamente en pipeline.log (anexando). Verlo:
+#   tail -f pipeline.log                     en vivo desde otra terminal
+#   grep "Época" pipeline.log | tail -20     solo el avance de las épocas
+#   grep -E "WARNING|ERROR" pipeline.log     solo lo que salió mal
+#
 # ETAPAS
 #   1 download    Kaggle -> data/raw/                      ~1 min
 #   2 preprocess  CSV -> parquet + split de 6 meses        ~1 min
@@ -33,6 +38,29 @@
 # En macOS, para que no se suspenda a mitad de una corrida larga:
 #   caffeinate -is bash scripts/run_pipeline.sh 2>&1 | tee pipeline.log
 # =============================================================================
-set -e
+set -o pipefail
 cd "$(dirname "$0")/.."
-exec python -m src.pipeline "$@"
+
+# Las consultas no ejecutan nada: salen por pantalla y no ensucian el log.
+for arg in "$@"; do
+    case "$arg" in
+        --status|--steps|--history|--archive|--help|-h)
+            exec python -m src.pipeline "$@" ;;
+    esac
+done
+
+# Todo lo demás SÍ es una corrida: se guarda siempre, sin tener que acordarse
+# del `| tee`. Se anexa (nunca se pisa) porque el pipeline es reanudable y una
+# corrida puede continuar otra. Ruta configurable con FRAUDGNN_LOG.
+LOG="${FRAUDGNN_LOG:-pipeline.log}"
+{
+    echo
+    echo "════════════════════════════════════════════════════════════════"
+    echo "  $(date '+%Y-%m-%d %H:%M:%S')   run_pipeline.sh $*"
+    echo "════════════════════════════════════════════════════════════════"
+} >> "$LOG"
+
+# -u (sin búfer): al pasar por la tubería, Python bufearía la salida y el
+# avance aparecería a tirones en vez de línea a línea.
+python -u -m src.pipeline "$@" 2>&1 | tee -a "$LOG"
+exit "${PIPESTATUS[0]}"
