@@ -42,7 +42,12 @@ from src.utils.common import (ensure_dirs, get_logger, load_config,
 log = get_logger("compare_gnns")
 
 TIE_MARGIN = 0.005  # si el AUC difiere menos que esto, decide producción
-MODELS = ("graphsage", "gat")
+# GAT va PRIMERO a propósito: es la arquitectura cara (atención con 4 cabezas
+# sobre ~1.8M aristas por batch, ~12 GB de activaciones). Si va a fallar por
+# memoria o a ir demasiado lenta, mejor saberlo en la primera corrida que tras
+# hora y media de GraphSAGE. El orden NO afecta los resultados: train() llama a
+# set_seed(seed) al inicio de cada corrida, así que cada una es independiente.
+MODELS = ("gat", "graphsage")
 
 
 def plan(cfg) -> list[tuple[str, int]]:
