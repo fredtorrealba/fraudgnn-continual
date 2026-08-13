@@ -87,6 +87,10 @@ gnn:
   lr: 0.001
   epochs: 30
   patience: 5                      # early stopping sobre AUC de validación
+  # Épocas del paso `refit`. Vacío = usar el pico de la corrida ganadora, que
+  # compare_gnns anota en selected_model.json. Poner un número aquí permite
+  # relanzar SOLO el refit con otra cantidad, sin repetir las 6 corridas.
+  refit_epochs:
   log_every: 0                     # 0 = solo una línea por época (recomendado). >0 = avance cada N batches
   # Muestreo en paralelo (solo aplica con el sampler nativo pyg-lib; el
   # fallback en numpy los ignora). num_workers > 0 samplea el batch siguiente

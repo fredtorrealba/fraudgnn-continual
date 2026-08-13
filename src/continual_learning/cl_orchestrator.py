@@ -47,15 +47,13 @@ log = get_logger("cl.orchestrator")
 
 
 def load_selected_model(cfg, data):
-    models_dir = resolve(cfg, "models_dir")
-    with open(models_dir / "selected_model.json") as f:
-        sel = json.load(f)["selection"]
-    ckpt = torch.load(models_dir / sel["checkpoint"], weights_only=False)
+    from src.gnn.train_gnn import ruta_modelo_operativo
+    ruta, etiqueta = ruta_modelo_operativo(cfg)
+    ckpt = torch.load(ruta, weights_only=False)
     cfg["gnn"]["in_dim"] = ckpt["in_dim"]
     model = build_model(ckpt["model_name"], cfg)
     model.load_state_dict(ckpt["state_dict"])
-    log.info("Modelo seleccionado por el comparador: %s (seed %d)",
-             sel["selected"], sel["seed"])
+    log.info("Modelo en operación: %s", etiqueta)
     return model, ckpt["model_name"]
 
 

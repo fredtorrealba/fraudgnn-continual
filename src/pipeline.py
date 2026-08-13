@@ -101,6 +101,13 @@ STEPS = [
               "neighbor sampling 15-10-5 (nunca ve el grafo entero). Elige la mejor "
               "por AUC walk-forward semanal. EL PASO CARO: 2-4 h con GPU. "
               "Reanudable por corrida Y por época."),
+    Step("refit", "[6] Refit del ganador sobre train + validación",
+         "src.gnn.refit",
+         [("models_dir", "refit_model.pt"), ("reports_dir", "refit.json")],
+         desc="Refit estándar: la validación ya eligió arquitectura y número de "
+              "épocas, así que se reentrena DESDE CERO con todos los datos hasta "
+              "el mes 5 (+21%). Sin early stopping — las épocas se heredan del "
+              "pico de la corrida ganadora. El mes 6 sigue intacto. ~35 min GPU."),
     Step("cl", "[7] Ciclo de Continual Learning (mes 6 por semanas)",
          "src.continual_learning.cl_orchestrator",
          [("reports_dir", "cl_cycles.json"),

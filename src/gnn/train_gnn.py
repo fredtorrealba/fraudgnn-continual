@@ -117,6 +117,21 @@ def _restore_rng(st: dict, **loaders):
             rng.bit_generator.state = st[name]
 
 
+def ruta_modelo_operativo(cfg) -> tuple[Path, str]:
+    """
+    Qué checkpoint entra en operación: el del refit si existe, si no el
+    ganador del paso GNN. Devuelve (ruta, etiqueta) para poder decirlo en el
+    log — importa saber cuál de los dos produjo un resultado.
+    """
+    models_dir = resolve(cfg, "models_dir")
+    refit = models_dir / "refit_model.pt"
+    if refit.exists():
+        return refit, "refit (reentrenado con train+val)"
+    with open(models_dir / "selected_model.json") as f:
+        sel = json.load(f)["selection"]
+    return models_dir / sel["checkpoint"], f"{sel['selected']} seed {sel['seed']}"
+
+
 def make_loader(data, mask, cfg, shuffle=True):
     return make_neighbor_loader(
         data,
@@ -181,7 +196,7 @@ def train(model_name: str, seed: int, cfg: dict | None = None,
     train_loader = make_loader(data, data.train_mask, cfg, shuffle=True)
     val_loader = make_loader(data, data.val_mask, cfg, shuffle=False)
 
-    best_auc, best_state, bad_epochs = 0.0, None, 0
+    best_auc, best_state, bad_epochs, best_epoch = 0.0, None, 0, 0
     start_epoch, resumed, minutes_before = 1, False, 0.0
 
     if resume_path.exists():
@@ -190,6 +205,7 @@ def train(model_name: str, seed: int, cfg: dict | None = None,
         optimizer.load_state_dict(ck["optimizer"])
         best_auc, best_state = ck["best_auc"], ck["best_state"]
         bad_epochs = ck["bad_epochs"]
+        best_epoch = ck.get("best_epoch", 0)
         minutes_before = ck.get("minutes", 0.0)    # tiempo de la corrida previa
         start_epoch = ck["epoch"] + 1
         _restore_rng(ck.get("rng"), train=train_loader, val=val_loader)
@@ -242,7 +258,7 @@ def train(model_name: str, seed: int, cfg: dict | None = None,
                  auc, rep["recall"], (time.time() - t_epoch) / 60)
 
         if auc > best_auc:
-            best_auc, bad_epochs = auc, 0
+            best_auc, bad_epochs, best_epoch = auc, 0, epoch
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
         else:
             bad_epochs += 1
@@ -255,7 +271,8 @@ def train(model_name: str, seed: int, cfg: dict | None = None,
              "state_dict": {k: v.cpu() for k, v in model.state_dict().items()},
              "optimizer": optimizer.state_dict(),
              "best_auc": best_auc, "best_state": best_state,
-             "bad_epochs": bad_epochs, "minutes": minutes,
+             "bad_epochs": bad_epochs, "best_epoch": best_epoch,
+             "minutes": minutes,
              "rng": _rng_state(train=train_loader, val=val_loader)},
             resume_path)
         update_state(cfg, key, status="running", model=model_name, seed=seed,
@@ -277,11 +294,16 @@ def train(model_name: str, seed: int, cfg: dict | None = None,
     final_rep["model"] = model_name
     final_rep["seed"] = seed
     final_rep["resumed"] = resumed
+    # época del PICO, no la última: con patience=5 la corrida sigue 5 épocas
+    # más allá de su mejor momento. Es el número que necesita el refit para
+    # entrenar sin early stopping si algún día se usa el modo de épocas fijas.
+    final_rep["best_epoch"] = best_epoch
 
     # los pesos se guardan en CPU: así el checkpoint se puede cargar en
     # cualquier máquina (Linux/CUDA, Mac/MPS o CPU pelado)
     _atomic_torch_save({"model_name": model_name, "seed": seed,
                         "in_dim": cfg["gnn"]["in_dim"],
+                        "best_epoch": best_epoch,
                         "state_dict": {k: v.cpu()
                                        for k, v in model.state_dict().items()}},
                        ckpt_path)

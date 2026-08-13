@@ -212,10 +212,15 @@ def select(results: dict, cfg) -> dict:
     best_seed = best_seed_runs[best_idx]["seed"]
 
     kpi_ok = results[winner]["auc_mean"] > cfg["gnn"]["kpi_auc"]
+    # La época del PICO de la corrida ganadora. Se anota aquí —y no solo dentro
+    # del checkpoint— para que el paso `refit` pueda releerla sin cargar 2 MB de
+    # pesos, y para que quede a la vista qué número se heredó.
+    best_epoch = best_seed_runs[best_idx].get("best_epoch")
     return {
         "selected": winner,
         "seed": best_seed,
         "checkpoint": f"{winner}_seed{best_seed}.pt",
+        "best_epoch": best_epoch,
         "reason": reason,
         "auc_mean": results[winner]["auc_mean"],
         "auc_std": results[winner]["auc_std"],

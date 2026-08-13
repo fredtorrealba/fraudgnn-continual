@@ -110,13 +110,13 @@ def xgboost_scores_on_test(cfg) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
 
 def original_gnn_scores_on_test(cfg, data, test_idx) -> np.ndarray:
     """Scores del GNN ORIGINAL (pre-CL) para identificar patrones emergentes."""
-    models_dir = resolve(cfg, "models_dir")
-    with open(models_dir / "selected_model.json") as f:
-        sel = json.load(f)["selection"]
-    ckpt = torch.load(models_dir / sel["checkpoint"], weights_only=False)
+    from src.gnn.train_gnn import ruta_modelo_operativo
+    ruta, etiqueta = ruta_modelo_operativo(cfg)
+    ckpt = torch.load(ruta, weights_only=False)
     cfg["gnn"]["in_dim"] = ckpt["in_dim"]
     model = build_model(ckpt["model_name"], cfg)
     model.load_state_dict(ckpt["state_dict"])
+    log.info("GNN de referencia (pre-CL): %s", etiqueta)
     return score_nodes(model, data, test_idx, cfg)
 
 
