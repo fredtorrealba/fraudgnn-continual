@@ -84,8 +84,11 @@ def show_runs(cfg, force: bool = False):
     from src.gnn.train_gnn import is_done, resume_info
 
     pending = []
+    hd = cfg["gnn"]["hidden_dims"]
     log.info("--- Corridas GNN (%d arquitecturas x %d seeds) ---",
              len(MODELS), len(cfg["gnn"]["seeds"]))
+    log.info("    arquitectura: %d capa(s) [%s] = %d salto(s) en el grafo",
+             len(hd), ", ".join(map(str, hd)), len(hd))
     for model in MODELS:
         listas, faltan = [], []
         for seed in cfg["gnn"]["seeds"]:

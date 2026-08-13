@@ -1,457 +1,296 @@
 # FraudGNN — Detección Adaptativa de Fraude con Grafos
 
-Código del Capstone **"FraudGNN: Detección Adaptativa con Grafos"** (MIA UAI, Grupo 18 — Freddy Torrealba).
-Sistema de detección de fraude en transacciones card-not-present usando Graph Neural Networks
-(GraphSAGE / GAT) con Continual Learning, comparado contra un baseline XGBoost congelado,
+Capstone MIA UAI, Grupo 18 — Freddy Torrealba.
+
+Detección de fraude en transacciones *card-not-present* con **Graph Neural Networks**
+(GraphSAGE vs GAT) y **Continual Learning**, medido contra un **XGBoost congelado**
 sobre el dataset IEEE-CIS.
 
-El proyecto es **experimental**: todo corre localmente con PyTorch Geometric sobre el grafo
-serializado. No incluye capa de servicio (API, base de grafos ni despliegue).
+Proyecto experimental: todo corre sobre el grafo serializado en disco. No incluye
+capa de servicio (API, base de grafos ni despliegue).
 
 ---
 
-## 1. Estructura del proyecto
+## La idea en tres frases
+
+1. **El fraude no viene solo, viene en redes.** Cada transacción es un nodo; se
+   conecta con las que comparten tarjeta, email o dispositivo dentro de 30 días.
+2. **El fraude cambia.** El mes 6 se recorre semana a semana: cuando aparecen
+   fraudes que el modelo no detecta, se dispara un ciclo de adaptación que
+   reentrena sin olvidar lo anterior.
+3. **Hay que demostrarlo.** Un XGBoost entrenado con las mismas columnas y nunca
+   reentrenado sirve de vara de medir.
+
+El split es **temporal estricto**: meses 1-4 entrenan, el 5 decide, el 6 es el
+examen. Nunca al revés.
+
+---
+
+## Las 8 etapas
+
+| # | Etapa | Qué hace | Produce |
+|---|---|---|---|
+| 1 | `download` | Baja IEEE-CIS de Kaggle (590K txn etiquetadas) | `data/raw/*.csv` |
+| 2 | `preprocess` | Une, codifica, imputa y parte los 6 meses | `data/processed/full.parquet` |
+| 3 | `graph` | Nodos = txn, aristas = entidad compartida | `data/graph/graph.pt` |
+| 4 | `gnn` | 2 arquitecturas × 3 semillas = 6 corridas, y elige | `models/selected_model.json` |
+| 5 | `refit` | Reentrena al ganador añadiendo el mes 5 | `models/refit_model.pt` |
+| 6 | `cl` | Mes 6 semana a semana: gatillo → fine-tuning → veredicto | `reports/cl_cycles.json` |
+| 7 | `xgboost` | Baseline tabular **congelado** | `models/xgboost_baseline.json` |
+| 8 | `final` | Comparación a igual presupuesto de alertas | `reports/final_comparison.json` |
+
+Las **3 semillas** existen porque entrenar tiene azar: con una sola corrida no
+sabrías si una arquitectura ganó por buena o por suerte.
+
+`xgboost` va en la posición 7 y no en la 3: solo depende de `preprocess`, así que
+ponerlo tarde deja que el paso caro (`gnn`) arranque antes.
+
+```
+download → preprocess → graph ─┬─► gnn → refit → cl ─┐
+                               │                      ├─► final
+                               └─────► xgboost ───────┘
+```
+
+---
+
+## Estructura
 
 ```
 fraudgnn/
-├── config/
-│   └── config.yaml              # TODOS los hiperparámetros del sistema en un solo lugar
+├── config/config.yaml           TODOS los hiperparámetros, en un solo archivo
 ├── src/
-│   ├── pipeline.py              # runner del pipeline completo, reanudable (sabe qué falta)
-│   ├── data/                    # descarga, preprocesamiento y construcción del grafo
-│   │   ├── download_ieee_cis.py
-│   │   ├── preprocessing.py
-│   │   └── build_graph.py
-│   ├── baseline_xgboost/        # baseline tabular (caja aislada, se entrena UNA vez)
-│   │   ├── smote_pipeline.py
-│   │   └── train_xgboost.py
-│   ├── gnn/                     # las dos redes y el comparador
-│   │   ├── models.py            # GraphSAGE y GAT (misma columna vertebral)
-│   │   ├── sampling.py          # neighbor sampling 15-10-5 (con fallback sin torch-sparse)
-│   │   ├── train_gnn.py
-│   │   └── compare_gnns.py
-│   ├── continual_learning/      # todo el ciclo de adaptación
-│   │   ├── trigger.py           # gatillo de novedad (ejecutores por conteo y por tasa)
-│   │   ├── splitter.py          # split 70/30 adaptación/verificación
-│   │   ├── replay_buffer.py     # buffer de repaso (~10K, estratificado, frontera)
-│   │   ├── control_set.py       # set de control congelado (~5K, disjunto del buffer)
-│   │   ├── finetune.py          # fine-tuning 40/60 con LR diferenciado por capa
-│   │   ├── validate.py          # doble validación (aprendió / no olvidó) + dial
-│   │   ├── cl_orchestrator.py   # orquesta el mes 6 semana a semana
-│   │   └── deep_retrain.py      # reentrenamiento profundo (última carta del dial)
-│   ├── comparison/
-│   │   └── final_comparison.py  # OE4: GNN+CL vs XGBoost congelado
-│   └── utils/                   # config, logging, seeds, dispositivo, métricas
+│   ├── pipeline.py              runner reanudable: sabe qué falta y lo salta
+│   ├── data/
+│   │   ├── download_ieee_cis.py credenciales: entorno > .env > ~/.kaggle
+│   │   ├── preprocessing.py     codificación e imputación ajustadas SOLO con train
+│   │   └── build_graph.py       aristas por entidad compartida, ventana 30 días
+│   ├── gnn/
+│   │   ├── models.py            GraphSAGE y GAT; profundidad = len(hidden_dims)
+│   │   ├── sampling.py          neighbor sampling (con fallback sin pyg-lib)
+│   │   ├── train_gnn.py         entrenamiento reanudable POR ÉPOCA
+│   │   ├── compare_gnns.py      las 6 corridas y la selección walk-forward
+│   │   └── refit.py             reentrena al ganador con meses 1-5
+│   ├── continual_learning/
+│   │   ├── trigger.py           gatillo: fraude confirmado con score BAJO
+│   │   ├── splitter.py          70% adaptación / 30% verificación
+│   │   ├── replay_buffer.py     memoria de repaso (~10K, prioriza frontera)
+│   │   ├── control_set.py       examen sorpresa congelado (~5K, disjunto)
+│   │   ├── finetune.py          mezcla 40/60 con LR diferenciado por capa
+│   │   ├── validate.py          ¿aprendió? ¿olvidó? + dial estabilidad-plasticidad
+│   │   ├── cl_orchestrator.py   orquesta el mes 6
+│   │   └── deep_retrain.py      última carta del dial
+│   ├── baseline_xgboost/
+│   │   ├── smote_pipeline.py    SMOTE, solo sobre train
+│   │   └── train_xgboost.py     Optuna + modelo CONGELADO
+│   ├── comparison/final_comparison.py
+│   └── utils/                   config, logging, semillas, dispositivo, métricas
 ├── scripts/
-│   ├── run_pipeline.sh          # corre todo el pipeline en orden
-│   ├── make_synthetic_demo.py   # demo sintética para probar sin el dataset real
-│   ├── graph_explorer.py        # explorador interactivo del grafo (HTML navegable)
-│   └── plot_embeddings.py       # t-SNE del espacio latente (antes vs después del CL)
-├── requirements.txt
-└── README.md                    # este archivo
+│   ├── run_pipeline.sh          punto de entrada
+│   ├── setup_runpod.sh          instala el entorno en un pod con GPU
+│   ├── make_synthetic_demo.py   demo sin Kaggle, para probar el flujo
+│   └── graph_explorer.py        explorador de vecindarios (HTML)
+└── historial/                   corridas archivadas (ver --archive)
 ```
 
-**Directorios que se crean al correr** (no van en el zip): `data/`, `models/`, `reports/`, `artifacts/`.
+Se crean al correr: `data/`, `models/`, `reports/`, `artifacts/`.
 
 ---
 
-## 2. Instalación
+## Ejecutar en RunPod
 
-Requiere Python 3.10+.
+### 1. Variables de entorno del pod
 
-```bash
-pip install -r requirements.txt
+Al desplegar, en **Environment variables** del template:
+
+```
+KAGGLE_USERNAME = tu_usuario
+KAGGLE_KEY      = tu_api_key
 ```
 
-Notas:
-- `torch` conviene instalarlo primero según tu máquina (CPU o CUDA): https://pytorch.org/get-started/locally/
-  En macOS basta `pip install torch` (la rueda de PyPI ya trae soporte MPS).
-- **macOS**: XGBoost necesita el runtime de OpenMP → `brew install libomp`. Sin eso, el
-  paso 3 falla al importar `xgboost` con un error de `libomp.dylib` no encontrada.
-- `torch-sparse` / `pyg-lib` son **opcionales**: aceleran el neighbor sampling de PyG.
-  Si no están, el código usa un sampler propio (`src/gnn/sampling.py`) que implementa
-  el mismo protocolo 15-10-5 en numpy. Para el dataset completo (590K nodos) sí conviene
-  instalarlos.
+Salen del `kaggle.json` de [kaggle.com/settings](https://www.kaggle.com/settings) → API →
+*Create New Token*. Y hay que **aceptar las reglas** de la competencia una vez, o la
+API responde 403 aunque la credencial sea válida.
 
-### Entrenar en una VM con GPU (Azure y similares)
+El código las busca en este orden: **entorno del proceso → `.env` → `~/.kaggle/`**.
+En el pod basta con las variables; no hace falta crear ningún archivo.
 
-En CPU, una época de GAT sobre el dataset completo tarda ~70 min (401 batches ×
-~9,5 s): las 6 corridas del paso 4-5 se van a días. El costo dominante es la
-atención de GAT sobre los ~1,8M de aristas de cada batch, que es exactamente lo
-que una GPU resuelve bien. Con GPU + sampler nativo el paso completo baja a
-horas.
-
-SKU de referencia en Azure: `Standard_NC8as_T4_v3` (1× T4 16 GB, 8 vCPU, 56 GB
-RAM), imagen *Ubuntu Server + NVIDIA GPU Driver Extension*, disco de 128 GB.
-Como el pipeline es reanudable, una VM **spot** es buena idea: si te desalojan,
-relanzas el mismo comando y retoma en la época que iba.
+### 2. Clonar
 
 ```bash
-git clone <repo> && cd fraudgnn
-bash scripts/setup_azure.sh        # venv + torch CUDA + deps + sampler nativo
-cp .env.example .env && nano .env  # KAGGLE_USERNAME / KAGGLE_KEY
-tmux new -s fraudgnn               # que no muera al cerrar el SSH
+cd /workspace                          # lo único que sobrevive a un Stop
+git clone https://github.com/fredtorrealba/fraudgnn-continual.git fraudgnn
+cd fraudgnn
+```
+
+### 3. Averiguar los núcleos REALES
+
+En un contenedor, `nproc` reporta los del host (96), no tu cuota:
+
+```bash
+if [ -r /sys/fs/cgroup/cpu.max ] && [ "$(cut -d' ' -f1 /sys/fs/cgroup/cpu.max)" != "max" ]; then
+    n=$(awk '{print int($1/$2)}' /sys/fs/cgroup/cpu.max)
+elif [ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us ] && [ "$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us)" -gt 0 ]; then
+    n=$(( $(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us) / $(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us) ))
+else n=$(nproc); fi
+echo "n_jobs: $n | num_workers: $(( n>3 ? n-3 : 1 ))"
+```
+
+Con más hilos que núcleos el kernel **congela el contenedor** periódicamente
+(*cgroup throttling*): no va un poco más lento, se apaga a ratos.
+
+### 4. Configurar
+
+```bash
+nano config/config.yaml
+```
+
+```yaml
+compute:
+  n_jobs: 15                     # el primer número del paso 3
+gnn:
+  num_workers: 12                # el segundo
+  hidden_dims: [256]             # 1 capa (descomenta la que quieras)
+```
+
+### 5. Instalar
+
+```bash
+bash scripts/setup_runpod.sh
+```
+
+Debe terminar con `CUDA disponible: True` y `sampler nativo: SÍ`. Si dice
+`NO (fallback, lento)`, para: sin el sampler nativo el muestreo va varias veces
+más lento.
+
+### 6. Ejecutar
+
+```bash
+tmux new -s fraudgnn             # que no muera al cerrar el SSH
 bash scripts/run_pipeline.sh 2>&1 | tee pipeline.log
 ```
 
-El script verifica al final que `torch.cuda.is_available()` sea `True` y que el
-sampler nativo esté activo — conviene mirarlo antes de gastar horas de VM.
-
-**Importante para la comparación del OE2:** si migras de máquina, reentrena las
-**6** corridas allá, no solo las que faltan. CPU y GPU dan resultados
-numéricamente distintos y el paso 5 exige que ambas arquitecturas se midan en
-igualdad de condiciones (ver `get_device()` en `src/utils/common.py`). Lo mismo
-vale si activas el sampler nativo: cambia el muestreo respecto del fallback.
-Basta con partir de `models/` y `reports/` limpios.
-
-### Dataset
-
-#### Opción A — IEEE-CIS real
-
-**Este repositorio no incluye credenciales.** Lo configurable no secreto está en
-`config/config.yaml` → sección `kaggle:` (competencia, archivos a bajar, dónde
-buscar e instalar la credencial). El secreto va en un `.env` que **no se versiona**:
+Ctrl-B luego D para salir dejándolo corriendo. Desde otra terminal:
 
 ```bash
-cp .env.example .env      # y editar
-python -m src.data.download_ieee_cis --check
+tail -f pipeline.log
+watch -n 2 nvidia-smi            # si GPU-Util < 50%, el cuello es el sampler
 ```
 
-| # | Vía | Cómo | Caduca |
-|---|---|---|---|
-| 1 | **Usuario + API key** (recomendada) | `KAGGLE_USERNAME` y `KAGGLE_KEY` en `.env` o como variables de entorno. Salen del `kaggle.json` de [kaggle.com/settings](https://www.kaggle.com/settings) → API → *Create New Token* | No |
-| 2 | Token de sesión | `kaggle auth login`, o pegar el `KGAT_...` en `.env` como `KAGGLE_API_TOKEN` | **Sí, en horas** |
-| 3 | Archivo ya instalado | `~/.kaggle/kaggle.json` o `~/.kaggle/access_token` | Según cuál |
-
-Si das el token por `.env` o por entorno, el script lo **instala solo** en
-`~/.kaggle/access_token` con permisos 600 — no hay que correr ningún comando a mano.
-
-Además hay que **aceptar las reglas de la competencia una vez** con esa misma cuenta:
-[ieee-fraud-detection/rules](https://www.kaggle.com/competitions/ieee-fraud-detection/rules).
-Sin eso la API responde **403** aunque las credenciales sean válidas — es el error
-más común al empezar.
+### 7. Bajar resultados y archivar
 
 ```bash
-python -m src.data.download_ieee_cis           # solo los 2 archivos que usa el pipeline
-python -m src.data.download_ieee_cis --all     # además test_* y sample_submission
-python -m src.data.download_ieee_cis --force   # re-descargar
+# desde tu máquina
+scp -P <puerto> -r root@<ip>:/workspace/fraudgnn/{reports,models,artifacts} .
 ```
 
-Por defecto baja **solo** `train_transaction.csv` (~650 MB) y `train_identity.csv`
-(~26 MB): el test de Kaggle no trae etiquetas, así que los 6 "meses" del split
-temporal se cortan dentro de `train_transaction.csv`. Si algo falla, el script
-imprime exactamente qué configurar.
-
-También puedes bajar esos dos archivos a mano desde la pestaña *Data* y dejarlos
-en `data/raw/` — el resto del pipeline no nota la diferencia.
-
-#### Opción B — demo sintética (sin Kaggle, en segundos)
-```bash
-python scripts/make_synthetic_demo.py --n 20000
-```
-Genera 6 "meses" con un patrón de fraude conocido (meses 1-5) y un patrón
-**emergente solo en el mes 6** (banda de features que en el entrenamiento fue siempre
-legítima + anillo nuevo de tarjetas), justamente para gatillar el continual learning.
-Útil para validar el flujo completo antes de invertir horas en el dataset real.
+Verifica que abren **antes** de terminar el pod: *Terminate* borra `/workspace`
+sin vuelta atrás.
 
 ---
 
-## 3. Cómo ejecutar cada módulo (en orden)
-
-Todo se corre desde la raíz del proyecto. El pipeline completo:
+## Ejecutar en local
 
 ```bash
+pip install -r requirements.txt        # macOS: brew install libomp (XGBoost)
+cp .env.example .env && nano .env      # KAGGLE_USERNAME / KAGGLE_KEY
 bash scripts/run_pipeline.sh
 ```
 
-**El pipeline es reanudable: no repite lo que ya está hecho.** Antes de cada
-paso revisa si sus archivos de salida existen y, si están, lo salta. Si el
-proceso muere (Ctrl-C, batería, kernel panic, cierre de sesión SSH), se
-relanza *el mismo comando* y sigue donde quedó — incluso a mitad del
-entrenamiento de una GNN, que retoma desde su última época guardada. El
-avance queda en `artifacts/pipeline_state.json`, que se crea solo.
+Sin GPU funciona, pero el paso `gnn` se va a días: en CPU una época de GAT sobre
+el dataset completo tarda ~70 min. Para probar el flujo sin esperar:
 
 ```bash
-bash scripts/run_pipeline.sh --status        # ver en qué va, sin ejecutar nada
-bash scripts/run_pipeline.sh --from gnn      # desde ese paso en adelante
-bash scripts/run_pipeline.sh --only cl       # un solo paso
-bash scripts/run_pipeline.sh --force xgboost # rehacer ese paso aunque esté listo
-bash scripts/run_pipeline.sh --force         # rehacer TODO desde cero
+python scripts/make_synthetic_demo.py --n 20000
+bash scripts/run_pipeline.sh
 ```
-
-Pasos válidos para `--only/--from/--force`: `download`, `preprocess`, `graph`,
-`xgboost`, `gnn`, `cl`, `final`. En macOS conviene lanzarlo a prueba de
-suspensión: `caffeinate -is bash scripts/run_pipeline.sh 2>&1 | tee pipeline.log`.
-
-O paso a paso:
-
-### Paso 1 — Preprocesamiento y split temporal
-```bash
-python -m src.data.preprocessing
-```
-Une transaction+identity, codifica categóricas e imputa (ajustado SOLO con train,
-sin fuga temporal), y asigna el split: **meses 1-4 train / mes 5 validación / mes 6 test**
-(el mes 6 además queda dividido en 4 semanas para el walk-forward del CL).
-Salidas: `data/processed/full.parquet`, `feature_cols.json`, `split_masks.parquet`.
-
-### Paso 2 — Construcción del grafo
-```bash
-python -m src.data.build_graph
-```
-Grafo homogéneo: nodos = transacciones, aristas = entidad compartida
-(huella de tarjeta / email+card1 / dispositivo), ventana de 30 días y tope de
-50 aristas por nodo (anti-hub). Salida: `data/graph/graph.pt` (PyTorch Geometric).
-
-### Paso 3 — Baseline XGBoost (caja aislada)
-```bash
-python -m src.baseline_xgboost.train_xgboost
-```
-SMOTE **solo aquí** (los sintéticos tabulares no tienen aristas, por eso no aplica a la GNN)
-+ búsqueda de hiperparámetros con Optuna maximizando AUC en validación.
-El modelo queda **congelado** en `models/xgboost_baseline.json` y no se toca nunca más:
-representa al sistema tradicional que no se adapta.
-
-### Pasos 4-5 — Entrenar las dos GNN y compararlas
-```bash
-python -m src.gnn.compare_gnns          # entrena graphsage y gat, 3 seeds c/u
-# o individual:
-python -m src.gnn.train_gnn --model graphsage --seed 42
-```
-Ambas arquitecturas comparten la columna vertebral (432→256→128→64 + MLP head);
-solo cambia la agregación (MEAN vs atención). Entrenan con `BCEWithLogitsLoss` y
-`pos_weight` = razón real de desbalance del train (~27.6 en IEEE-CIS), neighbor
-sampling 15-10-5 y early stopping por AUC de validación.
-La comparación es **walk-forward × 3**: además del AUC del mes de validación
-completo, cada modelo se evalúa semana a semana dentro del mes 5 (el "futuro
-que va llegando"), y la selección usa el AUC promedio de las semanas × seeds —
-premia consistencia temporal, no solo el promedio. El criterio de desempate se
-mantiene (delta < 0.005 = empate técnico y **gana GraphSAGE** por costo de
-inferencia fijo e inductividad); todo queda en `models/selected_model.json`.
-
-**Si el proceso se cae, se retoma solo.** Cada corrida tarda ~2 h, así que el
-entrenamiento guarda su avance y sabe dónde quedó:
-
-- `artifacts/pipeline_state.json` — archivo de estado, sección `runs`. Se
-  **crea solo** en la primera corrida con las 6 combinaciones (2 modelos ×
-  3 seeds) en `pending`, y se actualiza a `running` (con la última época y el
-  mejor AUC) y a `done`. La sección `steps` del mismo archivo lleva el avance
-  de los pasos del pipeline.
-- `models/{modelo}_seed{seed}_resume.pt` — checkpoint de época: pesos,
-  optimizador, mejor estado, contador de paciencia y las semillas de todos los
-  RNG (incluido el del neighbor sampler). Se escribe de forma atómica al
-  terminar cada época y se **borra** cuando la corrida cierra bien.
-
-Tras un corte (Ctrl-C, batería, kernel panic) basta con **relanzar el mismo
-comando**: salta las seeds terminadas y retoma la que quedó a medias desde la
-época siguiente. Al restaurar los RNG, la corrida reanudada da resultados
-idénticos a una sin interrupción. Para ignorar todo y reentrenar desde cero:
-`--force`.
-
-```bash
-python -m src.gnn.compare_gnns              # entrena lo que falte y compara
-python -m src.gnn.compare_gnns --skip-train # solo comparar lo ya entrenado
-python -m src.gnn.compare_gnns --force      # reentrenar las 6 desde cero
-cat artifacts/pipeline_state.json           # ver en qué va
-```
-
-En macOS conviene lanzarlo a prueba de suspensión:
-`caffeinate -is nohup python -m src.gnn.compare_gnns > gat.log 2>&1 &`
-
-### Paso 6 — Ciclo de Continual Learning (el corazón del capstone)
-```bash
-python -m src.continual_learning.cl_orchestrator
-```
-Simula el mes 6 semana a semana:
-1. El modelo opera sobre la semana y se mide el recall "antes".
-2. Los fraudes confirmados por analistas (simulados con las etiquetas reales) con
-   **score bajo** entran a la cola de novedad — esa es la señal de patrón emergente.
-3. El gatillo dispara por conteo (50 casos) o por tasa de escape (>30%).
-4. Split 70/30: adaptación / verificación (la verificación NUNCA se entrena).
-5. Fine-tuning: lotes 40% casos nuevos + 60% replay buffer, LR diferenciado por capa
-   (capa 1 congelada, capa 2 = 1e-5, capa 3 = 1e-4, clasificador = 1e-3),
-   BatchNorm congelado, 5-10 épocas.
-6. Doble validación contra el modelo ANTERIOR: aprendió (recall verificación ≥ 70%)
-   y no olvidó (caída en el set de control ≤ 0.02). Si falla, el **dial
-   estabilidad-plasticidad** ajusta la receta y reintenta (máx. 3).
-7. Solo si pasa ambas: despliegue (`models/production_model.pt`) y actualización
-   del buffer (con casos de adaptación) y del control (con casos de verificación).
-   **Regla de oro**: datos entrenados → buffer; datos nunca entrenados → control.
-   Jamás se cruzan. En el buffer la evicción sale en este orden: primero
-   **redundantes** (misma clase + mismo origen + score casi idéntico: aportan
-   lo mismo al repaso, se conserva un representante), luego **fáciles** (score
-   extremo); la frontera es intocable y el piso histórico se respeta — si eso
-   impide expulsar lo suficiente, se recorta la entrada (el buffer es de
-   tamaño FIJO).
-8. Si se agotan los reintentos sin desplegar, el diagnóstico queda en la
-   bitácora: si no aprendió pese a la plasticidad, el patrón probablemente usa
-   relaciones que el grafo no modela (**requiere aristas nuevas**); si fallan
-   ambos frentes, se **programa el reentrenamiento profundo** dejando
-   `artifacts/pending_deep_retrain.json`.
-
-Salidas: `reports/cl_cycles.json` (bitácora con diagnósticos), los recalls
-antes/después, y `data/graph/graph_scored.pt` — el grafo con el atributo
-`fraud_score` poblado por nodo (features + isFraud + fraud_score).
-
-### Paso 6b — Reentrenamiento profundo (cuando el fine-tuning no basta)
-```bash
-python -m src.continual_learning.deep_retrain
-```
-Lee el pendiente que dejó el orquestador y reentrena la arquitectura
-seleccionada **desde cero** sobre el train original completo + los casos de
-adaptación del patrón conflictivo (pos_weight recalculado sobre esa unión).
-Valida con la misma vara del ciclo normal (verificación ≥70% y control sin
-caída vs el modelo vigente); solo si pasa, despliega y actualiza los conjuntos
-con la regla de oro. Es lento (horas) — por eso es la última carta del dial.
-
-### Paso 7 — Comparación final (OE4)
-```bash
-python -m src.comparison.final_comparison
-```
-Mismo mes 6, mismo threshold 0.5: GNN+CL vs XGBoost congelado, global y sobre
-**patrones emergentes** (fraudes que el GNN original pre-CL no detectaba).
-KPI: gap de recall ≥ 20 puntos sobre emergentes + estimación de impacto en USD.
-Salida: `reports/final_comparison.json`.
 
 ---
 
-## 3b. Visualización (herramientas de apoyo, no son parte del pipeline)
+## El pipeline es reanudable
 
-### Explorador interactivo del grafo
+Antes de cada etapa mira si sus archivos de salida existen y la salta si están.
+Si el proceso muere (Ctrl-C, batería, desalojo de VM spot), relanzas **el mismo
+comando** y sigue donde quedó — incluso a mitad de una GNN, que retoma desde su
+última época guardada.
+
+**El disco manda**: borra una salida y esa etapa vuelve a estar pendiente.
+
 ```bash
-python scripts/graph_explorer.py                 # semilla: el fraude más conectado del mes 6
-python scripts/graph_explorer.py --tid 3003456   # una transacción concreta
-python scripts/graph_explorer.py --offline       # embebe la librería: funciona sin internet
+bash scripts/run_pipeline.sh --steps          # qué hace cada etapa
+bash scripts/run_pipeline.sh --status         # en qué va ahora
+bash scripts/run_pipeline.sh --only gnn,cl    # SOLO esas          (coma)
+bash scripts/run_pipeline.sh --skip xgboost   # todo MENOS esas    (coma)
+bash scripts/run_pipeline.sh --from gnn       # desde ahí
+bash scripts/run_pipeline.sh --only gnn --force   # rehacer lo seleccionado
 ```
-Genera `reports/grafo_interactivo.html` y lo abre en el navegador. Parte de un solo
-nodo y se navega expandiendo: **doble clic** expande vecinos, **clic** muestra la ficha
-(tid, mes, split, etiqueta, `fraud_score`, grado, vecinos ocultos), y el **borde punteado**
-marca los nodos que aún tienen vecinos sin destapar. El buscador por `TransactionID`
-permite saltar a otra componente conexa.
 
-Requiere el paso 2. Con `--graph data/graph/graph_scored.pt` (paso 6) las fichas
-muestran además el score del modelo.
+`--force` no elige etapas: **fuerza las que dejen `--only`/`--skip`/`--from`**.
+Borra sus salidas antes de relanzarlas.
 
-### t-SNE del espacio latente
+---
+
+## Archivar y comparar corridas
+
 ```bash
-python scripts/plot_embeddings.py                # un panel, modelo seleccionado
-python scripts/plot_embeddings.py --auto         # ANTES vs DESPUÉS del CL
-```
-Proyecta en 2D los embeddings de 64 dims (salida de `conv3`, capturados con un
-forward hook sobre `classifier[0]` — no modifica los modelos). El modo `--auto`
-dibuja dos paneles con los mismos nodos del mes 6: pre-CL y post-CL, marcando con
-**X amarilla** los fraudes emergentes (los que el modelo pre-CL dejaba pasar con
-score < 0.5). Es la evidencia visual del OE3: se ve cómo pasan de estar diluidos
-entre las legítimas a agruparse.
-
-Requiere los pasos 4-5; el modo `--auto` requiere además el paso 6.
-
----
-
-## 4. Flujo completo del sistema (cómo conversan los módulos)
-
-```
-                         ┌─────────────────────────────────────────┐
-                         │   IEEE-CIS (o demo sintética)           │
-                         └───────────────┬─────────────────────────┘
-                                         ▼
-        preprocessing.py ──► build_graph.py ──► graph.pt (PyG)
-              │                                        │
-              ▼                                        ▼
-   train_xgboost.py (SMOTE+Optuna)          compare_gnns.py (SAGE vs GAT, 3 seeds)
-   modelo CONGELADO ──────────┐                        │ selecciona
-                              │                        ▼
-                              │             cl_orchestrator.py (mes 6, semana a semana)
-                              │             gatillo → split 70/30 → fine-tuning →
-                              │             doble validación → despliegue/buffer/control
-                              │                        │
-                              ▼                        ▼
-                        final_comparison.py  ◄─  production_model.pt
-                        (recall global + emergentes + USD)
+bash scripts/run_pipeline.sh --archive "1capa"   # guarda y deja todo en cero
+bash scripts/run_pipeline.sh --history           # lista lo archivado
 ```
 
-Todo el flujo es local: `graph.pt` en disco, PyTorch Geometric en memoria y
-neighbor sampling 15-10-5 por batch. La red nunca ve el grafo completo de una vez,
-así que el mismo mecanismo escalaría a un grafo servido por una base de datos —
-pero eso queda fuera del alcance de este repositorio.
+Mueve `models/`, `reports/` y `artifacts/` a `historial/<fecha>_<nombre>/` junto
+con **el `config.yaml` que los produjo** (sin él, un resultado antiguo no se puede
+interpretar), `feature_cols.json` y un `meta.json` con las métricas ya extraídas.
+Después borra `data/`, que son 2 GB deterministas y se regeneran en ~7 min.
+
+Para comparar dos corridas, empieza por `meta.json`. Y comprueba que la **huella
+del grafo** (`nodos`, `aristas`, `features`) coincida: si difiere, cambiaste el
+grafo y estarías comparando cosas distintas.
 
 ---
 
-## 5. Configuración
+## Configuración
 
-Todo está en `config/config.yaml`, comentado. Lo que más se toca:
+Todo vive en `config/config.yaml`. Lo que más se toca:
 
-| Sección | Qué controla |
-|---|---|
-| `data.split` | meses de train/val/test y semanas del walk-forward |
-| `graph` | entidades de arista, ventana 30d, tope 50 aristas |
-| `gnn` | dims, fanouts 15-10-5, épocas, seeds, KPI AUC 0.93 |
-| `xgboost` | SMOTE ratio, trials de Optuna |
-| `continual_learning` | gatillo (50 / 30%), split 70/30, buffer 10K, control 5K, mezcla 40/60, LRs por capa, umbrales de validación (0.70 / −0.02), dial y reintentos |
+```yaml
+compute:
+  n_jobs: -1              # núcleos de CPU. En contenedor, la cuota REAL
+gnn:
+  hidden_dims: [256]      # PROFUNDIDAD: cada capa es un SALTO en el grafo
+  fanouts: [15, 10, 5]    # vecinos por salto; se recortan a las capas
+  batch_size: 1024
+  num_workers: 4          # procesos de muestreo en paralelo
+  log_every: 0            # 0 = una línea por época
+  seeds: [42, 123, 2026]
+xgboost:
+  device: "auto"          # auto | cuda | cpu
+```
 
-Para una corrida rápida de humo: bajar `gnn.epochs`, `gnn.seeds` a `[42]`,
-`xgboost.optuna_trials` a 5 y `continual_learning.trigger.min_cases` a ~15.
-
-**Dispositivo de cómputo:** se elige solo (CUDA si hay NVIDIA, si no CPU) y se
-anuncia en la primera línea del log. En Apple Silicon, MPS está disponible pero
-**no se activa por defecto** — el cuello de botella es el neighbor sampling, que
-corre en CPU igual. Para probarlo: `FRAUDGNN_DEVICE=mps python -m src.gnn.compare_gnns`.
-Una corrida completa debe usar siempre el mismo dispositivo.
-
----
-
-## 6. Resultados del smoke test (demo sintética, 20K txn)
-
-Sirven para verificar que el mecanismo funciona — **no son los números del dataset
-real**. Los artefactos completos están en `reports/smoke_synthetic/`.
-
-- **Baseline XGBoost** (mes 5): AUC 0.9687, recall 0.757, precisión 0.321, PR-AUC 0.558.
-- **Comparador** (mes 5, walk-forward × 3 seeds): GraphSAGE 0.9629 ± 0.0033 vs
-  GAT 0.9491 ± 0.0048 → GraphSAGE por mayor AUC (Δ=+0.0138, no hubo empate técnico).
-  KPI AUC ≥ 0.93 cumplido.
-- **Ciclo CL** (mes 6): la semana 1 disparó por tasa de escape (55% > 30%) con recall
-  0.5135. El **primer intento falló** ("no aprendió"), el dial de plasticidad ajustó la
-  receta (mezcla 50/50, LR ×2, capa 2 descongelada, 12 épocas) y el segundo intento pasó
-  la doble validación → despliegue. Recall de la semana: 0.5135 → 1.0000.
-  Semanas 2-4 sin disparos (0.979 / 1.000 / 0.960).
-- **Comparación final** (mes 6, threshold 0.5):
-
-  | | XGBoost congelado | GNN + CL |
-  |---|---|---|
-  | Recall | 0.316 | 0.984 |
-  | Precisión | 0.285 | 0.394 |
-  | AUC-ROC | 0.931 | 0.978 |
-  | PR-AUC | 0.429 | 0.809 |
-  | Recall sobre **emergentes** | 0.010 | 0.981 |
-
-  Gap sobre emergentes **+0.971** (KPI ≥ 0.20 cumplido). 101 fraudes adicionales.
-
-Dos salvedades honestas sobre estos números: el split 70/30 dejó **solo 3 casos** en
-verificación (con 11 fraudes escapados), así que el KPI de "aprendió ≥ 0.70" no tiene
-poder estadístico — valida el mecanismo, no la magnitud. Y el patrón B de la demo fue
-diseñado para ser aprendible por fine-tuning, lo que introduce cierta circularidad.
-Ambas cosas desaparecen con el IEEE-CIS real.
+**Sobre la profundidad**: la homofilia medida en este dataset dice que la señal
+está a 1 salto (separación fraude/legítima 3.9x), se pierde a 2 (0.7x) y se
+**invierte** a 3 (0.3x). Apilar capas promedia ruido — es *over-smoothing*.
 
 ---
 
-## 7. Decisiones de diseño que conviene recordar (para la defensa)
+## Decisiones de diseño (para la defensa)
 
-- **SMOTE solo en el baseline tabular**: un ejemplo sintético no tiene aristas; en la
-  GNN el desbalance se maneja con `pos_weight` en la loss (27.6 original, ~1.2 en
-  fine-tuning porque la mezcla 40/60 ya viene balanceada; en inferencia no existe).
-- **El gatillo mira score BAJO en fraude confirmado**: si el modelo ya le daba score
-  alto no hay nada nuevo que aprender; el patrón emergente es el que se le escapa.
-- **Buffer ≠ control**: el buffer es memoria de entrenamiento (casos ya entrenados,
-  priorizando frontera 0.4-0.7); el control es un examen sorpresa congelado (casos
-  jamás entrenados). Si se cruzan, la validación de olvido queda contaminada.
-- **BatchNorm congelado en fine-tuning**: con lotes chicos y sesgados a fraude, dejar
-  que los BN actualicen sus estadísticas colapsa el modelo (lo vimos empíricamente
-  en el smoke test: recall de control 0.88 → 0.00 sin congelar, 0.88 → 0.88 congelando).
-- **Validación contra el modelo anterior**: el nuevo debe ser mejor donde el viejo
-  fallaba (verificación) sin empeorar donde funcionaba (control). Las dos cosas, no una.
-- **Redundancia en el buffer**: dos casos de la misma clase, mismo origen y score
-  casi idéntico son informacionalmente equivalentes para el repaso — se conserva
-  uno y el resto sale primero en la evicción. Criterio simple y explicable, sin
-  costo de cómputo extra.
-- **Selección walk-forward**: elegir la arquitectura por su AUC promedio semana a
-  semana (y no solo por el mes completo) evita premiar un modelo que rinde bien
-  "en promedio" pero se degrada hacia el final del mes de validación.
+- **SMOTE solo en el baseline.** Un ejemplo sintético no tiene aristas; en la GNN
+  el desbalance se maneja con `pos_weight` en la loss.
+- **El gatillo mira score BAJO en fraude confirmado.** Si el modelo ya le daba
+  score alto no hay nada nuevo que aprender.
+- **Buffer ≠ control.** El buffer es memoria de entrenamiento; el control es un
+  examen sorpresa congelado. Si se cruzan, la validación de olvido se contamina.
+- **BatchNorm congelado en fine-tuning.** Con lotes chicos y sesgados a fraude,
+  dejar que actualice sus estadísticas colapsa el modelo (recall de control
+  0.88 → 0.00 sin congelar; 0.88 → 0.88 congelando).
+- **Doble validación.** El modelo nuevo debe mejorar donde el viejo fallaba
+  *sin* empeorar donde funcionaba. Las dos cosas, no una.
+- **Selección walk-forward.** Elegir por el AUC promedio semana a semana evita
+  premiar a un modelo que va bien "en promedio" pero se degrada al final del mes.
+- **Comparar a igual presupuesto de alertas.** A umbral fijo, dos modelos con
+  calibraciones distintas no son comparables: el que tiene `pos_weight` alto
+  alerta más y parece mejor en recall. `final_comparison.py` reporta también a
+  igual número de alertas y a igual precisión.
+- **Refit antes del test.** El mes 5 se gasta en decidir; una vez decidido, se
+  reentrena al ganador desde cero con los meses 1-5. Las épocas se heredan del
+  pico de la corrida original (sin validación no hay early stopping) — limitación
+  asumida por el procedimiento.

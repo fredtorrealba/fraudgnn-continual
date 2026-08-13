@@ -52,11 +52,22 @@ if torch.cuda.is_available():
     vram = props.total_memory / 1024**3
     print(f"  GPU              : {props.name}")
     print(f"  VRAM             : {vram:.1f} GB")
-    # GAT retiene ~12 GB de activaciones con batch_size 1024 sobre el dataset
-    # completo (~1.8M aristas/batch, tensor [aristas, heads, canales] por capa).
-    if vram < 20:
-        print("  !! Menos de 20 GB: baja gnn.batch_size a 512 en config/config.yaml")
-        print("     ANTES de la primera corrida, y déjalo fijo para las 6 seeds.")
+    # La VRAM que hace falta depende de la PROFUNDIDAD: cada capa es un salto,
+    # y el subgrafo por batch crece con el fanout acumulado. Medido con
+    # batch_size 1024 sobre el dataset completo:
+    #   1 capa  -> < 1 GB     3.4K nodos por batch
+    #   2 capas -> ~4 GB     12.3K nodos
+    #   3 capas -> ~17 GB    23.7K nodos, 1.8M aristas (GAT retiene ~12 GB
+    #                        solo en tensores de atención)
+    import yaml
+    with open("config/config.yaml") as fh:
+        capas = len(yaml.safe_load(fh)["gnn"]["hidden_dims"])
+    necesita = {1: 2, 2: 6, 3: 20}.get(capas, 20)
+    print(f"  capas (config)   : {capas}  -> necesita ~{necesita} GB con batch 1024")
+    if vram < necesita:
+        print(f"  !! {vram:.1f} GB puede no bastar para {capas} capas: baja")
+        print("     gnn.batch_size a 512 ANTES de la primera corrida, y déjalo")
+        print("     fijo para las 6 seeds.")
     else:
         print("  VRAM suficiente para batch_size 1024 sin tocar la config.")
 print(f"  dispositivo      : {get_device().type}")
