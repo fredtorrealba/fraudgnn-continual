@@ -28,7 +28,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from src.gnn.sampling import loader_opts, make_neighbor_loader
+from src.gnn.sampling import make_neighbor_loader
 from src.utils.common import get_device, get_logger, load_config
 
 log = get_logger("cl.finetune")
@@ -91,8 +91,10 @@ def finetune(model, data, adapt_nodes: np.ndarray, buffer_nodes: np.ndarray,
     seed_mask[torch.tensor(seed_nodes, dtype=torch.long)] = True
     loader = make_neighbor_loader(data, num_neighbors=cfg["gnn"]["fanouts"],
                                   input_nodes=seed_mask,
-                                  batch_size=ft["batch_size"], shuffle=True,
-                                  **loader_opts(cfg))
+                                  batch_size=ft["batch_size"], shuffle=True)
+    # Sin num_workers: el fine-tuning trabaja con decenas de muestras (mezcla
+    # 40/60 de casos nuevos + buffer). Un pool de procesos para 1-2 batches es
+    # puro overhead, y su destrucción repetida ensucia el log.
 
     optimizer = torch.optim.Adam(model.param_groups(lrs))
     criterion = torch.nn.BCEWithLogitsLoss(

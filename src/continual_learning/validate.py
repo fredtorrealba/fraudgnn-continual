@@ -28,7 +28,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from src.gnn.sampling import loader_opts, make_neighbor_loader
+from src.gnn.sampling import make_neighbor_loader
 from src.utils.common import get_device, get_logger, load_config
 from src.utils.metrics import full_report, recall_at_threshold
 
@@ -41,10 +41,16 @@ def score_nodes(model, data, node_idx: np.ndarray, cfg) -> np.ndarray:
     device = get_device()
     model = model.to(device).eval()
     mask = torch.zeros(data.num_nodes, dtype=torch.bool)
-    mask[torch.tensor(node_idx, dtype=torch.long)] = True
+    # as_tensor en vez de tensor(): si node_idx YA es un tensor, tensor() copia
+    # y avisa con UserWarning. as_tensor no copia ni avisa.
+    mask[torch.as_tensor(node_idx, dtype=torch.long)] = True
+    # SIN num_workers a propósito: este loader se crea de nuevo en cada intento
+    # de cada semana (4 semanas x 3 intentos x N validaciones) sobre conjuntos
+    # de 2 a 5000 nodos. Levantar procesos persistentes para eso es más caro que
+    # el muestreo, y al destruirlos tan seguido PyTorch escupe cientos de
+    # "Bad file descriptor" y "semaphore released too many times" al cerrar.
     loader = make_neighbor_loader(data, num_neighbors=cfg["gnn"]["fanouts"],
-                                  input_nodes=mask, batch_size=512, shuffle=False,
-                                  **loader_opts(cfg))
+                                  input_nodes=mask, batch_size=512, shuffle=False)
     scores = np.zeros(data.num_nodes, dtype=np.float32)
     for batch in loader:
         batch = batch.to(device)

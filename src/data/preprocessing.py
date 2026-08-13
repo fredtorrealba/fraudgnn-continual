@@ -46,10 +46,14 @@ def load_raw(raw_dir: Path) -> pd.DataFrame:
 
 def add_temporal_columns(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     spm = cfg["data"]["seconds_per_month"]
-    df["month"] = (df["TransactionDT"] // spm).astype(int) + 1
-    # Semana relativa dentro del mes (para simular "futuro que llega" en test)
-    df["week_in_month"] = (((df["TransactionDT"] % spm) // (spm // 4)) + 1).clip(1, 4).astype(int)
-    return df
+    # assign() en vez de dos asignaciones sueltas: insertar columnas una a una
+    # en un DataFrame de 400+ columnas lo fragmenta y dispara PerformanceWarning.
+    return df.assign(
+        month=(df["TransactionDT"] // spm).astype(int) + 1,
+        # Semana relativa dentro del mes (simula el "futuro que llega" en test)
+        week_in_month=(((df["TransactionDT"] % spm) // (spm // 4)) + 1)
+                      .clip(1, 4).astype(int),
+    )
 
 
 def encode_and_impute(df: pd.DataFrame, train_mask: pd.Series):
@@ -61,10 +65,14 @@ def encode_and_impute(df: pd.DataFrame, train_mask: pd.Series):
                 if not pd.api.types.is_numeric_dtype(df[c])]
     num_cols = [c for c in feature_cols if c not in cat_cols]
 
-    # Guardar crudas para las aristas ANTES de codificar
-    for c in EDGE_RAW_COLS:
-        if c in df.columns:
-            df[f"raw__{c}"] = df[c].astype(str).replace("nan", np.nan)
+    # Guardar crudas para las aristas ANTES de codificar.
+    # Se añaden TODAS de una vez con concat: en bucle serían ~10 inserciones
+    # sucesivas sobre un DataFrame ancho, que es justo lo que pandas penaliza
+    # con PerformanceWarning ("DataFrame is highly fragmented").
+    crudas = {f"raw__{c}": df[c].astype(str).replace("nan", np.nan)
+              for c in EDGE_RAW_COLS if c in df.columns}
+    if crudas:
+        df = pd.concat([df, pd.DataFrame(crudas, index=df.index)], axis=1)
 
     # Categóricas: mapa de categorías aprendido en train; lo no visto -> -1
     for c in cat_cols:

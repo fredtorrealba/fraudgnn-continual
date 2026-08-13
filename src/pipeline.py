@@ -16,11 +16,26 @@ Dos niveles de memoria:
 El avance queda registrado en artifacts/pipeline_state.json, que se CREA solo
 en la primera corrida.
 
+Las 7 etapas (`--steps` las explica en detalle desde la terminal):
+
+  1. download    Kaggle -> data/raw/            ~1 min   (único paso con red)
+  2. preprocess  CSV -> parquet + split 6 meses ~1 min
+  3. graph       parquet -> grafo PyG (~22M aristas)     ~4 min
+  4. gnn         GraphSAGE vs GAT, 6 corridas  2-4 h GPU  <- el paso caro
+  5. cl          mes 6 semana a semana, fine-tuning      ~15 min
+  6. xgboost     baseline tabular CONGELADO              ~10 min
+  7. final       comparación GNN+CL vs baseline          ~1 min
+
+XGBoost va en 6 y no en su posición nominal [3] porque solo depende de
+`preprocess` y su salida solo la usa `final`: así el paso caro arranca antes.
+
 Uso:
   python -m src.pipeline                 # corre lo que falte, en orden
-  python -m src.pipeline --status        # solo mostrar en qué va (no ejecuta)
+  python -m src.pipeline --steps         # qué hace cada etapa (no ejecuta)
+  python -m src.pipeline --status        # en qué va ahora mismo (no ejecuta)
   python -m src.pipeline --from gnn      # desde ese paso en adelante
-  python -m src.pipeline --only cl       # un solo paso
+  python -m src.pipeline --only gnn,cl   # SOLO esos pasos (coma)
+  python -m src.pipeline --skip xgboost  # todo MENOS esos pasos (coma)
   python -m src.pipeline --force xgboost # rehacer ese paso aunque esté listo
   python -m src.pipeline --force         # rehacer TODO desde cero
 """
@@ -28,7 +43,7 @@ import argparse
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -45,6 +60,7 @@ class Step:
     module: str                     # se ejecuta como python -m <module>
     outputs: list[tuple[str, str]]  # (clave de config.paths, archivo)
     args: list[str] = field(default_factory=list)
+    desc: str = ""                  # resumen de qué hace, ver --steps
 
     def output_paths(self, cfg) -> list[Path]:
         return [resolve(cfg, key) / name for key, name in self.outputs]
@@ -61,24 +77,42 @@ class Step:
 STEPS = [
     Step("download", "[0] Descarga del dataset IEEE-CIS",
          "src.data.download_ieee_cis",
-         [("raw_dir", "train_transaction.csv"), ("raw_dir", "train_identity.csv")]),
+         [("raw_dir", "train_transaction.csv"), ("raw_dir", "train_identity.csv")],
+         desc="Baja train_transaction.csv (~650 MB) + train_identity.csv de Kaggle. "
+              "El test de la competencia NO trae etiquetas, por eso los 6 meses se "
+              "cortan dentro del train. Único paso que necesita red. ~1 min."),
     Step("preprocess", "[1] Preprocesamiento + split temporal",
          "src.data.preprocessing",
          [("processed_dir", "full.parquet"), ("processed_dir", "split_masks.parquet"),
-          ("processed_dir", "feature_cols.json")]),
+          ("processed_dir", "feature_cols.json")],
+         desc="Une ambos CSV por TransactionID, codifica categóricas e imputa "
+              "faltantes (mapas y medianas ajustados SOLO con train, sin fuga) y "
+              "parte 6 meses por TransactionDT: 1-4 entrenan, 5 valida, 6 es test. "
+              "~1 min."),
     Step("graph", "[2] Construcción del grafo (PyG)",
          "src.data.build_graph",
-         [("graph_dir", "graph.pt")]),
+         [("graph_dir", "graph.pt")],
+         desc="Construye el grafo: nodos = transacciones, aristas = comparten "
+              "entidad (tarjeta / email / dispositivo) dentro de 30 días, con tope "
+              "de 50 aristas por nodo para evitar hubs. ~4 min, ~22M aristas."),
     # Este paso tiene reanudación propia por seed y por época: aunque se corte
     # a la mitad, al relanzarlo sigue desde la última época guardada.
     Step("gnn", "[4-5] GraphSAGE vs GAT (3 seeds c/u) + selección",
          "src.gnn.compare_gnns",
-         [("models_dir", "selected_model.json")]),
+         [("models_dir", "selected_model.json")],
+         desc="Entrena GraphSAGE y GAT con 3 semillas cada uno = 6 corridas, con "
+              "neighbor sampling 15-10-5 (nunca ve el grafo entero). Elige la mejor "
+              "por AUC walk-forward semanal. EL PASO CARO: 2-4 h con GPU. "
+              "Reanudable por corrida Y por época."),
     Step("cl", "[7] Ciclo de Continual Learning (mes 6 por semanas)",
          "src.continual_learning.cl_orchestrator",
          [("reports_dir", "cl_cycles.json"),
           ("reports_dir", "gnn_cl_test_scores.npz"),
-          ("graph_dir", "graph_scored.pt")]),
+          ("graph_dir", "graph_scored.pt")],
+         desc="Simula el mes 6 semana a semana. Por cada una: mide qué fraudes se "
+              "escaparon, dispara el gatillo si hay patrón nuevo, hace fine-tuning "
+              "40/60 (nuevos + replay buffer) con LR diferenciado por capa, y valida "
+              "que aprendió SIN olvidar. Solo despliega si pasa ambas. ~15 min."),
     # XGBoost va aquí, no en su posición nominal [3]: solo necesita
     # `preprocess` (lee full.parquet, no toca el grafo) y su salida la consume
     # únicamente `final`. Ponerlo al final deja que las 6 corridas GNN —lo caro
@@ -87,10 +121,18 @@ STEPS = [
     Step("xgboost", "[3] Baseline XGBoost (SMOTE + Optuna) — queda CONGELADO",
          "src.baseline_xgboost.train_xgboost",
          [("models_dir", "xgboost_baseline.json"),
-          ("reports_dir", "xgboost_val_metrics.json")]),
+          ("reports_dir", "xgboost_val_metrics.json")],
+         desc="Baseline tabular sobre las MISMAS features: SMOTE en train + "
+              "búsqueda bayesiana con Optuna (30 trials). Queda CONGELADO, nunca se "
+              "reentrena: es el punto de referencia contra el que se mide todo. "
+              "~10 min en GPU."),
     Step("final", "[8] Comparación final GNN+CL vs XGBoost (OE4)",
          "src.comparison.final_comparison",
-         [("reports_dir", "final_comparison.json")]),
+         [("reports_dir", "final_comparison.json")],
+         desc="Compara GNN+CL contra el baseline congelado sobre el mes 6: a "
+              "threshold fijo, a IGUAL presupuesto de alertas y a IGUAL precisión. "
+              "Las dos últimas son las comparables — con calibraciones distintas, el "
+              "threshold fijo mide agresividad, no detección. ~1 min."),
 ]
 
 BY_NAME = {s.name: s for s in STEPS}
@@ -136,6 +178,22 @@ def show_status(cfg):
         sub = gnn_progress(cfg) if step.name == "gnn" else ""
         log.info("  %d. %-10s %s %s%s%s", i, step.name, marca, step.title,
                  detalle, sub)
+
+
+def show_steps(cfg):
+    """Mapa de las etapas: qué hace cada una y qué deja en disco."""
+    import textwrap
+    print(f"\nPipeline FraudGNN — {len(STEPS)} etapas, en orden de ejecución\n")
+    for i, step in enumerate(STEPS, 1):
+        estado = "LISTO" if step.is_done(cfg) else "pendiente"
+        print(f"{i}. {step.name}  [{estado}]")
+        print(f"   {step.title}")
+        for linea in textwrap.wrap(step.desc, 72):
+            print(f"     {linea}")
+        print(f"     salidas: {', '.join(_rel(p) for p in step.output_paths(cfg))}")
+        print()
+    print("Los pasos se saltan solos si sus salidas ya existen. El disco es la")
+    print("verdad: borra una salida y ese paso vuelve a estar pendiente.\n")
 
 
 def run_step(step: Step, cfg) -> bool:
@@ -187,6 +245,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--status", action="store_true",
                    help="Mostrar en qué va y salir (no ejecuta nada)")
+    p.add_argument("--steps", action="store_true",
+                   help="Explicar qué hace cada etapa y salir (no ejecuta nada)")
     p.add_argument("--only", metavar="PASOS",
                    help="Ejecutar SOLO estos pasos (separados por coma)")
     p.add_argument("--skip", metavar="PASOS",
@@ -216,6 +276,10 @@ def main():
         log.info("Primera corrida — se crea el archivo de estado en %s",
                  state_path(cfg))
 
+    if args.steps:
+        show_steps(cfg)
+        return 0
+
     if args.status:
         show_status(cfg)
         return 0
@@ -244,8 +308,7 @@ def main():
         if step.name in forzados:
             log.info("== %s (forzado) ==", step.title)
             extra = ["--force"] if step.name == "gnn" else []
-            step = Step(step.name, step.title, step.module, step.outputs,
-                        step.args + extra)
+            step = replace(step, args=step.args + extra)
         elif step.is_done(cfg):
             log.info("-- %s: YA ESTÁ HECHO, se salta.", step.title)
             update_step(cfg, step.name, status="done", title=step.title)

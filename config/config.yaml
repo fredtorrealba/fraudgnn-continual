@@ -63,8 +63,8 @@ graph:
   max_edges_per_node: 50           # tope anti-hub
 
 gnn:
-  in_dim: 432                      # features por transacción
-  hidden_dims: [256, 128, 64]      # 3 capas GNN: 432 -> 256 -> 128 -> 64
+  in_dim: 431                      # features por transacción (valor real del grafo)
+  hidden_dims: [256, 128, 64]      # 3 capas GNN: 431 -> 256 -> 128 -> 64
   mlp_head_dim: 32                 # cabeza clasificadora 64 -> 32 -> 1
   dropout: 0.3
   fanouts: [15, 10, 5]             # neighbor sampling por capa (~750 nodos/subgrafo)
