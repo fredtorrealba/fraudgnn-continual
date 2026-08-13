@@ -23,28 +23,46 @@ from torch_geometric.nn import GATConv, SAGEConv
 
 
 class _BaseGNN(nn.Module):
-    """Esqueleto compartido: 3 convoluciones + MLP head."""
+    """
+    Esqueleto compartido: N convoluciones + MLP head.
+
+    N = len(hidden_dims), así que la PROFUNDIDAD es configurable desde
+    config.yaml sin tocar código:
+        hidden_dims: [256, 128, 64]  -> 3 capas = 3 saltos
+        hidden_dims: [256, 128]      -> 2 capas
+        hidden_dims: [256]           -> 1 capa
+
+    Importa porque cada capa es un SALTO en el grafo, y la señal no se reparte
+    por igual: medida sobre este dataset, la separación fraude/legítima es de
+    3.9x a 1 salto, 0.7x a 2 y 0.3x a 3 — a partir del segundo salto se agrega
+    ruido (over-smoothing). Los `fanouts` deben tener tantos elementos como
+    capas; `src.gnn.sampling.fanouts()` se encarga de recortarlos.
+    """
 
     def __init__(self, in_dim: int, hidden_dims: list[int], mlp_dim: int,
                  dropout: float):
         super().__init__()
+        if not hidden_dims:
+            raise ValueError("hidden_dims no puede estar vacío")
         self.dropout = dropout
-        h1, h2, h3 = hidden_dims
-        self.conv1 = self._make_conv(in_dim, h1)
-        self.conv2 = self._make_conv(h1, h2)
-        self.conv3 = self._make_conv(h2, h3)
-        self.bn1, self.bn2, self.bn3 = (nn.BatchNorm1d(h) for h in (h1, h2, h3))
+        dims = [in_dim, *hidden_dims]
+        self.convs = nn.ModuleList(
+            self._make_conv(dims[i], dims[i + 1]) for i in range(len(hidden_dims)))
+        self.bns = nn.ModuleList(nn.BatchNorm1d(h) for h in hidden_dims)
         self.classifier = nn.Sequential(
-            nn.Linear(h3, mlp_dim), nn.ReLU(),
+            nn.Linear(hidden_dims[-1], mlp_dim), nn.ReLU(),
             nn.Dropout(dropout), nn.Linear(mlp_dim, 1),
         )
+
+    @property
+    def n_capas(self) -> int:
+        return len(self.convs)
 
     def _make_conv(self, in_c, out_c):  # pragma: no cover - abstracta
         raise NotImplementedError
 
     def forward(self, x, edge_index):
-        for conv, bn in ((self.conv1, self.bn1), (self.conv2, self.bn2),
-                         (self.conv3, self.bn3)):
+        for conv, bn in zip(self.convs, self.bns):
             x = conv(x, edge_index)
             x = bn(x)
             x = F.relu(x)
@@ -60,17 +78,22 @@ class _BaseGNN(nn.Module):
         """
         Grupos de parámetros con LR diferenciado para el fine-tuning:
         lrs = {"layer1": 0.0, "layer2": 1e-5, "layer3": 1e-4, "classifier": 1e-3}
-        (BatchNorm de cada capa acompaña a su convolución.)
+
+        Con menos de 3 capas se usan los ÚLTIMOS N valores de la lista, para
+        conservar el gradiente de plasticidad que persigue el diseño: la capa
+        más profunda es la más libre de moverse y la primera la más congelada.
+        Con 1 capa, esa capa recibe `layer3` (la más plástica) — congelarla
+        dejaría solo el clasificador entrenando.
+        BatchNorm de cada capa acompaña a su convolución.
         """
-        return [
-            {"params": list(self.conv1.parameters()) + list(self.bn1.parameters()),
-             "lr": lrs["layer1"]},
-            {"params": list(self.conv2.parameters()) + list(self.bn2.parameters()),
-             "lr": lrs["layer2"]},
-            {"params": list(self.conv3.parameters()) + list(self.bn3.parameters()),
-             "lr": lrs["layer3"]},
-            {"params": self.classifier.parameters(), "lr": lrs["classifier"]},
+        escala = [lrs["layer1"], lrs["layer2"], lrs["layer3"]][-self.n_capas:]
+        grupos = [
+            {"params": list(c.parameters()) + list(b.parameters()), "lr": lr}
+            for c, b, lr in zip(self.convs, self.bns, escala)
         ]
+        grupos.append({"params": self.classifier.parameters(),
+                       "lr": lrs["classifier"]})
+        return grupos
 
 
 class FraudGraphSAGE(_BaseGNN):
@@ -88,7 +111,7 @@ class FraudGAT(_BaseGNN):
         super().__init__(in_dim, hidden_dims, mlp_dim, dropout)
 
     def _make_conv(self, in_c, out_c):
-        # concat=False -> promedio de cabezas, mantiene las dimensiones 256/128/64
+        # concat=False -> promedio de cabezas, respeta las dims de hidden_dims
         return GATConv(in_c, out_c, heads=self.heads, concat=False)
 
 

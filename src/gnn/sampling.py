@@ -17,6 +17,20 @@ import numpy as np
 import torch
 
 
+def fanouts(cfg: dict) -> list[int]:
+    """
+    Fanouts recortados al número de capas del modelo.
+
+    Cada capa es un salto, así que muestrear 3 saltos para un modelo de 1 capa
+    sería traer miles de nodos que nunca se usan. Se toman los PRIMEROS N
+    valores: el fanout grande corresponde al salto más cercano, que es donde
+    está la señal.
+    """
+    g = cfg.get("gnn", {})
+    n = len(g.get("hidden_dims", [256, 128, 64]))
+    return list(g["fanouts"])[:n]
+
+
 def loader_opts(cfg: dict) -> dict:
     """Opciones de muestreo del config, listas para pasar al loader."""
     g = cfg.get("gnn", {})

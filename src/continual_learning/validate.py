@@ -28,7 +28,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from src.gnn.sampling import make_neighbor_loader
+from src.gnn.sampling import fanouts, make_neighbor_loader
 from src.utils.common import get_device, get_logger, load_config
 from src.utils.metrics import full_report, recall_at_threshold
 
@@ -49,7 +49,7 @@ def score_nodes(model, data, node_idx: np.ndarray, cfg) -> np.ndarray:
     # de 2 a 5000 nodos. Levantar procesos persistentes para eso es más caro que
     # el muestreo, y al destruirlos tan seguido PyTorch escupe cientos de
     # "Bad file descriptor" y "semaphore released too many times" al cerrar.
-    loader = make_neighbor_loader(data, num_neighbors=cfg["gnn"]["fanouts"],
+    loader = make_neighbor_loader(data, num_neighbors=fanouts(cfg),
                                   input_nodes=mask, batch_size=512, shuffle=False)
     scores = np.zeros(data.num_nodes, dtype=np.float32)
     for batch in loader:

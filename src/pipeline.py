@@ -31,6 +31,7 @@ Uso:
   python -m src.pipeline --force         # rehacer TODO
 """
 import argparse
+import json
 import subprocess
 import sys
 import time
@@ -174,6 +175,157 @@ def show_status(cfg):
                  detalle, sub)
 
 
+def archivar(cfg, nombre: str | None = None) -> Path:
+    """
+    MUEVE los resultados de la corrida actual a historial/<fecha>_<nombre>/.
+
+    Se archivan models/, reports/ y artifacts/ junto con una copia del
+    config.yaml que los produjo — sin esa copia, un resultado antiguo no se
+    puede interpretar (¿cuántas capas tenía? ¿qué batch_size?). Los datos
+    (data/) NO se archivan: pesan GB y se regeneran en minutos.
+
+    Al vaciar esos directorios, el pipeline vuelve a ver todo pendiente, que es
+    justo lo que hace falta para lanzar una corrida nueva y compararla después.
+    """
+    import re, shutil, subprocess
+    from datetime import datetime
+
+    sello = datetime.now().strftime("%Y%m%d-%H%M")
+    slug = re.sub(r"[^a-z0-9]+", "-", (nombre or "").lower()).strip("-")
+    destino = resolve(cfg, "history_dir") / (f"{sello}_{slug}" if slug else sello)
+    destino.mkdir(parents=True, exist_ok=True)
+
+    movidos = 0
+    for clave in ("models_dir", "reports_dir", "artifacts_dir"):
+        origen = resolve(cfg, clave)
+        sub = destino / origen.name
+        for f in sorted(origen.iterdir()):
+            if f.name == ".gitkeep" or f.name.startswith("."):
+                continue
+            sub.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(f), str(sub / f.name))
+            movidos += 1
+
+    if movidos == 0:
+        destino.rmdir()
+        log.warning("No había nada que archivar (models/, reports/ y "
+                    "artifacts/ están vacíos).")
+        return destino
+
+    shutil.copy2(ROOT / "config" / "config.yaml", destino / "config.yaml")
+
+    try:
+        commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                                cwd=ROOT, capture_output=True, text=True,
+                                check=True).stdout.strip()
+    except Exception:
+        commit = None
+
+    g = cfg["gnn"]
+    meta = {
+        "fecha": datetime.now().isoformat(timespec="seconds"),
+        "nombre": nombre,
+        "commit": commit,
+        "archivos": movidos,
+        "config": {
+            "capas": len(g["hidden_dims"]), "hidden_dims": g["hidden_dims"],
+            "fanouts": g["fanouts"], "batch_size": g["batch_size"],
+            "epochs": g["epochs"], "patience": g["patience"],
+            "num_workers": g.get("num_workers"), "seeds": g["seeds"],
+            "n_jobs": (cfg.get("compute") or {}).get("n_jobs"),
+            "xgboost_device": cfg["xgboost"].get("device"),
+        },
+        "resumen": _resumen_metricas(destino),
+    }
+    with open(destino / "meta.json", "w") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
+
+    log.info("Archivados %d archivos en %s", movidos, _rel(destino))
+    log.info("models/, reports/ y artifacts/ quedan vacíos: el pipeline verá "
+             "todo pendiente para la corrida siguiente.")
+    return destino
+
+
+def _resumen_metricas(dir_archivo: Path) -> dict:
+    """Extrae los números clave del archivo recién creado, para comparar luego."""
+    out = {}
+
+    def leer(rel):
+        f = dir_archivo / rel
+        if not f.exists():
+            return None
+        try:
+            with open(f) as fh:
+                return json.load(fh)
+        except Exception:
+            return None
+
+    sel = leer("models/selected_model.json")
+    if sel and "selection" in sel:
+        s = sel["selection"]
+        out["gnn"] = {"ganadora": s.get("selected"), "seed": s.get("seed"),
+                      "auc_mean": s.get("auc_mean"), "auc_std": s.get("auc_std"),
+                      "kpi_ok": s.get("kpi_auc_ok")}
+        for arq, r in (sel.get("results") or {}).items():
+            out.setdefault("por_arquitectura", {})[arq] = {
+                "auc_mean": r.get("auc_mean"), "pr_auc": r.get("pr_auc_mean")}
+
+    fin = leer("reports/final_comparison.json")
+    if fin:
+        g = (fin.get("month6_overall") or {})
+        for k, etq in (("xgboost_frozen", "xgboost"),
+                       ("gnn_continual_learning", "gnn_cl")):
+            if k in g:
+                out.setdefault("mes6", {})[etq] = {
+                    "roc_auc": g[k].get("auc_roc"), "pr_auc": g[k].get("pr_auc"),
+                    "recall": g[k].get("recall"), "precision": g[k].get("precision")}
+        mb = fin.get("matched_budget") or {}
+        if mb:
+            out.setdefault("mes6", {})["igual_presupuesto"] = {
+                "alertas": mb.get("presupuesto_referencia"),
+                "recall_xgboost": mb.get("recall_xgboost_ref"),
+                "recall_gnn_cl": mb.get("recall_gnn_cl_ref")}
+
+    ciclos = leer("reports/cl_cycles.json")
+    if isinstance(ciclos, list):
+        out["cl"] = {"ciclos": len(ciclos),
+                     "desplegados": sum(1 for c in ciclos
+                                        if (c.get("verdict") or {}).get("deploy"))}
+    return out
+
+
+def listar_historial(cfg):
+    """Corridas archivadas, de la más reciente a la más antigua."""
+    raiz = resolve(cfg, "history_dir")
+    dirs = sorted([d for d in raiz.iterdir() if d.is_dir()], reverse=True) \
+        if raiz.exists() else []
+    if not dirs:
+        print("\nNo hay corridas archivadas. Crea una con --archive [nombre]\n")
+        return
+    print(f"\n{len(dirs)} corrida(s) archivada(s) en {_rel(raiz)}\n")
+    for d in dirs:
+        meta = {}
+        if (d / "meta.json").exists():
+            with open(d / "meta.json") as f:
+                meta = json.load(f)
+        c = meta.get("config", {})
+        print(f"  {d.name}")
+        if c:
+            print(f"    capas={c.get('capas')} {c.get('hidden_dims')} "
+                  f"fanouts={c.get('fanouts')} batch={c.get('batch_size')}")
+        r = meta.get("resumen", {})
+        if "gnn" in r:
+            g = r["gnn"]
+            print(f"    GNN: gana {g.get('ganadora')} | AUC {g.get('auc_mean')}")
+        if "mes6" in r:
+            m = r["mes6"]
+            for k in ("xgboost", "gnn_cl"):
+                if k in m:
+                    print(f"    mes6 {k:8s} PR-AUC {m[k].get('pr_auc')} | "
+                          f"ROC {m[k].get('roc_auc')}")
+        print()
+
+
 def show_steps(cfg):
     """Mapa de las etapas: qué hace cada una y qué deja en disco."""
     import textwrap
@@ -240,6 +392,11 @@ def main():
                    help="Mostrar en qué va y salir (no ejecuta nada)")
     p.add_argument("--steps", action="store_true",
                    help="Explicar qué hace cada etapa y salir (no ejecuta nada)")
+    p.add_argument("--archive", nargs="?", const="", metavar="NOMBRE",
+                   help="Mover models/, reports/ y artifacts/ a historial/ "
+                        "con una copia del config, y salir")
+    p.add_argument("--history", action="store_true",
+                   help="Listar las corridas archivadas y salir")
     p.add_argument("--only", metavar="PASOS",
                    help="Ejecutar SOLO estos pasos (separados por coma)")
     p.add_argument("--skip", metavar="PASOS",
@@ -268,6 +425,14 @@ def main():
     if not state_path(cfg).exists():
         log.info("Primera corrida — se crea el archivo de estado en %s",
                  state_path(cfg))
+
+    if args.history:
+        listar_historial(cfg)
+        return 0
+
+    if args.archive is not None:
+        archivar(cfg, args.archive or None)
+        return 0
 
     if args.steps:
         show_steps(cfg)

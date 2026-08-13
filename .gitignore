@@ -18,6 +18,7 @@ data/graph/*
 models/*
 artifacts/*
 reports/*
+historial/*
 # ...pero se conserva la estructura de carpetas y los resultados archivados
 !**/.gitkeep
 !reports/smoke_synthetic/

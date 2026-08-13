@@ -21,6 +21,8 @@
 #   --from gnn        desde ahí en adelante
 #   --force gnn cl    rehacer aunque estén listos (ESPACIO)
 #   --force           rehacer TODO
+#   --archive "1capa" guarda y limpia
+#    --history        lista lo archivado
 #
 # --force BORRA las salidas del paso antes de relanzarlo. En `download` eso
 # significa volver a bajar 650 MB de Kaggle.

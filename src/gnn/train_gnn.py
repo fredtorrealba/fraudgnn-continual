@@ -41,7 +41,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from src.gnn.models import build_model
-from src.gnn.sampling import loader_opts, make_neighbor_loader
+from src.gnn.sampling import fanouts, loader_opts, make_neighbor_loader
 from src.utils.common import (ensure_dirs, get_device, get_logger,
                               get_run_state, load_config, resolve, set_seed,
                               update_state)
@@ -120,7 +120,7 @@ def _restore_rng(st: dict, **loaders):
 def make_loader(data, mask, cfg, shuffle=True):
     return make_neighbor_loader(
         data,
-        num_neighbors=cfg["gnn"]["fanouts"],   # 15-10-5 -> ~750 nodos por subgrafo
+        num_neighbors=fanouts(cfg),            # recortados a las capas del modelo
         input_nodes=mask,
         batch_size=cfg["gnn"]["batch_size"],
         shuffle=shuffle,

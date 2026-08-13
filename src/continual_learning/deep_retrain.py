@@ -38,7 +38,7 @@ from src.continual_learning.control_set import ControlSet
 from src.continual_learning.replay_buffer import ReplayBuffer
 from src.continual_learning.validate import score_nodes
 from src.gnn.models import build_model
-from src.gnn.sampling import loader_opts, make_neighbor_loader
+from src.gnn.sampling import fanouts, loader_opts, make_neighbor_loader
 from src.utils.common import get_logger, load_config, resolve, set_seed
 from src.utils.metrics import recall_at_threshold
 
@@ -96,7 +96,7 @@ def deep_retrain(epochs: int | None = None):
     model = build_model(model_name, cfg)   # pesos NUEVOS: desde cero
     criterion = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight))
     opt = torch.optim.Adam(model.parameters(), lr=cfg["gnn"]["lr"])
-    loader = make_neighbor_loader(data, cfg["gnn"]["fanouts"], seed_mask,
+    loader = make_neighbor_loader(data, fanouts(cfg), seed_mask,
                                   cfg["gnn"]["batch_size"], shuffle=True,
                                   **loader_opts(cfg))
     n_epochs = epochs or cfg["gnn"]["epochs"]

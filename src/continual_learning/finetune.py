@@ -28,7 +28,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from src.gnn.sampling import make_neighbor_loader
+from src.gnn.sampling import fanouts, make_neighbor_loader
 from src.utils.common import get_device, get_logger, load_config
 
 log = get_logger("cl.finetune")
@@ -89,7 +89,7 @@ def finetune(model, data, adapt_nodes: np.ndarray, buffer_nodes: np.ndarray,
 
     seed_mask = torch.zeros(data.num_nodes, dtype=torch.bool)
     seed_mask[torch.tensor(seed_nodes, dtype=torch.long)] = True
-    loader = make_neighbor_loader(data, num_neighbors=cfg["gnn"]["fanouts"],
+    loader = make_neighbor_loader(data, num_neighbors=fanouts(cfg),
                                   input_nodes=seed_mask,
                                   batch_size=ft["batch_size"], shuffle=True)
     # Sin num_workers: el fine-tuning trabaja con decenas de muestras (mezcla

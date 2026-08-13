@@ -25,6 +25,7 @@ paths:
   models_dir: "models"             # checkpoints de modelos
   artifacts_dir: "artifacts"       # buffer, control set, logs de ciclos CL
   reports_dir: "reports"           # métricas, comparaciones, gráficos
+  history_dir: "historial"         # corridas archivadas (ver --archive)
 
 kaggle:
   # Descarga del dataset. OJO: este archivo SE VERSIONA — el token NUNCA va acá.
@@ -64,10 +65,24 @@ graph:
 
 gnn:
   in_dim: 431                      # features por transacción (valor real del grafo)
-  hidden_dims: [256, 128, 64]      # 3 capas GNN: 431 -> 256 -> 128 -> 64
-  mlp_head_dim: 32                 # cabeza clasificadora 64 -> 32 -> 1
+  # --- PROFUNDIDAD: cada capa es un SALTO en el grafo -------------------------
+  # Descomenta UNA. El número de capas es len(hidden_dims) y los `fanouts` se
+  # recortan solos a esa longitud (src/gnn/sampling.py: fanouts()).
+  #
+  # Homofilia medida sobre este dataset (separación fraude vs legítima):
+  #     1 salto  ->  3.9x   <- toda la señal está aquí
+  #     2 saltos ->  0.7x      la señal se pierde
+  #     3 saltos ->  0.3x      se INVIERTE (over-smoothing: se promedia ruido)
+  # Coste por batch de 256 nodos semilla: 3.4K nodos con 1 capa, 12.3K con 2,
+  # 23.7K con 3 — o sea que 1 capa entrena ~7x más barato.
+  #
+  hidden_dims: [256]               # 1 capa   431 -> 256
+  # hidden_dims: [256, 128]        # 2 capas  431 -> 256 -> 128
+  # hidden_dims: [256, 128, 64]    # 3 capas  431 -> 256 -> 128 -> 64  (original)
+  #
+  mlp_head_dim: 32                 # cabeza clasificadora: última capa -> 32 -> 1
   dropout: 0.3
-  fanouts: [15, 10, 5]             # neighbor sampling por capa (~750 nodos/subgrafo)
+  fanouts: [15, 10, 5]             # vecinos por salto; se usan los primeros N
   batch_size: 1024
   lr: 0.001
   epochs: 30
