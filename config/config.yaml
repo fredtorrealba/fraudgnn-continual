@@ -16,7 +16,7 @@ compute:
   # Con -1 se lanzarían 96 hilos para 7 núcleos: el kernel quema la cuota en
   # milisegundos y CONGELA el proceso el resto de cada ventana de 100 ms
   # (cgroup throttling). Poner aquí el número real lo evita.
-  n_jobs: 9
+  n_jobs: 7
 
 paths:
   raw_dir: "data/raw"              # train_transaction.csv + train_identity.csv (IEEE-CIS)
