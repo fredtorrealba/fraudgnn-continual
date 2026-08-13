@@ -86,6 +86,50 @@ def recall_at_precision(y, s, objetivo: float):
     return float(tp[k - 1] / max(y.sum(), 1)), k
 
 
+def por_semana(test_df, y, scores_xgb, scores_gnn, thr):
+    """
+    AUC y PR-AUC SEMANA A SEMANA dentro del mes 6.
+
+    Existe porque el AUC del mes agregado puede mentir. Medido en la ablación
+    sin aristas: el modelo daba 0.8524 sobre el mes completo pero 0.6075 de
+    media semanal — separaba transacciones por PERIODO TEMPORAL, no por fraude.
+    Al agrupar el mes entero esa correlación con el tiempo infla la métrica;
+    dentro de una semana, donde apenas hay variación temporal, no queda nada.
+
+    Un sistema de fraude decide semana a semana, así que esta es la métrica con
+    sentido operativo. La misma lógica que ya usa compare_gnns para elegir
+    arquitectura (AUC walk-forward), aplicada ahora al mes de test.
+    """
+    if "week_in_month" not in test_df.columns:
+        return None
+    semanas = test_df["week_in_month"].values
+    filas = []
+    for w in sorted(set(semanas.tolist())):
+        m = semanas == w
+        if len(np.unique(y[m])) < 2:
+            continue
+        rx = full_report(y[m], scores_xgb[m], thr)
+        rg = full_report(y[m], scores_gnn[m], thr)
+        filas.append({"semana": int(w), "n": int(m.sum()),
+                      "n_fraude": int(y[m].sum()),
+                      "xgboost": {"auc_roc": rx.get("auc_roc"),
+                                  "pr_auc": rx.get("pr_auc")},
+                      "gnn_cl": {"auc_roc": rg.get("auc_roc"),
+                                 "pr_auc": rg.get("pr_auc")}})
+    if not filas:
+        return None
+    med = lambda k, c: float(np.mean([f[k][c] for f in filas]))
+    return {"nota": ("AUC dentro de cada semana. Si cae mucho respecto al mes "
+                     "agregado, la métrica mensual estaba inflada por "
+                     "correlación temporal, no por capacidad de detección."),
+            "semanas": filas,
+            "media_semanal": {
+                "xgboost": {"auc_roc": med("xgboost", "auc_roc"),
+                            "pr_auc": med("xgboost", "pr_auc")},
+                "gnn_cl": {"auc_roc": med("gnn_cl", "auc_roc"),
+                           "pr_auc": med("gnn_cl", "pr_auc")}}}
+
+
 def cl_desplego(cfg) -> bool:
     """¿Algún ciclo de CL llegó a desplegar? Si no, el modelo nunca cambió."""
     ruta = resolve(cfg, "reports_dir") / "cl_cycles.json"
@@ -202,6 +246,7 @@ def main():
     else:
         usd_iso = float(extra_iso.sum() * cfg["comparison"]["avg_fraud_amount_usd"])
 
+    semanal = por_semana(test_df, y_gnn, xgb_scores, gnn_cl_scores, thr)
     desplego = cl_desplego(cfg)
 
     result = {
@@ -216,6 +261,7 @@ def main():
             "gana_en_referencia": "xgboost" if r_xgb_ref > r_gnn_ref else "gnn_cl",
             "barrido": por_presupuesto,
         },
+        "month6_weekly": semanal,
         "matched_precision": {
             "nota": ("Recall máximo de cada modelo sin bajar de la precisión "
                      "objetivo. Responde: a igual calidad de alerta, ¿quién "
@@ -281,6 +327,18 @@ def main():
         log.info("  precisión %3.0f%% | XGBoost %-22s | GNN+CL %s",
                  100 * fila["precision_objetivo"], fmt(fila["xgboost"]),
                  fmt(fila["gnn_cl"]))
+    if semanal:
+        log.info("-- SEMANA A SEMANA (el mes agregado puede inflar el AUC) --")
+        for f in semanal["semanas"]:
+            log.info("  semana %d (%5d txn, %3d fraudes) | XGBoost %.4f | GNN+CL %.4f",
+                     f["semana"], f["n"], f["n_fraude"],
+                     f["xgboost"]["auc_roc"], f["gnn_cl"]["auc_roc"])
+        ms = semanal["media_semanal"]
+        log.info("  MEDIA SEMANAL             | XGBoost %.4f | GNN+CL %.4f",
+                 ms["xgboost"]["auc_roc"], ms["gnn_cl"]["auc_roc"])
+        log.info("  (contra el mes agregado   | XGBoost %.4f | GNN+CL %.4f)",
+                 rep_xgb.get("auc_roc", float("nan")),
+                 rep_cl.get("auc_roc", float("nan")))
     log.info("-- Threshold-independiente --")
     log.info("  XGBoost  ROC-AUC %.4f | PR-AUC %.4f",
              rep_xgb.get("auc_roc", float("nan")), rep_xgb.get("pr_auc", float("nan")))
