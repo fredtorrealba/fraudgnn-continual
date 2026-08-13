@@ -95,8 +95,12 @@ def build_edges(df: pd.DataFrame, cfg: dict) -> np.ndarray:
     if not edges:
         return np.zeros((2, 0), dtype=np.int64)
     arr = np.array(list(edges), dtype=np.int64).T
-    # Grafo no dirigido -> duplicar en ambos sentidos
-    return np.concatenate([arr, arr[::-1]], axis=1)
+    # Grafo no dirigido -> duplicar en ambos sentidos.
+    # ascontiguousarray NO es cosmético: .T y [::-1] devuelven vistas en orden
+    # Fortran, torch.tensor() PRESERVA esos strides, y el sampler nativo
+    # (pyg_lib.ops.index_sort) falla con "Input should be contiguous".
+    return np.ascontiguousarray(
+        np.concatenate([arr, arr[::-1]], axis=1))
 
 
 def main():

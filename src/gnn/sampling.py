@@ -134,6 +134,12 @@ def make_neighbor_loader(data, num_neighbors, input_nodes, batch_size,
     """
     if _has_pyg_sampler():
         from torch_geometric.loader import NeighborLoader
+        # pyg-lib exige tensores contiguos. Los grafos generados antes de
+        # arreglar build_graph traen edge_index como vista transpuesta
+        # (stride (1,2)) y revientan en index_sort: se normalizan aquí para
+        # no obligar a reconstruir el grafo.
+        if not data.edge_index.is_contiguous():
+            data.edge_index = data.edge_index.contiguous()
         extra = {}
         if num_workers and int(num_workers) > 0:
             # persistent_workers evita respawnear los procesos en CADA época
