@@ -27,8 +27,10 @@ Uso:
   python -m src.pipeline --only gnn,cl   # SOLO esos          (coma)
   python -m src.pipeline --skip xgboost  # todo MENOS esos    (coma)
   python -m src.pipeline --from gnn      # desde ahí en adelante
-  python -m src.pipeline --force gnn cl  # rehacer            (espacio)
-  python -m src.pipeline --force         # rehacer TODO
+  python -m src.pipeline --only gnn --force   # rehacer SOLO ese paso
+  python -m src.pipeline --skip cl --force   # rehacer todo menos ese
+  python -m src.pipeline --force             # rehacer TODO
+  python -m src.pipeline --archive "1capa"   # archivar y dejar en cero
 """
 import argparse
 import json
@@ -181,11 +183,11 @@ def archivar(cfg, nombre: str | None = None) -> Path:
 
     Se archivan models/, reports/ y artifacts/ junto con una copia del
     config.yaml que los produjo — sin esa copia, un resultado antiguo no se
-    puede interpretar (¿cuántas capas tenía? ¿qué batch_size?). Los datos
-    (data/) NO se archivan: pesan GB y se regeneran en minutos.
+    puede interpretar (¿cuántas capas tenía? ¿qué batch_size?).
 
-    Al vaciar esos directorios, el pipeline vuelve a ver todo pendiente, que es
-    justo lo que hace falta para lanzar una corrida nueva y compararla después.
+    Y se BORRA data/ entero: archivar cierra la corrida y deja el repositorio
+    en cero. No se copia porque pesa GB y es determinista — con el config
+    archivado se reconstruye igual, y la huella del grafo lo verifica.
     """
     import re, shutil, subprocess
     from datetime import datetime
@@ -214,6 +216,20 @@ def archivar(cfg, nombre: str | None = None) -> Path:
 
     shutil.copy2(ROOT / "config" / "config.yaml", destino / "config.yaml")
 
+    # feature_cols.json (5 KB) define QUÉ vio el modelo: sin él un resultado
+    # archivado no se puede reinterpretar. Barato y necesario.
+    fc = resolve(cfg, "processed_dir") / "feature_cols.json"
+    if fc.exists():
+        shutil.copy2(fc, destino / "feature_cols.json")
+
+    # graph_scored.pt lo PRODUCE la corrida (paso cl) pero cae en data/, así que
+    # se mueve aquí igual que los reports. graph.pt NO: es determinista a partir
+    # de full.parquet + la sección graph: del config, y pesa 1.3 GB.
+    gs = resolve(cfg, "graph_dir") / "graph_scored.pt"
+    if gs.exists():
+        shutil.move(str(gs), str(destino / "graph_scored.pt"))
+        movidos += 1
+
     try:
         commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
                                 cwd=ROOT, capture_output=True, text=True,
@@ -235,15 +251,55 @@ def archivar(cfg, nombre: str | None = None) -> Path:
             "n_jobs": (cfg.get("compute") or {}).get("n_jobs"),
             "xgboost_device": cfg["xgboost"].get("device"),
         },
+        "grafo": _huella_grafo(cfg),
         "resumen": _resumen_metricas(destino),
     }
     with open(destino / "meta.json", "w") as f:
         json.dump(meta, f, indent=2, ensure_ascii=False)
 
     log.info("Archivados %d archivos en %s", movidos, _rel(destino))
-    log.info("models/, reports/ y artifacts/ quedan vacíos: el pipeline verá "
-             "todo pendiente para la corrida siguiente.")
+
+    # data/ se borra ENTERO: archivar significa cerrar la corrida y dejar el
+    # repositorio en cero. Es reproducible porque el config.yaml viaja con el
+    # archivo, y la huella del grafo (nodos/aristas/features) permite verificar
+    # que el reconstruido es el mismo.
+    borrados, bytes_ = 0, 0
+    for clave in ("raw_dir", "processed_dir", "graph_dir"):
+        for f in resolve(cfg, clave).iterdir():
+            if f.name == ".gitkeep" or f.name.startswith("."):
+                continue
+            bytes_ += f.stat().st_size
+            f.unlink()
+            borrados += 1
+    if borrados:
+        log.info("data/ vaciado: %d archivos, %.1f GB liberados",
+                 borrados, bytes_ / 1073741824)
+
+    log.info("Todo limpio. La corrida siguiente arranca desde cero:")
+    log.info("  bash scripts/run_pipeline.sh          (~7 min de datos + entrenamiento)")
     return destino
+
+
+def _huella_grafo(cfg) -> dict:
+    """
+    Identidad del grafo usado, SIN copiarlo (pesa 1.3 GB y es determinista a
+    partir de full.parquet + la sección graph: del config). Con estos números
+    se comprueba si dos corridas archivadas partieron del mismo grafo; si no,
+    se reconstruye desde el config que acompaña al archivo.
+    """
+    ruta = resolve(cfg, "graph_dir") / "graph.pt"
+    out = {"config_graph": cfg.get("graph"), "existe": ruta.exists()}
+    if not ruta.exists():
+        return out
+    out["bytes"] = ruta.stat().st_size
+    try:
+        import torch
+        d = torch.load(ruta, weights_only=False, map_location="cpu")
+        out.update(nodos=int(d.num_nodes), aristas=int(d.edge_index.shape[1]),
+                   features=int(d.x.shape[1]))
+    except Exception as e:
+        out["error"] = str(e)
+    return out
 
 
 def _resumen_metricas(dir_archivo: Path) -> dict:
@@ -382,19 +438,21 @@ def main():
     p = argparse.ArgumentParser(
         description="Pipeline FraudGNN, reanudable.",
         epilog="Pasos: " + ", ".join(BY_NAME) + "\n"
-               "--only y --skip aceptan varios separados por coma y se pueden "
-               "combinar con --from. Ejemplos:\n"
-               "  --only gnn,cl          solo esos dos\n"
-               "  --skip xgboost         todo menos ese\n"
-               "  --from gnn --skip cl   desde gnn en adelante, sin cl",
+               "--only y --skip aceptan varios separados por coma y se combinan "
+               "con --from. --force actúa sobre lo que ellos dejen:\n"
+               "  --only gnn,cl            solo esos dos, lo que falte\n"
+               "  --only gnn,cl --force    solo esos dos, rehaciéndolos\n"
+               "  --skip xgboost --force   rehace todo menos xgboost\n"
+               "  --force                  rehace TODO",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--status", action="store_true",
                    help="Mostrar en qué va y salir (no ejecuta nada)")
     p.add_argument("--steps", action="store_true",
                    help="Explicar qué hace cada etapa y salir (no ejecuta nada)")
     p.add_argument("--archive", nargs="?", const="", metavar="NOMBRE",
-                   help="Mover models/, reports/ y artifacts/ a historial/ "
-                        "con una copia del config, y salir")
+                   help="Archivar la corrida en historial/ (con el config que "
+                        "la produjo) y dejar models/, reports/, artifacts/ y "
+                        "data/ en cero. Sale sin ejecutar nada")
     p.add_argument("--history", action="store_true",
                    help="Listar las corridas archivadas y salir")
     p.add_argument("--only", metavar="PASOS",
@@ -403,9 +461,10 @@ def main():
                    help="Ejecutar todo MENOS estos pasos (separados por coma)")
     p.add_argument("--from", dest="from_step", metavar="PASO",
                    help="Empezar desde ese paso")
-    p.add_argument("--force", nargs="*", metavar="PASO",
-                   help="Rehacer esos pasos aunque estén listos "
-                        "(sin argumentos: todos)")
+    p.add_argument("--force", action="store_true",
+                   help="Rehacer los pasos seleccionados aunque ya estén "
+                        "listos. Actúa sobre lo que dejen --only/--skip/--from; "
+                        "solo, rehace TODO")
     args = p.parse_args()
 
     cfg = load_config()
@@ -416,8 +475,7 @@ def main():
         return [x.strip() for x in v.split(",") if x.strip()] if v else []
 
     solo, omitir = lista(args.only), lista(args.skip)
-    for nombre in [*solo, *omitir, *filter(None, [args.from_step]),
-                   *(args.force or [])]:
+    for nombre in [*solo, *omitir, *filter(None, [args.from_step])]:
         if nombre not in BY_NAME:
             p.error(f"paso desconocido: {nombre}. Válidos: "
                     f"{', '.join(BY_NAME)}")
@@ -458,8 +516,10 @@ def main():
     if solo or omitir:
         log.info("Pasos seleccionados: %s", ", ".join(s.name for s in pasos))
 
-    forzados = (set(BY_NAME) if args.force == []
-                else set(args.force or []))
+    # --force no elige pasos: fuerza los que ya eligieron --only/--skip/--from.
+    # Así "--only graph --force" rehace SOLO el grafo, en vez de rehacer el
+    # grafo y además arrastrar cualquier otro paso pendiente.
+    forzados = {p.name for p in pasos} if args.force else set()
 
     listos = [s.name for s in STEPS if s.is_done(cfg)]
     log.info("Estado: %d/%d listos%s", len(listos), len(STEPS),

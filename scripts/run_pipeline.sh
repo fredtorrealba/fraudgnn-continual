@@ -19,13 +19,9 @@
 #   --only gnn,cl     SOLO esos pasos             (COMA)
 #   --skip xgboost    todo MENOS esos             (COMA)
 #   --from gnn        desde ahí en adelante
-#   --force gnn cl    rehacer aunque estén listos (ESPACIO)
-#   --force           rehacer TODO
-#   --archive "1capa" guarda y limpia
-#    --history        lista lo archivado
-#
-# --force BORRA las salidas del paso antes de relanzarlo. En `download` eso
-# significa volver a bajar 650 MB de Kaggle.
+#   --archive "1capa" archiva la corrida y deja TODO en cero
+#   --history         lista lo archivado
+#   --force           fuerza los que dejen --only/--skip/--from.
 #
 # RENDIMIENTO — no va por línea de comandos, vive en config/config.yaml:
 #   compute.n_jobs   núcleos de CPU. En contenedores `nproc` MIENTE: usa la
