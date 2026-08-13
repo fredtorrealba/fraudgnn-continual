@@ -35,7 +35,8 @@ def loader_opts(cfg: dict) -> dict:
     """Opciones de muestreo del config, listas para pasar al loader."""
     g = cfg.get("gnn", {})
     return {"num_workers": g.get("num_workers", 0),
-            "pin_memory": g.get("pin_memory", False)}
+            "pin_memory": g.get("pin_memory", False),
+            "sin_aristas": g.get("sin_aristas", False)}
 
 
 def _has_pyg_sampler() -> bool:
@@ -138,7 +139,8 @@ class SimpleNeighborLoader:
 
 
 def make_neighbor_loader(data, num_neighbors, input_nodes, batch_size,
-                         shuffle=True, num_workers=0, pin_memory=False):
+                         shuffle=True, num_workers=0, pin_memory=False,
+                         sin_aristas=False):
     """
     NeighborLoader de PyG si hay backend nativo; si no, el fallback.
 
@@ -146,6 +148,18 @@ def make_neighbor_loader(data, num_neighbors, input_nodes, batch_size,
     gnn.pin_memory) y SOLO aplican al NeighborLoader de PyG: el fallback es
     una clase propia, no un DataLoader, y los ignora.
     """
+    if sin_aristas:
+        # ABLACIÓN: se anula el grafo dejando edge_index vacío. Cada nodo queda
+        # aislado, así que la convolución se reduce a su transformación propia
+        # (SAGEConv conserva root_weight) y el modelo pasa a ser una MLP con la
+        # misma capacidad. Sirve para responder una sola pregunta: ¿el AUC
+        # depende de las aristas o el grafo nunca aportó nada?
+        # NO se toca graph.pt: el cambio es solo en memoria, por corrida.
+        import torch as _t
+        if data.edge_index.numel():
+            data = data.clone()
+            data.edge_index = _t.zeros((2, 0), dtype=_t.long)
+
     if _has_pyg_sampler():
         from torch_geometric.loader import NeighborLoader
         # pyg-lib exige tensores contiguos. Los grafos generados antes de

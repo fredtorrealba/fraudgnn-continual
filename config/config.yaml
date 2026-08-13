@@ -98,6 +98,10 @@ gnn:
   # Regla: deja 2-3 núcleos libres respecto a compute.n_jobs.
   # OJO: cambia el ORDEN de muestreo. Fíjalo antes de la primera corrida y no
   # lo toques durante las 6 seeds (el paso 5 exige igualdad de condiciones).
+  # ABLACIÓN: true anula TODAS las aristas (cada nodo queda aislado y el modelo
+  # se convierte en una MLP con la misma capacidad). Responde si el grafo aporta
+  # algo: si el AUC no baja, la GNN nunca lo estaba usando. No modifica graph.pt.
+  sin_aristas: false
   num_workers: 4                   # 0 = todo en el proceso principal
   pin_memory: true                 # copia CPU->GPU más rápida (cientos de MB/batch)
   seeds: [42, 123, 2026]           # 3 corridas para la comparación GraphSAGE vs GAT
