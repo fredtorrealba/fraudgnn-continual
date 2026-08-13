@@ -69,10 +69,6 @@ STEPS = [
     Step("graph", "[2] Construcción del grafo (PyG)",
          "src.data.build_graph",
          [("graph_dir", "graph.pt")]),
-    Step("xgboost", "[3] Baseline XGBoost (SMOTE + Optuna) — queda CONGELADO",
-         "src.baseline_xgboost.train_xgboost",
-         [("models_dir", "xgboost_baseline.json"),
-          ("reports_dir", "xgboost_val_metrics.json")]),
     # Este paso tiene reanudación propia por seed y por época: aunque se corte
     # a la mitad, al relanzarlo sigue desde la última época guardada.
     Step("gnn", "[4-5] GraphSAGE vs GAT (3 seeds c/u) + selección",
@@ -83,6 +79,15 @@ STEPS = [
          [("reports_dir", "cl_cycles.json"),
           ("reports_dir", "gnn_cl_test_scores.npz"),
           ("graph_dir", "graph_scored.pt")]),
+    # XGBoost va aquí, no en su posición nominal [3]: solo necesita
+    # `preprocess` (lee full.parquet, no toca el grafo) y su salida la consume
+    # únicamente `final`. Ponerlo al final deja que las 6 corridas GNN —lo caro
+    # y lo que puede fallar— arranquen cuanto antes. Los títulos conservan la
+    # numeración del capstone, que es lógica y no de ejecución.
+    Step("xgboost", "[3] Baseline XGBoost (SMOTE + Optuna) — queda CONGELADO",
+         "src.baseline_xgboost.train_xgboost",
+         [("models_dir", "xgboost_baseline.json"),
+          ("reports_dir", "xgboost_val_metrics.json")]),
     Step("final", "[8] Comparación final GNN+CL vs XGBoost (OE4)",
          "src.comparison.final_comparison",
          [("reports_dir", "final_comparison.json")]),
