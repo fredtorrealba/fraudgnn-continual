@@ -25,7 +25,8 @@ import xgboost as xgb
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from src.baseline_xgboost.smote_pipeline import apply_smote
-from src.utils.common import ensure_dirs, get_logger, load_config, resolve, set_seed
+from src.utils.common import (ensure_dirs, get_logger, load_config, n_jobs,
+                              resolve, set_seed)
 from src.utils.metrics import full_report
 
 log = get_logger("xgboost")
@@ -39,6 +40,21 @@ def load_splits(cfg):
     tr, va = df[df.split == "train"], df[df.split == "val"]
     return (tr[cols].values, tr["isFraud"].values.astype(int),
             va[cols].values, va["isFraud"].values.astype(int), cols)
+
+
+def xgb_device(cfg: dict) -> str:
+    """
+    Dispositivo para XGBoost desde `xgboost.device`: auto | cuda | cpu.
+    "auto" usa CUDA solo si torch la ve; sin torch o sin GPU, cae a CPU.
+    """
+    d = str(cfg["xgboost"].get("device", "auto")).lower()
+    if d != "auto":
+        return d
+    try:
+        import torch
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        return "cpu"
 
 
 def objective_factory(X_tr, y_tr, X_va, y_va, cfg):
@@ -58,7 +74,8 @@ def objective_factory(X_tr, y_tr, X_va, y_va, cfg):
             "n_estimators": 1000,
             "early_stopping_rounds": cfg["xgboost"]["early_stopping_rounds"],
             "random_state": 42,
-            "n_jobs": -1,
+            "n_jobs": n_jobs(cfg),
+            "device": xgb_device(cfg),
         }
         model = xgb.XGBClassifier(**params)
         model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
@@ -80,6 +97,7 @@ def main():
     # SMOTE SOLO sobre train — validación queda con la distribución real
     X_tr_res, y_tr_res = apply_smote(X_tr, y_tr, cfg)
 
+    log.info("XGBoost en %s | n_jobs=%d", xgb_device(cfg), n_jobs(cfg))
     log.info("Búsqueda bayesiana (%d trials)...", cfg["xgboost"]["optuna_trials"])
     study = optuna.create_study(direction="maximize",
                                 sampler=optuna.samplers.TPESampler(seed=42))
@@ -92,7 +110,8 @@ def main():
     best.update({"objective": "binary:logistic", "eval_metric": "auc",
                  "tree_method": "hist", "n_estimators": 1000,
                  "early_stopping_rounds": cfg["xgboost"]["early_stopping_rounds"],
-                 "random_state": 42, "n_jobs": -1})
+                 "random_state": 42, "n_jobs": n_jobs(cfg),
+                 "device": xgb_device(cfg)})
     model = xgb.XGBClassifier(**best)
     model.fit(X_tr_res, y_tr_res, eval_set=[(X_va, y_va)], verbose=False)
 

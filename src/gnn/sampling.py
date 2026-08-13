@@ -17,6 +17,13 @@ import numpy as np
 import torch
 
 
+def loader_opts(cfg: dict) -> dict:
+    """Opciones de muestreo del config, listas para pasar al loader."""
+    g = cfg.get("gnn", {})
+    return {"num_workers": g.get("num_workers", 0),
+            "pin_memory": g.get("pin_memory", False)}
+
+
 def _has_pyg_sampler() -> bool:
     try:
         import pyg_lib  # noqa: F401
@@ -117,12 +124,24 @@ class SimpleNeighborLoader:
 
 
 def make_neighbor_loader(data, num_neighbors, input_nodes, batch_size,
-                         shuffle=True):
-    """NeighborLoader de PyG si hay backend nativo; si no, el fallback."""
+                         shuffle=True, num_workers=0, pin_memory=False):
+    """
+    NeighborLoader de PyG si hay backend nativo; si no, el fallback.
+
+    `num_workers` y `pin_memory` vienen de config.yaml (gnn.num_workers y
+    gnn.pin_memory) y SOLO aplican al NeighborLoader de PyG: el fallback es
+    una clase propia, no un DataLoader, y los ignora.
+    """
     if _has_pyg_sampler():
         from torch_geometric.loader import NeighborLoader
+        extra = {}
+        if num_workers and int(num_workers) > 0:
+            # persistent_workers evita respawnear los procesos en CADA época
+            # (30 épocas x 6 corridas = mucho arranque desperdiciado).
+            extra = {"num_workers": int(num_workers), "persistent_workers": True}
         return NeighborLoader(data, num_neighbors=num_neighbors,
                               input_nodes=input_nodes,
-                              batch_size=batch_size, shuffle=shuffle)
+                              batch_size=batch_size, shuffle=shuffle,
+                              pin_memory=bool(pin_memory), **extra)
     return SimpleNeighborLoader(data, num_neighbors, input_nodes,
                                 batch_size, shuffle)

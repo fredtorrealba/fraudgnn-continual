@@ -17,11 +17,43 @@ ROOT = Path(__file__).resolve().parents[2]
 _DEVICE_LOGGED = False   # el dispositivo se anuncia una sola vez por proceso
 
 
+def n_jobs(cfg: dict) -> int:
+    """
+    Núcleos de CPU a usar, resueltos a un entero concreto (`compute.n_jobs`).
+    -1 (o ausente) significa "todos los visibles".
+    """
+    v = (cfg.get("compute") or {}).get("n_jobs", -1)
+    try:
+        v = int(v)
+    except (TypeError, ValueError):
+        v = -1
+    return os.cpu_count() or 1 if v <= 0 else v
+
+
+def _apply_compute(cfg: dict) -> None:
+    """
+    Fija el paralelismo de CPU a partir de `compute.n_jobs`, ANTES de que las
+    librerías arranquen sus pools. Es un único sitio: XGBoost, OpenMP (pyg-lib)
+    y las BLAS quedan alineados y no se pisan entre sí.
+    """
+    n = str(n_jobs(cfg))
+    for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS",
+                "NUMEXPR_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+        os.environ[var] = n          # las lee libgomp/BLAS al primer uso
+    try:
+        import torch
+        torch.set_num_threads(int(n))
+    except Exception:
+        pass                          # torch puede no estar en pasos de solo CPU
+
+
 def load_config(path: str | None = None) -> dict:
     """Carga config/config.yaml (o una ruta alternativa)."""
     cfg_path = Path(path) if path else ROOT / "config" / "config.yaml"
     with open(cfg_path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        cfg = yaml.safe_load(f)
+    _apply_compute(cfg)
+    return cfg
 
 
 def get_logger(name: str) -> logging.Logger:

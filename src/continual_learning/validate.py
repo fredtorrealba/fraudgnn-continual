@@ -28,7 +28,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from src.gnn.sampling import make_neighbor_loader
+from src.gnn.sampling import loader_opts, make_neighbor_loader
 from src.utils.common import get_device, get_logger, load_config
 from src.utils.metrics import full_report, recall_at_threshold
 
@@ -43,7 +43,8 @@ def score_nodes(model, data, node_idx: np.ndarray, cfg) -> np.ndarray:
     mask = torch.zeros(data.num_nodes, dtype=torch.bool)
     mask[torch.tensor(node_idx, dtype=torch.long)] = True
     loader = make_neighbor_loader(data, num_neighbors=cfg["gnn"]["fanouts"],
-                                  input_nodes=mask, batch_size=512, shuffle=False)
+                                  input_nodes=mask, batch_size=512, shuffle=False,
+                                  **loader_opts(cfg))
     scores = np.zeros(data.num_nodes, dtype=np.float32)
     for batch in loader:
         batch = batch.to(device)

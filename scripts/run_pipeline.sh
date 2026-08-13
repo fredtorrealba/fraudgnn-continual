@@ -15,9 +15,20 @@
 # Otras formas de invocarlo (los argumentos pasan derecho al runner):
 #   bash scripts/run_pipeline.sh --status        # ver en qué va, sin ejecutar
 #   bash scripts/run_pipeline.sh --from gnn      # desde ese paso en adelante
-#   bash scripts/run_pipeline.sh --only cl       # un solo paso
+#   bash scripts/run_pipeline.sh --only gnn,cl   # SOLO esos pasos (coma)
+#   bash scripts/run_pipeline.sh --skip xgboost  # todo MENOS esos pasos (coma)
 #   bash scripts/run_pipeline.sh --force xgboost # rehacer ese paso
 #   bash scripts/run_pipeline.sh --force         # rehacer TODO desde cero
+#
+# Pasos: download, preprocess, graph, xgboost, gnn, cl, final
+# --only/--skip se combinan con --from y respetan siempre el orden real del
+# pipeline, no el orden en que los escribas.
+#
+# El paralelismo NO se pasa por línea de comandos: vive en config/config.yaml
+#   compute.n_jobs      núcleos de CPU (XGBoost, OpenMP de pyg-lib, BLAS)
+#   xgboost.device      auto | cuda | cpu
+#   gnn.num_workers     procesos de muestreo en paralelo
+#   gnn.pin_memory      copia CPU->GPU más rápida
 #
 # En macOS, para que el equipo no se suspenda a mitad de una corrida larga:
 #   caffeinate -is bash scripts/run_pipeline.sh 2>&1 | tee pipeline.log

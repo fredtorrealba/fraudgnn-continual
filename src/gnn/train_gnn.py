@@ -41,7 +41,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from src.gnn.models import build_model
-from src.gnn.sampling import make_neighbor_loader
+from src.gnn.sampling import loader_opts, make_neighbor_loader
 from src.utils.common import (ensure_dirs, get_device, get_logger,
                               get_run_state, load_config, resolve, set_seed,
                               update_state)
@@ -124,6 +124,7 @@ def make_loader(data, mask, cfg, shuffle=True):
         input_nodes=mask,
         batch_size=cfg["gnn"]["batch_size"],
         shuffle=shuffle,
+        **loader_opts(cfg),
     )
 
 

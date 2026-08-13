@@ -171,10 +171,21 @@ def run_step(step: Step, cfg) -> bool:
 
 
 def main():
-    p = argparse.ArgumentParser(description="Pipeline FraudGNN, reanudable.")
+    p = argparse.ArgumentParser(
+        description="Pipeline FraudGNN, reanudable.",
+        epilog="Pasos: " + ", ".join(BY_NAME) + "\n"
+               "--only y --skip aceptan varios separados por coma y se pueden "
+               "combinar con --from. Ejemplos:\n"
+               "  --only gnn,cl          solo esos dos\n"
+               "  --skip xgboost         todo menos ese\n"
+               "  --from gnn --skip cl   desde gnn en adelante, sin cl",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--status", action="store_true",
                    help="Mostrar en qué va y salir (no ejecuta nada)")
-    p.add_argument("--only", metavar="PASO", help="Ejecutar solo ese paso")
+    p.add_argument("--only", metavar="PASOS",
+                   help="Ejecutar SOLO estos pasos (separados por coma)")
+    p.add_argument("--skip", metavar="PASOS",
+                   help="Ejecutar todo MENOS estos pasos (separados por coma)")
     p.add_argument("--from", dest="from_step", metavar="PASO",
                    help="Empezar desde ese paso")
     p.add_argument("--force", nargs="*", metavar="PASO",
@@ -185,7 +196,13 @@ def main():
     cfg = load_config()
     ensure_dirs(cfg)
 
-    for nombre in filter(None, [args.only, args.from_step, *(args.force or [])]):
+    def lista(v):
+        """'gnn, cl' -> ['gnn', 'cl']"""
+        return [x.strip() for x in v.split(",") if x.strip()] if v else []
+
+    solo, omitir = lista(args.only), lista(args.skip)
+    for nombre in [*solo, *omitir, *filter(None, [args.from_step]),
+                   *(args.force or [])]:
         if nombre not in BY_NAME:
             p.error(f"paso desconocido: {nombre}. Válidos: "
                     f"{', '.join(BY_NAME)}")
@@ -199,10 +216,20 @@ def main():
         return 0
 
     pasos = STEPS
-    if args.only:
-        pasos = [BY_NAME[args.only]]
+    if solo:
+        # Se respeta el orden del pipeline, no el que escriba el usuario:
+        # los pasos dependen unos de otros.
+        pasos = [s for s in STEPS if s.name in solo]
     elif args.from_step:
         pasos = STEPS[[s.name for s in STEPS].index(args.from_step):]
+    if omitir:
+        pasos = [s for s in pasos if s.name not in omitir]
+
+    if not pasos:
+        log.warning("La selección no deja ningún paso por ejecutar.")
+        return 0
+    if solo or omitir:
+        log.info("Pasos seleccionados: %s", ", ".join(s.name for s in pasos))
 
     forzados = (set(BY_NAME) if args.force == []
                 else set(args.force or []))
