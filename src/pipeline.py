@@ -184,6 +184,15 @@ def show_status(cfg):
                  detalle, sub)
 
 
+# Salidas que NO se mueven al archivar: se COPIAN y se quedan donde están.
+# El baseline XGBoost está congelado por diseño y no depende del grafo ni de
+# gnn.hidden_dims — es la MISMA constante contra la que se miden todas las
+# configuraciones. Reentrenarlo en cada corrida no solo cuesta 10 minutos:
+# introduciría variación en la vara de medir.
+COMPARTIDAS = [("models_dir", "xgboost_baseline.json"),
+               ("reports_dir", "xgboost_val_metrics.json")]
+
+
 def archivar(cfg, nombre: str | None = None) -> Path:
     """
     MUEVE los resultados de la corrida actual a historial/<fecha>_<nombre>/.
@@ -204,7 +213,8 @@ def archivar(cfg, nombre: str | None = None) -> Path:
     destino = resolve(cfg, "history_dir") / (f"{sello}_{slug}" if slug else sello)
     destino.mkdir(parents=True, exist_ok=True)
 
-    movidos = 0
+    compartidas = {resolve(cfg, k) / n for k, n in COMPARTIDAS}
+    movidos, copiados = 0, 0
     for clave in ("models_dir", "reports_dir", "artifacts_dir"):
         origen = resolve(cfg, clave)
         sub = destino / origen.name
@@ -212,8 +222,12 @@ def archivar(cfg, nombre: str | None = None) -> Path:
             if f.name == ".gitkeep" or f.name.startswith("."):
                 continue
             sub.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(f), str(sub / f.name))
-            movidos += 1
+            if f in compartidas:
+                shutil.copy2(f, sub / f.name)   # el archivo queda autocontenido
+                copiados += 1                    # pero el original NO se toca
+            else:
+                shutil.move(str(f), str(sub / f.name))
+                movidos += 1
 
     if movidos == 0:
         destino.rmdir()
@@ -264,7 +278,10 @@ def archivar(cfg, nombre: str | None = None) -> Path:
     with open(destino / "meta.json", "w") as f:
         json.dump(meta, f, indent=2, ensure_ascii=False)
 
-    log.info("Archivados %d archivos en %s", movidos, _rel(destino))
+    log.info("Archivados %d archivos en %s", movidos + copiados, _rel(destino))
+    if copiados:
+        log.info("   %d copiadas (no movidas): el baseline XGBoost se conserva "
+                 "para que no haya que reentrenarlo", copiados)
 
     # data/ se borra ENTERO: archivar significa cerrar la corrida y dejar el
     # repositorio en cero. Es reproducible porque el config.yaml viaja con el

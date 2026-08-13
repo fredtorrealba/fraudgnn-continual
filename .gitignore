@@ -21,6 +21,12 @@ reports/*
 historial/*
 # ...pero se conserva la estructura de carpetas y los resultados archivados
 !**/.gitkeep
+# El baseline XGBoost SÍ se versiona: está congelado por diseño, no depende del
+# grafo ni de gnn.hidden_dims, y es la MISMA vara de medir para todas las
+# configuraciones. Versionarlo evita reentrenarlo en cada máquina (10 min) y
+# garantiza que todas las corridas se comparen contra el idéntico baseline.
+!models/xgboost_baseline.json
+!reports/xgboost_val_metrics.json
 !reports/smoke_synthetic/
 !reports/smoke_synthetic/**
 
