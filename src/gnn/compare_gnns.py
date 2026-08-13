@@ -89,6 +89,9 @@ def show_runs(cfg, force: bool = False):
              len(MODELS), len(cfg["gnn"]["seeds"]))
     log.info("    arquitectura: %d capa(s) [%s] = %d salto(s) en el grafo",
              len(hd), ", ".join(map(str, hd)), len(hd))
+    if cfg["gnn"].get("sin_aristas"):
+        log.warning("    ABLACIÓN ACTIVA: sin_aristas=true -> el grafo se anula, "
+                    "cada nodo queda aislado y el modelo es una MLP")
     for model in MODELS:
         listas, faltan = [], []
         for seed in cfg["gnn"]["seeds"]:

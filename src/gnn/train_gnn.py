@@ -188,9 +188,11 @@ def train(model_name: str, seed: int, cfg: dict | None = None,
     pos_weight = float((y_tr == 0).sum() / max(1, (y_tr == 1).sum()))
     hd = cfg["gnn"]["hidden_dims"]
     log.info("[%s seed=%d] %d capa(s) %d->%s->%d->1 | fanouts %s | batch %d | "
-             "pos_weight %.2f", model_name, seed, len(hd), cfg["gnn"]["in_dim"],
+             "pos_weight %.2f%s", model_name, seed, len(hd), cfg["gnn"]["in_dim"],
              "->".join(map(str, hd)), cfg["gnn"]["mlp_head_dim"],
-             fanouts(cfg), cfg["gnn"]["batch_size"], pos_weight)
+             fanouts(cfg), cfg["gnn"]["batch_size"], pos_weight,
+             "  [SIN ARISTAS]" if cfg["gnn"].get("sin_aristas") else "")
+
 
     model = build_model(model_name, cfg).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg["gnn"]["lr"])
@@ -198,6 +200,11 @@ def train(model_name: str, seed: int, cfg: dict | None = None,
         pos_weight=torch.tensor(pos_weight, device=device))
 
     train_loader = make_loader(data, data.train_mask, cfg, shuffle=True)
+    # El tamaño real del primer batch es la prueba de que la ablación se aplicó:
+    # sin aristas son exactamente batch_size nodos; con aristas, muchos más.
+    _b = next(iter(train_loader))
+    log.info("[%s seed=%d] batch real: %d nodos, %d aristas", key.split("_")[0],
+             seed, _b.x.shape[0], _b.edge_index.shape[1])
     val_loader = make_loader(data, data.val_mask, cfg, shuffle=False)
 
     best_auc, best_state, bad_epochs, best_epoch = 0.0, None, 0, 0
