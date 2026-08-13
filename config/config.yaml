@@ -6,6 +6,18 @@
 # se hace en un solo lugar.
 # =============================================================================
 
+compute:
+  # Núcleos de CPU para TODO lo que corre en CPU: XGBoost, el OpenMP de
+  # pyg-lib (neighbor sampling) y las BLAS de numpy/torch.
+  #   -1 = todos los núcleos visibles.
+  # OJO EN CONTENEDORES (RunPod, Docker, K8s): `nproc` reporta los núcleos del
+  # HOST, no la cuota asignada. Compruébalo con:
+  #     cat /sys/fs/cgroup/cpu.max      -> "765000 100000" = 7 CPUs reales
+  # Con -1 se lanzarían 96 hilos para 7 núcleos: el kernel quema la cuota en
+  # milisegundos y CONGELA el proceso el resto de cada ventana de 100 ms
+  # (cgroup throttling). Poner aquí el número real lo evita.
+  n_jobs: 7
+
 paths:
   raw_dir: "data/raw"              # train_transaction.csv + train_identity.csv (IEEE-CIS)
   processed_dir: "data/processed"  # parquet procesados + splits temporales
@@ -61,6 +73,14 @@ gnn:
   epochs: 30
   patience: 5                      # early stopping sobre AUC de validación
   log_every: 50                    # avance dentro de la época cada N batches (0 = callado)
+  # Muestreo en paralelo (solo aplica con el sampler nativo pyg-lib; el
+  # fallback en numpy los ignora). num_workers > 0 samplea el batch siguiente
+  # MIENTRAS la GPU calcula el actual, en vez de alternarse con ella.
+  # Regla: deja 2-3 núcleos libres respecto a compute.n_jobs.
+  # OJO: cambia el ORDEN de muestreo. Fíjalo antes de la primera corrida y no
+  # lo toques durante las 6 seeds (el paso 5 exige igualdad de condiciones).
+  num_workers: 4                   # 0 = todo en el proceso principal
+  pin_memory: true                 # copia CPU->GPU más rápida (cientos de MB/batch)
   seeds: [42, 123, 2026]           # 3 corridas para la comparación GraphSAGE vs GAT
   gat_heads: 4
   threshold: 0.5                   # umbral de alerta P(fraude) >= 0.5
@@ -72,6 +92,10 @@ xgboost:
     sampling_strategy: 0.5         # fraudes sintéticos hasta ratio 1:2 (solo en TRAIN)
     k_neighbors: 5
   optuna_trials: 30                # búsqueda bayesiana de hiperparámetros
+  # Dónde entrena XGBoost: "auto" usa la GPU si hay CUDA, si no CPU.
+  # En una VM con GPU esto baja la búsqueda de 30 trials de ~35 min a minutos.
+  # Fuerza "cpu" si quieres el baseline reproducible en cualquier máquina.
+  device: "auto"                   # auto | cuda | cpu
   early_stopping_rounds: 50
 
 continual_learning:
