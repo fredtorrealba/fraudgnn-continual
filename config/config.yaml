@@ -72,7 +72,7 @@ gnn:
   lr: 0.001
   epochs: 30
   patience: 5                      # early stopping sobre AUC de validación
-  log_every: 50                    # avance dentro de la época cada N batches (0 = callado)
+  log_every: 0                     # 0 = solo una línea por época (recomendado). >0 = avance cada N batches
   # Muestreo en paralelo (solo aplica con el sampler nativo pyg-lib; el
   # fallback en numpy los ignora). num_workers > 0 samplea el batch siguiente
   # MIENTRAS la GPU calcula el actual, en vez de alternarse con ella.

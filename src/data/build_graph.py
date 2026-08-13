@@ -135,7 +135,8 @@ def main():
                 torch.tensor((df["split"] == split).values, dtype=torch.bool))
 
     torch.save(data, graph_dir / "graph.pt")
-    log.info("Grafo guardado en %s (in_dim=%d)", graph_dir / "graph.pt", data.x.shape[1])
+    log.info("Grafo: %d nodos, %d aristas, %d features",
+             data.num_nodes, data.edge_index.shape[1], data.x.shape[1])
     if data.x.shape[1] != cfg["gnn"]["in_dim"]:
         log.warning("in_dim real (%d) != config (%d). Actualiza gnn.in_dim en "
                     "config.yaml antes de entrenar.", data.x.shape[1], cfg["gnn"]["in_dim"])

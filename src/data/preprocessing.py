@@ -36,12 +36,14 @@ EDGE_RAW_COLS = ["card1", "card2", "card3", "card5", "addr1",
 
 
 def load_raw(raw_dir: Path) -> pd.DataFrame:
-    log.info("Cargando CSVs crudos...")
     tx = pd.read_csv(raw_dir / "train_transaction.csv")
     ident = pd.read_csv(raw_dir / "train_identity.csv")
     df = tx.merge(ident, on="TransactionID", how="left")
     log.info("Merge: %d filas, %d columnas", *df.shape)
-    return df
+    # El merge deja el DataFrame repartido en muchos bloques internos. Con
+    # 400+ columnas, CUALQUIER inserción posterior dispara PerformanceWarning.
+    # Una copia aquí lo consolida de una vez y evita el aviso aguas abajo.
+    return df.copy()
 
 
 def add_temporal_columns(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
@@ -86,7 +88,9 @@ def encode_and_impute(df: pd.DataFrame, train_mask: pd.Series):
         df[c] = df[c].fillna(0.0 if np.isnan(med) else med)
 
     df[num_cols] = df[num_cols].astype(np.float32)
-    return df, feature_cols
+    # Los dos bucles de arriba reescriben cientos de columnas una a una y
+    # vuelven a fragmentar el frame; se consolida antes de devolverlo.
+    return df.copy(), feature_cols
 
 
 def main():
@@ -101,11 +105,13 @@ def main():
     train_mask = df["month"].isin(train_months)
     df, feature_cols = encode_and_impute(df, train_mask)
 
-    # Asignación de split
-    df["split"] = "other"
-    df.loc[df["month"].isin(train_months), "split"] = "train"
-    df.loc[df["month"] == cfg["data"]["val_month"], "split"] = "val"
-    df.loc[df["month"] == cfg["data"]["test_month"], "split"] = "test"
+    # Asignación de split, en una sola pasada (np.select en vez de 4
+    # asignaciones sucesivas, que volverían a fragmentar el frame).
+    df["split"] = np.select(
+        [df["month"].isin(train_months),
+         df["month"] == cfg["data"]["val_month"],
+         df["month"] == cfg["data"]["test_month"]],
+        ["train", "val", "test"], default="other")
     df = df[df["split"] != "other"].reset_index(drop=True)
 
     ratio = (df.loc[df.split == "train", "isFraud"] == 0).sum() / max(
@@ -120,7 +126,6 @@ def main():
 
     log.info("Split -> train: %d | val: %d | test: %d",
              (df.split == "train").sum(), (df.split == "val").sum(), (df.split == "test").sum())
-    log.info("Guardado en %s", out_dir)
 
 
 if __name__ == "__main__":

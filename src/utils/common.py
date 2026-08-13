@@ -37,6 +37,12 @@ def _apply_compute(cfg: dict) -> None:
     y las BLAS quedan alineados y no se pisan entre sí.
     """
     n = str(n_jobs(cfg))
+    # Si algo YA fijó OMP_NUM_THREADS antes de llegar aquí, ese valor manda: se
+    # puso por una razón. El caso real es final_comparison.py, que en macOS lo
+    # pone a 1 porque torch y XGBoost traen runtimes de OpenMP distintos y con
+    # los dos multihilo el intérprete muere con SIGSEGV en load_model().
+    # Pisarlo con compute.n_jobs resucitaba ese crash.
+    n = os.environ.get("OMP_NUM_THREADS", n)
     for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS",
                 "NUMEXPR_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
         os.environ[var] = n          # las lee libgomp/BLAS al primer uso
@@ -56,11 +62,26 @@ def load_config(path: str | None = None) -> dict:
     return cfg
 
 
+class _Formato(logging.Formatter):
+    """
+    Prefijo corto. El formato anterior gastaba 45 caracteres por línea en
+    fecha + nombre + 'INFO', que se repite en las miles de líneas de una
+    corrida. Aquí la hora basta (el pipeline corre en horas, no en días) y el
+    nivel solo aparece cuando NO es INFO — que es justo cuando hay que verlo.
+    """
+    def format(self, record):
+        record.lvl = "" if record.levelno == logging.INFO else record.levelname + " "
+        return super().format(record)
+
+
 def get_logger(name: str) -> logging.Logger:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
-    )
+    raiz = logging.getLogger()
+    if not raiz.handlers:
+        h = logging.StreamHandler()
+        h.setFormatter(_Formato("%(asctime)s %(name)-14s %(lvl)s%(message)s",
+                                datefmt="%H:%M:%S"))
+        raiz.addHandler(h)
+        raiz.setLevel(logging.INFO)
     return logging.getLogger(name)
 
 

@@ -1,43 +1,34 @@
 """
-Runner del pipeline completo, con memoria de lo que YA está hecho.
+Runner del pipeline, con memoria de lo que YA está hecho.
 
-Reemplaza la lista de comandos a ciegas de scripts/run_pipeline.sh: antes de
-cada paso mira si sus archivos de salida existen y, si están, lo salta. Así
-un corte (Ctrl-C, batería, kernel panic) no obliga a rehacer la descarga, el
-preprocesamiento ni los modelos ya entrenados: se relanza el mismo comando y
-sigue donde quedó.
+Antes de cada paso mira si sus archivos de salida existen y lo salta si están.
+Un corte (Ctrl-C, batería, desalojo de VM spot) no obliga a rehacer nada: se
+relanza el mismo comando y sigue donde quedó — incluso a mitad de una GNN, que
+retoma desde su última época. El avance vive en artifacts/pipeline_state.json.
 
-Dos niveles de memoria:
-  PASO    los archivos de salida en data/, models/ y reports/ — el disco es
-          la verdad. Si borras una salida, ese paso vuelve a estar pendiente.
-  ÉPOCA   dentro del paso 4-5, cada corrida GNN (2 modelos x 3 seeds) tiene
-          su propio checkpoint de reanudación (ver src/gnn/train_gnn.py).
+El disco manda: borra una salida y ese paso vuelve a estar pendiente.
 
-El avance queda registrado en artifacts/pipeline_state.json, que se CREA solo
-en la primera corrida.
+Las 7 etapas (`--steps` las explica una por una):
+  1 download    Kaggle -> data/raw/                       ~1 min
+  2 preprocess  CSV -> parquet + split de 6 meses         ~1 min
+  3 graph       parquet -> grafo PyG (~22M aristas)       ~4 min
+  4 gnn         GraphSAGE vs GAT, 6 corridas          2-4 h GPU  <- el caro
+  5 cl          mes 6 semana a semana + fine-tuning       ~15 min
+  6 xgboost     baseline tabular CONGELADO                ~10 min
+  7 final       comparación GNN+CL vs baseline            ~1 min
 
-Las 7 etapas (`--steps` las explica en detalle desde la terminal):
-
-  1. download    Kaggle -> data/raw/            ~1 min   (único paso con red)
-  2. preprocess  CSV -> parquet + split 6 meses ~1 min
-  3. graph       parquet -> grafo PyG (~22M aristas)     ~4 min
-  4. gnn         GraphSAGE vs GAT, 6 corridas  2-4 h GPU  <- el paso caro
-  5. cl          mes 6 semana a semana, fine-tuning      ~15 min
-  6. xgboost     baseline tabular CONGELADO              ~10 min
-  7. final       comparación GNN+CL vs baseline          ~1 min
-
-XGBoost va en 6 y no en su posición nominal [3] porque solo depende de
-`preprocess` y su salida solo la usa `final`: así el paso caro arranca antes.
+XGBoost va en 6 y no en su [3] nominal: solo depende de preprocess y su salida
+solo la usa final, así que el paso caro arranca antes.
 
 Uso:
-  python -m src.pipeline                 # corre lo que falte, en orden
+  python -m src.pipeline                 # corre lo que falte
   python -m src.pipeline --steps         # qué hace cada etapa (no ejecuta)
-  python -m src.pipeline --status        # en qué va ahora mismo (no ejecuta)
-  python -m src.pipeline --from gnn      # desde ese paso en adelante
-  python -m src.pipeline --only gnn,cl   # SOLO esos pasos (coma)
-  python -m src.pipeline --skip xgboost  # todo MENOS esos pasos (coma)
-  python -m src.pipeline --force xgboost # rehacer ese paso aunque esté listo
-  python -m src.pipeline --force         # rehacer TODO desde cero
+  python -m src.pipeline --status        # en qué va ahora   (no ejecuta)
+  python -m src.pipeline --only gnn,cl   # SOLO esos          (coma)
+  python -m src.pipeline --skip xgboost  # todo MENOS esos    (coma)
+  python -m src.pipeline --from gnn      # desde ahí en adelante
+  python -m src.pipeline --force gnn cl  # rehacer            (espacio)
+  python -m src.pipeline --force         # rehacer TODO
 """
 import argparse
 import subprocess
@@ -61,6 +52,7 @@ class Step:
     outputs: list[tuple[str, str]]  # (clave de config.paths, archivo)
     args: list[str] = field(default_factory=list)
     desc: str = ""                  # resumen de qué hace, ver --steps
+    acepta_force: bool = False      # el módulo entiende --force por su cuenta
 
     def output_paths(self, cfg) -> list[Path]:
         return [resolve(cfg, key) / name for key, name in self.outputs]
@@ -78,6 +70,7 @@ STEPS = [
     Step("download", "[0] Descarga del dataset IEEE-CIS",
          "src.data.download_ieee_cis",
          [("raw_dir", "train_transaction.csv"), ("raw_dir", "train_identity.csv")],
+         acepta_force=True,
          desc="Baja train_transaction.csv (~650 MB) + train_identity.csv de Kaggle. "
               "El test de la competencia NO trae etiquetas, por eso los 6 meses se "
               "cortan dentro del train. Único paso que necesita red. ~1 min."),
@@ -100,6 +93,7 @@ STEPS = [
     Step("gnn", "[4-5] GraphSAGE vs GAT (3 seeds c/u) + selección",
          "src.gnn.compare_gnns",
          [("models_dir", "selected_model.json")],
+         acepta_force=True,
          desc="Entrena GraphSAGE y GAT con 3 semillas cada uno = 6 corridas, con "
               "neighbor sampling 15-10-5 (nunca ve el grafo entero). Elige la mejor "
               "por AUC walk-forward semanal. EL PASO CARO: 2-4 h con GPU. "
@@ -196,11 +190,10 @@ def show_steps(cfg):
     print("verdad: borra una salida y ese paso vuelve a estar pendiente.\n")
 
 
-def run_step(step: Step, cfg) -> bool:
+def run_step(step: Step, cfg, i: int = 1, n: int = 1) -> bool:
     """Ejecuta un paso como subproceso. True si terminó bien."""
     cmd = [sys.executable, "-m", step.module, *step.args]
-    log.info("== %s ==", step.title)
-    log.info("   $ %s", " ".join(cmd[1:]))
+    log.info("[%d/%d] %-10s %s", i, n, step.name, step.title)
     update_step(cfg, step.name, status="running", title=step.title)
     t0 = time.time()
     try:
@@ -229,7 +222,7 @@ def run_step(step: Step, cfg) -> bool:
         return False
 
     update_step(cfg, step.name, status="done", minutes=minutes)
-    log.info("== '%s' listo (%.1f min) ==", step.name, minutes)
+    log.info("        %s listo en %.1f min", step.name, minutes)
     return True
 
 
@@ -303,17 +296,31 @@ def main():
     forzados = (set(BY_NAME) if args.force == []
                 else set(args.force or []))
 
-    show_status(cfg)
-    for step in pasos:
+    listos = [s.name for s in STEPS if s.is_done(cfg)]
+    log.info("Estado: %d/%d listos%s", len(listos), len(STEPS),
+             "" if len(listos) == len(STEPS)
+             else " | faltan: " + ", ".join(s.name for s in STEPS
+                                            if not s.is_done(cfg)))
+
+    n = len(pasos)
+    for i, step in enumerate(pasos, 1):
         if step.name in forzados:
-            log.info("== %s (forzado) ==", step.title)
-            extra = ["--force"] if step.name == "gnn" else []
-            step = replace(step, args=step.args + extra)
+            # Borrar las salidas es lo que hace que --force funcione IGUAL en
+            # todos los pasos: sin esto, módulos como download ven sus archivos
+            # y se saltan solos aunque el pipeline los haya marcado forzados.
+            borradas = [p for p in step.output_paths(cfg) if p.exists()]
+            for ruta in borradas:
+                ruta.unlink()
+            if borradas:
+                log.info("   forzado: borradas %d salidas previas de '%s'",
+                         len(borradas), step.name)
+            if step.acepta_force:
+                step = replace(step, args=step.args + ["--force"])
         elif step.is_done(cfg):
-            log.info("-- %s: YA ESTÁ HECHO, se salta.", step.title)
+            log.info("[%d/%d] %-10s ya hecho, se salta", i, n, step.name)
             update_step(cfg, step.name, status="done", title=step.title)
             continue
-        if not run_step(step, cfg):
+        if not run_step(step, cfg, i, n):
             return 1
 
     log.info("Pipeline completo. Reportes en %s", resolve(cfg, "reports_dir"))

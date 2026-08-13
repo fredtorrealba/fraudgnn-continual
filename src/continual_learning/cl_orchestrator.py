@@ -64,7 +64,6 @@ def init_memory_sets(cfg, data, model):
     train_idx = torch.where(data.train_mask)[0].numpy()
     y = data.y[data.train_mask].numpy().astype(int)
     months = data.month[data.train_mask].numpy()
-    log.info("Scoreando train para estratificar por dificultad (frontera)...")
     scores = score_nodes(model, data, train_idx, cfg)
 
     buffer = ReplayBuffer(cfg)

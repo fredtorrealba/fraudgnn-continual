@@ -35,7 +35,11 @@ from pathlib import Path
 # tiene que definirse ANTES de importar torch/xgboost. En Linux hay un solo
 # runtime, así que no se toca nada.
 if sys.platform == "darwin":
-    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    # Asignación directa, NO setdefault: el pipeline padre exporta
+    # OMP_NUM_THREADS desde compute.n_jobs y el subproceso lo hereda, así que
+    # un setdefault no llegaría a aplicarse nunca. En macOS esto no es un valor
+    # por defecto sino un requisito para no segfaultear.
+    os.environ["OMP_NUM_THREADS"] = "1"
 
 import numpy as np
 import pandas as pd
@@ -294,7 +298,6 @@ def main():
              int(extra_detected.sum()), usd)
     log.info("  a igual presupuesto: %d fraudes ~ USD %.0f",
              int(extra_iso.sum()), usd_iso)
-    log.info("Guardado en %s", reports_dir / "final_comparison.json")
 
 
 if __name__ == "__main__":
