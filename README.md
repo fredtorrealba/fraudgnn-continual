@@ -181,10 +181,39 @@ watch -n 2 nvidia-smi            # si GPU-Util < 50%, el cuello es el sampler
 
 ### 7. Bajar resultados y archivar
 
+**La vía limpia**: archiva primero en el pod y copia una sola carpeta, ya
+autocontenida y con el `meta.json` de métricas hecho.
+
 ```bash
-# desde tu máquina
-scp -P <puerto> -r root@<ip>:/workspace/fraudgnn/{reports,models,artifacts} .
+# en el pod
+bash scripts/run_pipeline.sh --archive "1capa-sin-aristas"
+
+# en tu máquina
+scp -i ~/.ssh/id_ed25519 -P <puerto> -r \
+    root@<ip>:/workspace/fraudgnn/historial/* historial/
 ```
+
+**Si prefieres copiar en crudo** (porque vas a lanzar otra configuración y no
+quieres que `--archive` borre `data/`), son cuatro sitios, no tres:
+
+```bash
+scp -i ~/.ssh/id_ed25519 -P <puerto> -r \
+    root@<ip>:/workspace/fraudgnn/{reports,models,artifacts,pipeline.log,config} .
+
+scp -i ~/.ssh/id_ed25519 -P <puerto> \
+    root@<ip>:/workspace/fraudgnn/data/processed/feature_cols.json data/processed/
+```
+
+| Qué | Por qué |
+|---|---|
+| `models/` `reports/` `artifacts/` | los resultados |
+| **`config/config.yaml`** | **qué configuración los produjo** — se edita en el pod y es lo más fácil de perder |
+| `pipeline.log` | tiempos por época, warnings, decisiones del CL |
+| **`data/processed/feature_cols.json`** | **qué 431 columnas vio el modelo** — 5 KB, y sin él un resultado no se puede reinterpretar |
+| `data/graph/graph_scored.pt` | opcional, 1.4 GB. Solo lo usa `graph_explorer.py` |
+
+⚠️ Las opciones de `scp` van **antes** de las rutas. En macOS, un `-i` al final
+no se interpreta como opción: pasaría a ser el destino.
 
 Verifica que abren **antes** de terminar el pod: *Terminate* borra `/workspace`
 sin vuelta atrás.
@@ -264,10 +293,25 @@ bash scripts/run_pipeline.sh --archive "1capa"   # guarda y deja todo en cero
 bash scripts/run_pipeline.sh --history           # lista lo archivado
 ```
 
-Mueve `models/`, `reports/` y `artifacts/` a `historial/<fecha>_<nombre>/` junto
-con **el `config.yaml` que los produjo** (sin él, un resultado antiguo no se puede
-interpretar), `feature_cols.json` y un `meta.json` con las métricas ya extraídas.
-Después borra `data/`, que son 2 GB deterministas y se regeneran en ~7 min.
+Mueve a `historial/<fecha>_<nombre>/`:
+
+| Se mueve | |
+|---|---|
+| `models/` `reports/` `artifacts/` | los resultados de la corrida |
+| `pipeline.log` | así la corrida siguiente arranca con el log limpio |
+| `data/graph/graph_scored.pt` | lo produce `cl` aunque viva en `data/` |
+
+| Se copia (el original se queda) | |
+|---|---|
+| `config/config.yaml` | sin él, un resultado antiguo no se puede interpretar |
+| `data/processed/feature_cols.json` | las 431 columnas que vio el modelo |
+| `models/xgboost_baseline.json` + sus métricas | baseline congelado: no se reentrena nunca |
+
+Y genera un `meta.json` con fecha, commit de git, la huella del grafo
+(`nodos`/`aristas`/`features`) y las métricas ya extraídas.
+
+Después borra `data/`: son 2 GB deterministas que se regeneran en ~7 min con el
+config archivado.
 
 Para comparar dos corridas, empieza por `meta.json`. Y comprueba que la **huella
 del grafo** (`nodos`, `aristas`, `features`) coincida: si difiere, cambiaste el

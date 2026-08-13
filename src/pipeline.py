@@ -251,6 +251,15 @@ def archivar(cfg, nombre: str | None = None) -> Path:
         shutil.move(str(gs), str(destino / "graph_scored.pt"))
         movidos += 1
 
+    # El log se MUEVE (no se copia): así cada archivo conserva el suyo y la
+    # corrida siguiente arranca con pipeline.log limpio, sin arrastrar el
+    # historial de la anterior.
+    for log_file in (ROOT / "pipeline.log", Path.cwd() / "pipeline.log"):
+        if log_file.exists():
+            shutil.move(str(log_file), str(destino / "pipeline.log"))
+            movidos += 1
+            break
+
     try:
         commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
                                 cwd=ROOT, capture_output=True, text=True,
