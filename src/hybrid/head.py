@@ -94,7 +94,11 @@ def cargar(cfg, nombre: str):
     import xgboost as xgb
     booster = xgb.Booster()
     booster.load_model(str(resolve(cfg, "models_dir") / nombre))
-    booster.set_param({"nthread": 1})
+    # device="cpu": si se entrenó en GPU, el booster queda en cuda:0 y cada
+    # inplace_predict sobre numpy avisa de "mismatched devices" y cae a DMatrix.
+    # En el CL se predice muchas veces sobre conjuntos pequeños, así que ese
+    # rodeo se paga en cada ciclo. La predicción es idéntica (ver inferir_en_cpu).
+    booster.set_param({"nthread": 1, "device": "cpu"})
     return booster
 
 

@@ -27,7 +27,16 @@ echo "   torch $TORCH ($CUDA)  <- NO se reinstala"
 
 echo "== [3/4] Dependencias del proyecto + sampler nativo =="
 # --no-deps en torch para que pip no intente "arreglar" la versión de la imagen.
-pip install -q --no-cache-dir $(grep -vE '^\s*#|^\s*$|^torch' requirements.txt | tr '\n' ' ')
+pip install -q --no-cache-dir $(grep -vE '^\s*#|^\s*$|^torch|^xgboost' requirements.txt | tr '\n' ' ')
+# XGBoost aparte y desalojando lo que traiga la imagen: suele venir una versión
+# preinstalada (a veces el paquete `xgboost-cpu`, que instala el MISMO módulo y
+# sobrevive a --force-reinstall). Se usa el pin exacto de requirements.txt, que
+# está fijado por compatibilidad de CUDA con el driver del pod — ver el
+# comentario allí. Síntoma de saltarse esto: "No visible GPU is found" y los 30
+# trials de Optuna del paso `hybrid` pasan de ~7 min a ~50. Lo verifica [4/4].
+pip uninstall -yq xgboost xgboost-cpu 2>/dev/null || true
+pip install -q --no-cache-dir "$(grep '^xgboost' requirements.txt)"
+
 WHL="https://data.pyg.org/whl/torch-${TORCH}+${CUDA}.html"
 echo "   buscando ruedas en $WHL"
 pip install -q torch-geometric
@@ -72,6 +81,33 @@ if torch.cuda.is_available():
         print("  VRAM suficiente para batch_size 1024 sin tocar la config.")
 print(f"  dispositivo      : {get_device().type}")
 print(f"  sampler nativo   : {'SÍ' if _has_pyg_sampler() else 'NO (fallback, lento)'}")
+if torch.cuda.is_available():
+    # Que torch vea la GPU no implica que XGBoost la vea: son runtimes CUDA
+    # distintos. Se comprueba entrenando 2 árboles sobre datos de juguete.
+    import subprocess, xgboost as xgb
+    # Que torch vea la GPU no implica que XGBoost la vea: son runtimes CUDA
+    # distintos. Y las dos comprobaciones "obvias" fallan:
+    #   - build_info()["USE_CUDA"] dice True aunque el wheel no arranque con
+    #     este driver (medido: xgboost 3.4.0 con driver 570).
+    #   - train(device="cuda") NO lanza excepción: avisa y cae a CPU.
+    # Lo único fiable es entrenar de verdad en otro proceso y buscar el aviso.
+    sonda = ("import xgboost as xgb, numpy as np;"
+             "X=np.random.rand(2000,8); y=(np.random.rand(2000)>.5).astype(int);"
+             "xgb.train({'device':'cuda','tree_method':'hist'},"
+             "xgb.DMatrix(X,label=y),3)")
+    r = subprocess.run([sys.executable, "-c", sonda], capture_output=True,
+                       text=True)
+    if "No visible GPU" in (r.stdout + r.stderr) or r.returncode != 0:
+        print(f"  !! xgboost {xgb.__version__}: NO usa la GPU")
+        print("     El paso `hybrid` correrá en CPU: ~50 min en vez de ~7.")
+        print("     Causa habitual: el wheel se compiló contra un CUDA MÁS")
+        print("     NUEVO que el driver del pod. Mira tu driver con:")
+        print("       nvidia-smi --query-gpu=driver_version --format=csv")
+        print("     Verificado OK: xgboost 3.0.x con driver 570 (CUDA 12.8).")
+        print("     Con driver 580+ puedes soltar el tope de requirements.txt.")
+    else:
+        print(f"  xgboost {xgb.__version__:<9}: GPU OK")
+
 if not torch.cuda.is_available():
     print("\n  !! Sin CUDA: revisa que el pod tenga GPU asignada (nvidia-smi).")
     sys.exit(1)

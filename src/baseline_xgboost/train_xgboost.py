@@ -57,6 +57,24 @@ def xgb_device(cfg: dict) -> str:
         return "cpu"
 
 
+def inferir_en_cpu(modelo):
+    """
+    Pasa el booster a CPU para INFERENCIA y devuelve el mismo objeto.
+
+    Entrenar con device="cuda" deja el booster en cuda:0. Al predecir sobre
+    arrays de numpy —que viven en CPU— XGBoost avisa de "mismatched devices" y
+    cae a construir un DMatrix intermedio: más lento y con más memoria.
+
+    Es seguro: el recorrido de los árboles es exacto y da el mismo resultado en
+    cualquier dispositivo. Lo que difiere entre GPU y CPU es la CONSTRUCCIÓN de
+    histogramas durante el entrenamiento, no la predicción sobre un árbol ya
+    construido. Así que esto no cambia ni un decimal de los scores.
+    """
+    booster = modelo.get_booster() if hasattr(modelo, "get_booster") else modelo
+    booster.set_param({"device": "cpu"})
+    return modelo
+
+
 def objective_factory(X_tr, y_tr, X_va, y_va, cfg):
     """Objetivo Optuna: maximizar AUC en validación (mes 5, distribución real)."""
     def objective(trial: optuna.Trial) -> float:
@@ -80,6 +98,7 @@ def objective_factory(X_tr, y_tr, X_va, y_va, cfg):
         model = xgb.XGBClassifier(**params)
         model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
         from sklearn.metrics import roc_auc_score
+        inferir_en_cpu(model)
         return roc_auc_score(y_va, model.predict_proba(X_va)[:, 1])
     return objective
 

@@ -40,7 +40,8 @@ import optuna
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from src.baseline_xgboost.smote_pipeline import apply_smote
-from src.baseline_xgboost.train_xgboost import objective_factory, xgb_device
+from src.baseline_xgboost.train_xgboost import (inferir_en_cpu,
+                                                objective_factory, xgb_device)
 from src.hybrid.head import (VARIANTES, cargar_tabla, columnas, guardar, matriz,
                              nombre_modelo, umbral_por_presupuesto)
 from src.utils.common import (ensure_dirs, get_logger, load_config, n_jobs,
@@ -125,6 +126,7 @@ def main():
             X_va = matriz(df, filas_va, v, cols_base)
             X_res, y_res = apply_smote(X_tr, y_tr, cfg)
             m = _entrenar(X_res.astype(np.float32), y_res, X_va, y_va, cfg, best)
+            inferir_en_cpu(m)
             rep = full_report(y_va, m.predict_proba(X_va)[:, 1], cfg["gnn"]["threshold"])
             rep["n_estimators"] = int(getattr(m, "best_iteration", 0) or 0) + 1
             rep["n_columnas"] = len(columnas(v, cols_base))
@@ -161,6 +163,7 @@ def main():
     m = _entrenar(X_res.astype(np.float32), y_res, None, None, cfg,
                   prev["best_params"], n_est=n_est)
     guardar(m.get_booster(), cfg, "hybrid_head_prod.json")
+    inferir_en_cpu(m)
 
     # Umbral operativo: el cuantil que produce el presupuesto de alertas
     # configurado, medido sobre el mes 5 (ver head.umbral_por_presupuesto).
