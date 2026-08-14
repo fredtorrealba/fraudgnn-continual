@@ -108,7 +108,13 @@ def _rng_state(**loaders) -> dict:
 def _restore_rng(st: dict, **loaders):
     if not st:
         return
-    torch.set_rng_state(st["torch"])
+    # .cpu().to(uint8) NO es defensivo por gusto: el checkpoint se carga con
+    # map_location=device, así que en una máquina con CUDA TODOS sus tensores
+    # llegan en GPU — incluido este estado. torch.set_rng_state exige un
+    # ByteTensor en CPU y si no revienta con "RNG state must be a
+    # torch.ByteTensor". Solo se manifiesta al REANUDAR sobre GPU, que es
+    # justo el caso que no se prueba en un portátil.
+    torch.set_rng_state(st["torch"].cpu().to(torch.uint8))
     np.random.set_state(st["numpy"])
     random.setstate(st["python"])
     for name, loader in loaders.items():
