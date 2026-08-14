@@ -152,18 +152,30 @@ def main():
     # ---- refit: la variante completa con meses 1-5, sin Optuna ----
     with open(reports_dir / "hybrid_variants.json") as f:
         prev = json.load(f)
-    v = max(int(x) for x in prev["variantes"])
-    n_est = prev["variantes"][str(v)]["n_estimators"]
-    log.info("Refit de la variante %d con %d árboles heredados (sin Optuna)",
-             v, n_est)
-
-    X_tr = matriz(df, filas_tr, v, cols_base)
-    X_res, y_res = apply_smote(X_tr, y_tr, cfg)
+    todas = sorted(int(x) for x in prev["variantes"])
+    v = max(todas)                       # la completa: la que va a producción
     t0 = time.time()
-    m = _entrenar(X_res.astype(np.float32), y_res, None, None, cfg,
-                  prev["best_params"], n_est=n_est)
-    guardar(m.get_booster(), cfg, "hybrid_head_prod.json")
-    inferir_en_cpu(m)
+
+    # Se entrenan TODAS con meses 1-5, no solo la completa. Las que no usan
+    # gnn_score (431, 439) son el CONTROL de atribución: sin ellas, comparar el
+    # híbrido (440 col, meses 1-5) contra el baseline congelado (431 col, meses
+    # 1-4) cambia las columnas Y los datos a la vez, y la diferencia no se
+    # puede atribuir a ninguna de las dos cosas. `final` las mide en el mes 6.
+    for vi in todas:
+        n_i = prev["variantes"][str(vi)]["n_estimators"]
+        log.info("Refit variante %d con %d árboles heredados (sin Optuna)",
+                 vi, n_i)
+        X_res, y_res = apply_smote(matriz(df, filas_tr, vi, cols_base), y_tr, cfg)
+        mi = _entrenar(X_res.astype(np.float32), y_res, None, None, cfg,
+                       prev["best_params"], n_est=n_i)
+        inferir_en_cpu(mi)
+        guardar(mi.get_booster(), cfg, f"hybrid_head_prod_{vi}.json")
+        if vi == v:
+            m, n_est = mi, n_i
+            # Nombre estable para la cabeza de producción: lo consumen
+            # cl_orchestrator y HybridSystem, que no deben saber de variantes.
+            guardar(mi.get_booster(), cfg, "hybrid_head_prod.json")
+        del X_res
 
     # Umbral operativo: el cuantil que produce el presupuesto de alertas
     # configurado, medido sobre el mes 5 (ver head.umbral_por_presupuesto).
@@ -181,7 +193,8 @@ def main():
                             "alertaría casi nada.")}, f, indent=2, ensure_ascii=False)
 
     informe = {"variante": v, "n_estimators": n_est, "n_filas": int(len(filas_tr)),
-               "umbral": thr, "minutos": round((time.time() - t0) / 60, 1)}
+               "umbral": thr, "variantes_entrenadas": todas,
+               "minutos": round((time.time() - t0) / 60, 1)}
     with open(reports_dir / "hybrid_refit.json", "w") as f:
         json.dump(informe, f, indent=2, ensure_ascii=False)
     log.info("Cabeza de producción lista | umbral %.4f -> %d alertas en el mes 5 (%.1f%%)",

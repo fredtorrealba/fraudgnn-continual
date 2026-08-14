@@ -156,6 +156,46 @@ def xgboost_scores_on_test(cfg) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
             test["isFraud"].values.astype(int), test)
 
 
+def control_variantes_on_test(cfg) -> dict:
+    """
+    Scores del mes 6 de las cabezas entrenadas con meses 1-5 que NO usan
+    `gnn_score` (431 y 439). Son el CONTROL de atribución.
+
+    Sin ellas, la comparación "híbrido 0.61 vs baseline 0.55" cambia dos cosas
+    a la vez —las columnas (440 vs 431) y los datos (meses 1-5 vs 1-4)—, así
+    que la diferencia no es atribuible. Con el control, cada efecto se aísla:
+
+        baseline        -> 431(1-5)   = lo que aporta el mes extra de datos
+        431(1-5)        -> hibrido    = lo que aporta el gnn_score
+
+    La variante completa NO se recalcula aquí: su `gnn_score` del mes 6 exige
+    correr la GNN, y ya viene resuelto en `hybrid_cl_test_scores.npz`.
+    Devuelve {} si la corrida no dejó esas cabezas (compatibilidad hacia atrás).
+    """
+    from src.hybrid.head import cargar_tabla, columnas, matriz
+
+    models_dir = resolve(cfg, "models_dir")
+    variantes = [v for v in (cfg.get("hybrid") or {}).get("variants", [])
+                 if (models_dir / f"hybrid_head_prod_{int(v)}.json").exists()]
+    if not variantes:
+        return {}
+
+    df, cols_base = cargar_tabla(cfg, None)      # sin OOF: estas no lo usan
+    filas_te = np.where(df["split"].values == "test")[0]
+    salida = {}
+    for v in sorted(int(x) for x in variantes):
+        if "gnn_score" in columnas(v, cols_base):
+            continue                              # necesita la GNN en ejecución
+        booster = xgb.Booster()
+        booster.load_model(str(models_dir / f"hybrid_head_prod_{v}.json"))
+        booster.set_param({"nthread": 1, "device": "cpu"})
+        salida[f"control_{v}"] = np.asarray(
+            booster.inplace_predict(matriz(df, filas_te, v, cols_base)),
+            dtype=np.float64)
+        log.info("Control %d columnas (meses 1-5) cargado", v)
+    return salida
+
+
 def original_gnn_scores_on_test(cfg, data, test_idx) -> np.ndarray:
     """Scores del GNN ORIGINAL (pre-CL) para identificar patrones emergentes."""
     from src.gnn.train_gnn import ruta_modelo_operativo
@@ -238,8 +278,13 @@ def main():
     sistemas = {"gnn_cl": gnn_cl_scores}
     if hib_scores is not None:
         sistemas["hibrido"] = hib_scores
+    sistemas.update(control_variantes_on_test(cfg))
+    # el barrido recorre todo lo que haya, no solo el híbrido
+    for etq, sc in sistemas.items():
+        if etq == "gnn_cl":
+            continue                              # ya va como recall_gnn_cl
         for fila, k in zip(por_presupuesto, presupuestos):
-            fila["recall_hibrido"] = recall_at_budget(y_gnn, hib_scores, k)
+            fila[f"recall_{etq}"] = recall_at_budget(y_gnn, sc, k)
 
     por_precision = []
     for objetivo in PRECISION_TARGETS:
@@ -278,6 +323,9 @@ def main():
         thr_hib = float(hib_pack["umbral"][0]) if "umbral" in hib_pack else thr
         globales["hibrido"] = full_report(y_gnn, hib_scores, thr_hib)
         globales["hibrido"]["umbral_usado"] = thr_hib
+    for etq, sc in sistemas.items():
+        if etq.startswith("control_"):
+            globales[etq] = full_report(y_gnn, sc, thr)
 
     result = {
         "month6_overall": globales,
