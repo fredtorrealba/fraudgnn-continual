@@ -184,10 +184,10 @@ def control_variantes_on_test(cfg) -> dict:
     filas_te = np.where(df["split"].values == "test")[0]
     salida = {}
     for v in sorted(int(x) for x in variantes):
-        # Solo las que NO necesitan la GNN en ejecución. Tanto `gnn_score` como
-        # las columnas del embedding quedan NaN fuera de la ventana OOF: las
-        # rellena HybridSystem corriendo la red. Por eso el control se limita a
-        # 431 y 439, cuyas columnas existen para todos los meses.
+        # Solo 431 y 439: son el CONTROL, y su gracia es precisamente NO usar
+        # la GNN. Aquí se carga la tabla sin OOF (cargar_tabla(cfg, None)), así
+        # que las columnas de la red no están; las variantes que las necesitan
+        # se miden por su ruta propia, con HybridSystem corriendo el modelo.
         if v not in (431, 439):
             continue
         booster = xgb.Booster()

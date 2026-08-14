@@ -30,6 +30,9 @@ Los meses posteriores a la ventana NO llevan OOF: su score sale del modelo real
     --window trainval   meses 1-5  (tras la etapa `refit`)
 
 Salidas: data/processed/gnn_oof_{train,trainval}.parquet + su informe.
+El parquet cubre TODAS las filas del grafo: dentro de la ventana con el score
+out-of-fold, y fuera con el modelo real que nunca las vio (el ganador de `gnn`
+para la ventana `train`, el refit para `trainval`).
 """
 import argparse
 import json
@@ -214,14 +217,84 @@ def main():
         del model, h
     minutos = round((time.time() - t0) / 60, 1)
 
+    # El diagnóstico se calcula AQUÍ, antes de añadir los nodos de fuera de la
+    # ventana: mide si `gnn_score` delata el fold, y esos nodos no tienen fold.
+    diag = _diagnostico(scores, fold, data.month.numpy()[nodos])
+
+    # --- meses POSTERIORES a la ventana: el modelo REAL, no OOF -------------
+    # Sin esto, el paso `hybrid` valida sobre el mes 5 con gnn_score y embedding
+    # en NaN: entrena las variantes con esas columnas y las evalúa donde no
+    # existen. El efecto medido fue brutal — la variante del embedding cortaba
+    # por early stopping en 6 árboles porque sus 256 columnas eran NaN en
+    # validación, y la del escalar quedaba artificialmente por debajo de la
+    # de 431. La comparación entre variantes era inválida.
+    #
+    # Es HONESTO usar aquí el modelo real: para `train` es el ganador del paso
+    # `gnn`, entrenado solo con meses 1-4, que nunca vio el 5 ni el 6; para
+    # `trainval` es el refit, que nunca vio el 6. Ninguno memorizó lo que
+    # puntúa, que es la condición que persigue todo el esquema out-of-fold.
+    fuera_ventana = torch.where(~mask)[0].numpy()
+    if len(fuera_ventana):
+        # El modelo se elige POR VENTANA, no con ruta_modelo_operativo(): esa
+        # devuelve el refit si existe, y el refit entrenó con meses 1-5. Usarlo
+        # para puntuar el mes 5 en la ventana `train` sería fuga: puntuaría
+        # datos que memorizó. Cada ventana usa el modelo que NO vio lo que va
+        # a puntuar.
+        if args.window == "train":
+            ruta_real = models_dir / f"{nombre}_seed{seed}.pt"
+            etiqueta = f"{nombre} seed={seed} (meses 1-4)"
+        else:
+            ruta_real = models_dir / "refit_model.pt"
+            etiqueta = "refit (meses 1-5)"
+        if not ruta_real.exists():
+            raise SystemExit(
+                f"Falta {ruta_real.name}, necesario para puntuar los meses "
+                f"fuera de la ventana '{args.window}'.")
+        ck = torch.load(ruta_real, weights_only=False)
+        cfg_real = dict(cfg)
+        cfg_real["gnn"] = {**cfg["gnn"], "in_dim": ck["in_dim"]}
+        real = build_model(ck["model_name"], cfg_real)
+        real.load_state_dict(ck["state_dict"])
+        log.info("Meses fuera de la ventana (%d nodos): los puntúa %s, que "
+                 "nunca los vio", len(fuera_ventana), etiqueta)
+        h_out, s_out = embed_and_score_nodes(real, data, fuera_ventana, cfg)
+        del real
+        nodos = np.concatenate([nodos, fuera_ventana])
+        scores = np.concatenate([scores, s_out])
+        emb = np.vstack([emb, h_out])
+        orden = np.argsort(nodos)
+        nodos, scores, emb = nodos[orden], scores[orden], emb[orden]
+
+    # Escala de los embeddings dentro y fuera de la ventana. Los de dentro los
+    # producen las K redes out-of-fold y los de fuera el modelo real: son redes
+    # DISTINTAS, y su BatchNorm arrastra estadísticas distintas. Si las normas
+    # difieren mucho, XGBoost aprendería cortes sobre una escala y los aplicaría
+    # sobre otra. Medido en el smoke test (2 épocas) la mediana apenas se movía
+    # y el desajuste por columna era 0.09 sobre 1, pero conviene vigilarlo:
+    # normas muy dispares invalidarían la variante del embedding.
+    if len(fuera_ventana):
+        dentro = ~np.isin(nodos, fuera_ventana)
+        n_d = np.linalg.norm(emb[dentro], axis=1)
+        n_f = np.linalg.norm(emb[~dentro], axis=1)
+        log.info("Norma del embedding — dentro de la ventana: mediana %.2f "
+                 "(p95 %.2f) | fuera: mediana %.2f (p95 %.2f)",
+                 np.median(n_d), np.percentile(n_d, 95),
+                 np.median(n_f), np.percentile(n_f, 95))
+        r = np.median(n_f) / max(np.median(n_d), 1e-8)
+        if not 0.5 < r < 2.0:
+            log.warning("Las escalas difieren x%.1f. La cabeza entrenaría con "
+                        "una y serviría con otra: interpreta con cuidado los "
+                        "resultados de la variante del embedding.", r)
+
     salida = {"node_idx": nodos, "gnn_score": scores}
     salida.update({f"emb_{i}": emb[:, i] for i in range(emb.shape[1])})
     pd.DataFrame(salida).to_parquet(ruta_parquet(cfg, args.window), index=False)
-    log.info("Guardado: gnn_score + embedding de %d dimensiones", emb.shape[1])
+    log.info("Guardado: %d filas | gnn_score + embedding de %d dimensiones",
+             len(nodos), emb.shape[1])
 
-    diag = _diagnostico(scores, fold, data.month.numpy()[nodos])
     informe = {"window": args.window, "folds": k, "modelo": nombre, "seed": seed,
-               "epocas": epocas, "n_nodos": int(len(nodos)), "minutos": minutos,
+               "epocas": epocas, "n_nodos": int(int(mask.sum())),
+               "n_filas_parquet": int(len(nodos)), "minutos": minutos,
                "dim_embedding": int(emb.shape[1]),
                "diagnostico": diag}
     with open(ruta_informe(cfg, args.window), "w") as fh:

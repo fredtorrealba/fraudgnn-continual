@@ -73,10 +73,15 @@ def cargar_tabla(cfg, oof_window: str | None) -> tuple[pd.DataFrame, list[str]]:
     El índice de fila del parquet es el índice de nodo del grafo, así que la
     unión es un alineado posicional, no un join por clave. Se comprueba.
 
-    `gnn_score` queda NaN fuera de la ventana OOF (meses 5-6 en `train`). Para
-    esos meses lo rellena quien puntúa con el modelo real; XGBoost trata los
-    NaN nativamente, así que un fallo de relleno no pasa desapercibido como un
-    cero silencioso.
+    El parquet del OOF cubre TODAS las filas: dentro de la ventana con el score
+    out-of-fold, y fuera con el modelo real que no las vio (ver `oof.py`). No
+    siempre fue así: cuando los meses de fuera llegaban en NaN, el paso
+    `hybrid` entrenaba las variantes con `gnn_score`/embedding y las validaba
+    sobre el mes 5, donde esas columnas no existían — la variante del embedding
+    cortaba por early stopping en 6 árboles.
+
+    Si aun así quedara algún NaN, XGBoost lo trata nativamente, así que un
+    fallo de relleno no se disfraza de cero silencioso.
     """
     proc = resolve(cfg, "processed_dir")
     df = pd.read_parquet(proc / "full.parquet")
@@ -92,14 +97,21 @@ def cargar_tabla(cfg, oof_window: str | None) -> tuple[pd.DataFrame, list[str]]:
     if oof_window:
         oof = pd.read_parquet(proc / f"gnn_oof_{oof_window}.parquet")
         df.loc[oof["node_idx"].values, "gnn_score"] = oof["gnn_score"].values
-        # Embedding, si la corrida del OOF lo dejó. Igual que gnn_score, queda
-        # NaN fuera de la ventana: lo rellena quien puntúe con el modelo real.
+        # Embedding, si la corrida del OOF lo dejó.
         emb = cols_embedding(oof)
-        for c in emb:
-            df[c] = np.nan
-            df.loc[oof["node_idx"].values, c] = oof[c].values
-        log.info("gnn_score OOF (%s): %d filas%s", oof_window, len(oof),
-                 f" + embedding de {len(emb)} dims" if emb else "")
+        if emb:
+            # De golpe con concat, NO en un bucle de `df[c] = ...`: cada
+            # asignación inserta una columna y recopia las 582.429 filas del
+            # DataFrame. Con 256 columnas eso son 256 recopiados y pandas avisa
+            # con PerformanceWarning ("DataFrame is highly fragmented").
+            bloque = pd.DataFrame(np.float32("nan"), index=df.index,
+                                  columns=emb, dtype=np.float32)
+            bloque.iloc[oof["node_idx"].values] = oof[emb].values
+            df = pd.concat([df, bloque], axis=1)
+        faltan = int(df["gnn_score"].isna().sum())
+        log.info("gnn_score (%s): %d filas%s%s", oof_window, len(oof),
+                 f" + embedding de {len(emb)} dims" if emb else "",
+                 f" | AVISO: {faltan} filas sin score" if faltan else "")
     return df, cols_base
 
 
