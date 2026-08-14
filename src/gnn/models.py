@@ -61,7 +61,7 @@ class _BaseGNN(nn.Module):
     def _make_conv(self, in_c, out_c):  # pragma: no cover - abstracta
         raise NotImplementedError
 
-    def encode(self, x, edge_index):
+    def encode(self, x, edge_index, con_vecinos: bool = False):
         """
         Representación del nodo TRAS las convoluciones y ANTES del clasificador.
 
@@ -69,13 +69,32 @@ class _BaseGNN(nn.Module):
         dimensiones (256 con una capa). El sistema híbrido puede consumirlo
         entero en vez del escalar que devuelve `forward`, que lo colapsa a un
         único número y descarta 255 de esas 256 dimensiones.
+
+        Con `con_vecinos=True` devuelve además el TÉRMINO DE VECINOS de la
+        primera capa. SAGEConv calcula:
+
+            out = lin_l(mean(x_j))  +  lin_r(x_i)
+                  └─ los vecinos ─┘    └─ uno mismo ─┘
+
+        y XGBoost YA tiene `x_i` entre sus 431 columnas, así que la mitad del
+        embedding le llega repetida. El término de vecinos se despeja exacto
+        como `out - lin_r(x_i)`, sin reimplementar la convolución.
+
+        Solo tiene sentido en la PRIMERA capa: a partir de la segunda, `x` ya
+        es una mezcla de uno mismo y del vecindario, y la separación se pierde.
+        Con `hidden_dims: [256]` —la configuración medida— primera capa y única
+        coinciden.
         """
-        for conv, bn in zip(self.convs, self.bns):
-            x = conv(x, edge_index)
-            x = bn(x)
-            x = F.relu(x)
-            x = F.dropout(x, p=self.dropout, training=self.training)
-        return x
+        vecinos = None
+        for i, (conv, bn) in enumerate(zip(self.convs, self.bns)):
+            h = conv(x, edge_index)
+            if con_vecinos and i == 0:
+                lin_r = getattr(conv, "lin_r", None)
+                # GAT no tiene término de raíz separado: su convolución ya es
+                # atención sobre los vecinos, así que se devuelve tal cual.
+                vecinos = h - lin_r(x) if lin_r is not None else h
+            x = F.dropout(F.relu(bn(h)), p=self.dropout, training=self.training)
+        return (x, vecinos) if con_vecinos else x
 
     def forward(self, x, edge_index):
         return self.classifier(self.encode(x, edge_index)).squeeze(-1)  # logits

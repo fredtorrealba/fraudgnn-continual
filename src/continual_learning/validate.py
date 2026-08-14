@@ -71,6 +71,21 @@ def embed_and_score_nodes(model, data, node_idx: np.ndarray, cfg):
     El score ES `sigmoid(classifier(embedding))`, así que calcular los dos por
     separado recorrería el grafo dos veces para el mismo resultado. Devuelve
     (embeddings [n, dim], scores [n]).
+
+    QUÉ embedding devuelve lo decide `hybrid.embedding_modo` del config, y se
+    lee AQUÍ a propósito: los tres consumidores —`hybrid/oof.py` (que entrena
+    la cabeza), `hybrid/system.py` (que la sirve) y `hybrid/head_cl.py` (que la
+    adapta)— pasan por esta función, así que no pueden desincronizarse.
+
+        completo  h_i = lin_l(mean(x_j)) + lin_r(x_i)   "yo + mi vecindario"
+        vecinos   h_i = lin_l(mean(x_j))                solo el vecindario
+
+    El modo `vecinos` existe porque XGBoost ya tiene `x_i` entre sus 431
+    columnas: con `completo` la mitad del embedding le llega repetida.
+
+    El SCORE sale siempre del camino normal (`classifier(embedding completo)`),
+    tanto si el embedding devuelto es el recortado como si no: es el score del
+    modelo real, no una variante suya.
     """
     device = get_device()
     model = model.to(device).eval()
@@ -97,12 +112,19 @@ def embed_and_score_nodes(model, data, node_idx: np.ndarray, cfg):
     pos[uniq] = np.arange(len(uniq))
     emb = np.zeros((len(uniq), model.dim_embedding), dtype=np.float32)
     sc = np.zeros(len(uniq), dtype=np.float32)
+    solo_vecinos = str((cfg.get("hybrid") or {}).get("embedding_modo",
+                                                    "completo")) == "vecinos"
     for batch in loader:
         batch = batch.to(device)
-        h = model.encode(batch.x, batch.edge_index)[: batch.batch_size]
+        r = model.encode(batch.x, batch.edge_index,
+                         con_vecinos=solo_vecinos)
+        h_all, vec = r if solo_vecinos else (r, None)
+        h = h_all[: batch.batch_size]
+        # el score SIEMPRE del camino completo: es el del modelo real
         s = torch.sigmoid(model.classifier(h).squeeze(-1))
+        salida = vec[: batch.batch_size] if solo_vecinos else h
         fila = pos[batch.n_id[: batch.batch_size].cpu().numpy()]
-        emb[fila] = h.cpu().numpy()
+        emb[fila] = salida.cpu().numpy()
         sc[fila] = s.cpu().numpy()
     model.cpu()
     return emb[inv], sc[inv]

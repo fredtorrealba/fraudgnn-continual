@@ -77,8 +77,12 @@ gnn:
   # 23.7K con 3 — o sea que 1 capa entrena ~7x más barato.
   #
   hidden_dims: [256]               # 1 capa   431 -> 256
-  # hidden_dims: [256, 256]        # 2 capas  431 -> 256 -> 128
-  # hidden_dims: [256, 256, 256]    # 3 capas  431 -> 256 -> 128 -> 64  (original)
+  # hidden_dims: [256, 256]        # 2 capas  431 -> 256 -> 256
+  # hidden_dims: [256, 256, 256]   # 3 capas  431 -> 256 -> 256 -> 256
+  #
+  # Las alternativas NO estrechan la salida a propósito: el embedding que
+  # recibe la cabeza es `hidden_dims[-1]`, así que la pirámide clásica
+  # [256,128,64] daría un vector de 64 — más estrecho que el de una sola capa.
   #
   mlp_head_dim: 32                 # cabeza clasificadora: última capa -> 32 -> 1
   dropout: 0.3
@@ -147,6 +151,13 @@ hybrid:
   # Coste: el parquet del OOF pasa de ~4 MB a ~500 MB y XGBoost entrena sobre
   # 695 columnas. Ponlo en false para volver al comportamiento anterior.
   usar_embedding: true
+  # QUÉ embedding recibe la cabeza:
+  #   completo  lin_l(mean(x_j)) + lin_r(x_i)   "yo + mi vecindario"
+  #   vecinos   lin_l(mean(x_j))                SOLO el vecindario
+  # `completo` le entrega a XGBoost una transformación de x_i, que YA tiene
+  # entre sus 431 columnas: la mitad del embedding llega repetida. Medido con
+  # `completo`: PR-AUC 0.5792 frente a 0.6212 de la variante de 431 columnas.
+  embedding_modo: "vecinos"
   alert_budget_pct: 2.0            # % del mes que se marca para revisión
   cl_head:
     # Warm start de la cabeza en cada ciclo: la mezcla 40/60 son ~20 filas, así
