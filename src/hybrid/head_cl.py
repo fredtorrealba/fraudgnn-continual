@@ -32,22 +32,34 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from src.continual_learning.mixture import mezcla_40_60
-from src.continual_learning.validate import score_nodes
+from src.continual_learning.validate import embed_and_score_nodes
 from src.utils.common import get_logger
 
 log = get_logger("hybrid.head_cl")
 
 
 def matriz_nodos(data, struct: np.ndarray, gnn, nodos: np.ndarray,
-                 cfg) -> np.ndarray:
-    """Las 440 columnas de esos nodos: features + estructurales + gnn_score."""
+                 cfg, esperado: int | None = None) -> np.ndarray:
+    """
+    Columnas de esos nodos: features + estructurales + (gnn_score o embedding).
+
+    `esperado` es el ancho que pide la cabeza (`booster.num_features()`). Con
+    él se decide qué aporta la GNN, exactamente igual que en
+    `HybridSystem.score`: si no coincidieran, el warm start entrenaría sobre
+    una matriz con distinto número de columnas que el modelo que va a extender.
+    """
     idx = np.asarray(nodos, dtype=np.int64)
-    g = score_nodes(gnn, data, idx, cfg)
-    return np.hstack([
-        data.x[idx].numpy().astype(np.float32),
-        struct[idx],
-        g.reshape(-1, 1).astype(np.float32),
-    ])
+    emb, g = embed_and_score_nodes(gnn, data, idx, cfg)
+    base = data.x[idx].numpy().astype(np.float32)
+    est = struct[idx]
+    if esperado is None or esperado == base.shape[1] + est.shape[1] + 1:
+        extra = g.reshape(-1, 1).astype(np.float32)
+    else:
+        extra = emb
+    X = np.hstack([base, est, extra])
+    assert esperado is None or X.shape[1] == esperado, (
+        f"La cabeza espera {esperado} columnas y se le arman {X.shape[1]}")
+    return X
 
 
 def warm_start(booster, gnn, data, struct, adapt_nodes, buffer_nodes, cfg,
@@ -79,7 +91,10 @@ def warm_start(booster, gnn, data, struct, adapt_nodes, buffer_nodes, cfg,
         return booster, {"omitido": "una sola clase", "n_filas": int(len(nodos))}
 
     t0 = time.time()
-    X = matriz_nodos(data, struct, gnn, nodos, cfg)
+    # El ancho lo manda la cabeza vigente: xgb_model= exige que la matriz de
+    # las rondas nuevas tenga exactamente las mismas columnas que el modelo
+    # que se extiende.
+    X = matriz_nodos(data, struct, gnn, nodos, cfg, booster.num_features())
     dtrain = xgb.DMatrix(X, label=y)
     params = {"objective": "binary:logistic", "eval_metric": "auc",
               "tree_method": "hist", "learning_rate": lr,

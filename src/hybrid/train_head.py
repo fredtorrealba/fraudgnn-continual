@@ -42,8 +42,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from src.baseline_xgboost.smote_pipeline import apply_smote
 from src.baseline_xgboost.train_xgboost import (inferir_en_cpu,
                                                 objective_factory, xgb_device)
-from src.hybrid.head import (VARIANTES, cargar_tabla, columnas, guardar, matriz,
-                             nombre_modelo, umbral_por_presupuesto)
+from src.hybrid.head import (COLS_ESTRUCTURALES, VARIANTES, cargar_tabla,
+                             cols_embedding, columnas, guardar, matriz,
+                             nombre_modelo, umbral_por_presupuesto,
+                             variante_embedding)
 from src.utils.common import (ensure_dirs, get_logger, load_config, n_jobs,
                               resolve, set_seed)
 from src.utils.metrics import full_report
@@ -85,6 +87,11 @@ def main():
 
     oof_window = "train" if args.window == "train" else "trainval"
     df, cols_base = cargar_tabla(cfg, oof_window)
+    # Variante con EMBEDDING: solo si el OOF dejó columnas emb_* y la config la
+    # pide. Su número depende de gnn.hidden_dims (431+8+dim), así que se calcula
+    # aquí en vez de fijarlo en config.yaml.
+    cols_emb = cols_embedding(df) if hcfg.get("usar_embedding") else []
+    v_emb = variante_embedding(cols_base, len(cols_emb)) if cols_emb else None
     log.info("Tabla: %d filas | %d columnas base + %d estructurales + gnn_score",
              len(df), len(cols_base), 8)
 
@@ -121,15 +128,21 @@ def main():
         del Xo_tr, Xo_va, Xo_res
 
         resultados, t0 = {}, time.time()
-        for v in [int(x) for x in hcfg.get("variants", VARIANTES)]:
-            X_tr = matriz(df, filas_tr, v, cols_base)
-            X_va = matriz(df, filas_va, v, cols_base)
+        lista = [int(x) for x in hcfg.get("variants", VARIANTES)]
+        if v_emb is not None:
+            lista.append(v_emb)
+            log.info("Variante con embedding: %d columnas (%d base + %d "
+                     "estructurales + %d del embedding)", v_emb, len(cols_base),
+                     len(COLS_ESTRUCTURALES), len(cols_emb))
+        for v in lista:
+            X_tr = matriz(df, filas_tr, v, cols_base, cols_emb)
+            X_va = matriz(df, filas_va, v, cols_base, cols_emb)
             X_res, y_res = apply_smote(X_tr, y_tr, cfg)
             m = _entrenar(X_res.astype(np.float32), y_res, X_va, y_va, cfg, best)
             inferir_en_cpu(m)
             rep = full_report(y_va, m.predict_proba(X_va)[:, 1], cfg["gnn"]["threshold"])
             rep["n_estimators"] = int(getattr(m, "best_iteration", 0) or 0) + 1
-            rep["n_columnas"] = len(columnas(v, cols_base))
+            rep["n_columnas"] = len(columnas(v, cols_base, cols_emb))
             resultados[str(v)] = rep
             guardar(m.get_booster(), cfg, nombre_modelo(v))
             log.info("  variante %d: PR-AUC %.4f | ROC %.4f | %d árboles",
@@ -153,7 +166,40 @@ def main():
     with open(reports_dir / "hybrid_variants.json") as f:
         prev = json.load(f)
     todas = sorted(int(x) for x in prev["variantes"])
-    v = max(todas)                       # la completa: la que va a producción
+    # `hybrid_variants.json` puede venir de una corrida con otra configuración:
+    # si allí se entrenó la variante del embedding y ahora `usar_embedding` está
+    # en false (o cambió `hidden_dims`), esas columnas no existen en esta tabla.
+    # Se descartan con aviso en vez de reventar al armar la matriz.
+    def _armable(x):
+        try:
+            columnas(x, cols_base, cols_emb)
+            return True
+        except ValueError:
+            return False
+
+    fuera = [x for x in todas if not _armable(x)]
+    if fuera:
+        log.warning("Se omiten las variantes %s: hybrid_variants.json las trae "
+                    "pero la tabla actual no tiene sus columnas. Relanza el "
+                    "paso `hybrid` si las quieres.", fuera)
+        todas = [x for x in todas if _armable(x)]
+    if not todas:
+        raise SystemExit("Ninguna variante de hybrid_variants.json es armable "
+                         "con la tabla actual. Relanza el paso `hybrid`.")
+    # La cabeza de producción es la MEJOR de las que usan la GNN (440 y la del
+    # embedding), medida por PR-AUC en el mes 5. Antes se cogía la más grande,
+    # que era arbitrario. Se restringe a las que llevan GNN a propósito: 431 y
+    # 439 existen como CONTROL de atribución, no como candidatas a desplegar.
+    # 431 y 439 son los CONTROLES; cualquier otra variante lleva la GNN
+    # (gnn_score o embedding). Mismo criterio que el filtro de control
+    # en final_comparison.control_variantes_on_test.
+    con_gnn = [x for x in todas if x not in (431, 439)]
+    v = max(con_gnn, key=lambda x: prev["variantes"][str(x)].get("pr_auc", 0)) \
+        if con_gnn else max(todas)
+    log.info("Cabeza de producción: variante %d (mejor PR-AUC en el mes 5 entre "
+             "las que usan la GNN: %s)", v,
+             {x: round(prev["variantes"][str(x)].get("pr_auc", 0), 4)
+              for x in con_gnn})
     t0 = time.time()
 
     # Se entrenan TODAS con meses 1-5, no solo la completa. Las que no usan
@@ -165,7 +211,7 @@ def main():
         n_i = prev["variantes"][str(vi)]["n_estimators"]
         log.info("Refit variante %d con %d árboles heredados (sin Optuna)",
                  vi, n_i)
-        X_res, y_res = apply_smote(matriz(df, filas_tr, vi, cols_base), y_tr, cfg)
+        X_res, y_res = apply_smote(matriz(df, filas_tr, vi, cols_base, cols_emb), y_tr, cfg)
         mi = _entrenar(X_res.astype(np.float32), y_res, None, None, cfg,
                        prev["best_params"], n_est=n_i)
         inferir_en_cpu(mi)
@@ -180,7 +226,7 @@ def main():
     # Umbral operativo: el cuantil que produce el presupuesto de alertas
     # configurado, medido sobre el mes 5 (ver head.umbral_por_presupuesto).
     filas_v5 = np.where(df["split"].values == "val")[0]
-    s_v5 = m.predict_proba(matriz(df, filas_v5, v, cols_base))[:, 1]
+    s_v5 = m.predict_proba(matriz(df, filas_v5, v, cols_base, cols_emb))[:, 1]
     pct = float(hcfg.get("alert_budget_pct", 2.0))
     thr = umbral_por_presupuesto(s_v5, pct)
     with open(reports_dir / "hybrid_thresholds.json", "w") as f:

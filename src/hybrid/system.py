@@ -25,7 +25,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from src.continual_learning.validate import score_nodes
+from src.continual_learning.validate import embed_and_score_nodes
 from src.utils.common import get_logger
 
 log = get_logger("hybrid.system")
@@ -51,15 +51,26 @@ class HybridSystem:
 
     def score(self, data, node_idx: np.ndarray) -> np.ndarray:
         """P(fraude) para esos nodos, alineado con `node_idx`."""
-        g = score_nodes(self.gnn, data, node_idx, self.cfg)
+        emb, g = embed_and_score_nodes(self.gnn, data, node_idx, self.cfg)
         if not self.es_hibrido:
             return g
         idx = np.asarray(node_idx, dtype=np.int64)
-        X = np.hstack([
-            data.x[idx].numpy().astype(np.float32),
-            self.struct[idx],
-            g.reshape(-1, 1).astype(np.float32),
-        ])
+        base = data.x[idx].numpy().astype(np.float32)
+        est = self.struct[idx]
+        # Qué espera la cabeza se deduce de ELLA, no de la config: así el mismo
+        # código sirve para la variante del escalar (431+8+1) y la del
+        # embedding (431+8+dim), y un modelo entrenado con una no se puede
+        # servir por accidente con la otra.
+        esperado = self.head.num_features()
+        if esperado == base.shape[1] + est.shape[1] + 1:
+            extra = g.reshape(-1, 1).astype(np.float32)
+        else:
+            extra = emb
+        X = np.hstack([base, est, extra])
+        assert X.shape[1] == esperado, (
+            f"La cabeza espera {esperado} columnas y se le arman "
+            f"{X.shape[1]} ({base.shape[1]} base + {est.shape[1]} "
+            f"estructurales + {extra.shape[1]})")
         return self.head.inplace_predict(X)
 
     def scorer(self, data):

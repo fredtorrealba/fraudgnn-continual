@@ -61,13 +61,28 @@ class _BaseGNN(nn.Module):
     def _make_conv(self, in_c, out_c):  # pragma: no cover - abstracta
         raise NotImplementedError
 
-    def forward(self, x, edge_index):
+    def encode(self, x, edge_index):
+        """
+        Representación del nodo TRAS las convoluciones y ANTES del clasificador.
+
+        Es el vector que resume "yo + mi vecindario": `hidden_dims[-1]`
+        dimensiones (256 con una capa). El sistema híbrido puede consumirlo
+        entero en vez del escalar que devuelve `forward`, que lo colapsa a un
+        único número y descarta 255 de esas 256 dimensiones.
+        """
         for conv, bn in zip(self.convs, self.bns):
             x = conv(x, edge_index)
             x = bn(x)
             x = F.relu(x)
             x = F.dropout(x, p=self.dropout, training=self.training)
-        return self.classifier(x).squeeze(-1)  # logits
+        return x
+
+    def forward(self, x, edge_index):
+        return self.classifier(self.encode(x, edge_index)).squeeze(-1)  # logits
+
+    @property
+    def dim_embedding(self) -> int:
+        return self.classifier[0].in_features
 
     @torch.no_grad()
     def predict_proba(self, x, edge_index):

@@ -110,12 +110,13 @@ STEPS = [
               "excluido. Sin esto, la columna gnn_score sobre los meses 1-4 "
               "reflejaría lo que la red MEMORIZÓ, no lo que acierta, y la "
               "cabeza aprendería a copiarla. ~20 min."),
-    Step("hybrid", "[5b] Cabeza XGBoost del sistema híbrido (3 variantes)",
+    Step("hybrid", "[5b] Cabeza XGBoost del sistema híbrido (variantes)",
          "src.hybrid.train_head",
          [("models_dir", "hybrid_head_440.json"),
           ("reports_dir", "hybrid_variants.json")],
          args=["--window", "train"],
-         desc="Entrena la cabeza con 431 / 439 / 440 columnas para separar "
+         desc="Entrena la cabeza con 431 / 439 / 440 columnas —y con el "
+              "embedding entero de la GNN si hybrid.usar_embedding— para separar "
               "cuánto aporta la estructura del grafo y cuánto la red. Optuna "
               "corre UNA vez y las tres comparten hiperparámetros. ~12 min."),
     Step("refit", "[6] Refit del ganador sobre train + validación",
@@ -135,7 +136,7 @@ STEPS = [
          [("models_dir", "hybrid_head_prod.json"),
           ("reports_dir", "hybrid_thresholds.json")],
          args=["--window", "trainval"],
-         desc="Reentrena la variante ganadora con meses 1-5 (sin Optuna, hereda "
+         desc="Reentrena TODAS las variantes con meses 1-5 (sin Optuna, heredan "
               "los hiperparámetros) y fija el umbral por presupuesto de alertas "
               "sobre el mes 5. ~3 min."),
     Step("cl", "[7] Ciclo de Continual Learning (mes 6 por semanas)",

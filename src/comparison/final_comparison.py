@@ -184,8 +184,12 @@ def control_variantes_on_test(cfg) -> dict:
     filas_te = np.where(df["split"].values == "test")[0]
     salida = {}
     for v in sorted(int(x) for x in variantes):
-        if "gnn_score" in columnas(v, cols_base):
-            continue                              # necesita la GNN en ejecución
+        # Solo las que NO necesitan la GNN en ejecución. Tanto `gnn_score` como
+        # las columnas del embedding quedan NaN fuera de la ventana OOF: las
+        # rellena HybridSystem corriendo la red. Por eso el control se limita a
+        # 431 y 439, cuyas columnas existen para todos los meses.
+        if v not in (431, 439):
+            continue
         booster = xgb.Booster()
         booster.load_model(str(models_dir / f"hybrid_head_prod_{v}.json"))
         booster.set_param({"nthread": 1, "device": "cpu"})

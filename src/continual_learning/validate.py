@@ -63,6 +63,51 @@ def score_nodes(model, data, node_idx: np.ndarray, cfg) -> np.ndarray:
     return scores[node_idx]
 
 
+@torch.no_grad()
+def embed_and_score_nodes(model, data, node_idx: np.ndarray, cfg):
+    """
+    Embedding y score en UNA sola pasada de muestreo.
+
+    El score ES `sigmoid(classifier(embedding))`, así que calcular los dos por
+    separado recorrería el grafo dos veces para el mismo resultado. Devuelve
+    (embeddings [n, dim], scores [n]).
+    """
+    device = get_device()
+    model = model.to(device).eval()
+    mask = torch.zeros(data.num_nodes, dtype=torch.bool)
+    mask[torch.as_tensor(node_idx, dtype=torch.long)] = True
+    loader = make_neighbor_loader(data, num_neighbors=fanouts(cfg),
+                                  input_nodes=mask, batch_size=512, shuffle=False,
+                                  sin_aristas=loader_opts(cfg)["sin_aristas"])
+    # Se reserva por NODOS PEDIDOS, no por nodos del grafo. Con un embedding de
+    # 256 dims, dimensionarlo al grafo entero serían ~600 MB en cada llamada, y
+    # el CL llama a esto decenas de veces por semana. `pos` traduce el id global
+    # que devuelve el loader a la fila que le toca en la salida.
+    # Se reserva por nodos ÚNICOS pedidos, no por nodos del grafo: con 256 dims,
+    # dimensionarlo al grafo entero serían ~600 MB en cada llamada y el CL llama
+    # a esto decenas de veces por semana.
+    # Se pasa por `unique` a propósito: `mezcla_40_60` concatena adaptación y
+    # buffer, que pueden solaparse. Con duplicados, un mapeo directo id->fila
+    # solo rellenaría la última aparición y las demás quedarían en ceros SIN
+    # avisar. `inv` reconstruye el orden y las repeticiones del `node_idx`
+    # original, así que la salida sigue alineada 1 a 1 con lo que se pidió.
+    node_idx = np.asarray(node_idx, dtype=np.int64)
+    uniq, inv = np.unique(node_idx, return_inverse=True)
+    pos = np.full(data.num_nodes, -1, dtype=np.int64)
+    pos[uniq] = np.arange(len(uniq))
+    emb = np.zeros((len(uniq), model.dim_embedding), dtype=np.float32)
+    sc = np.zeros(len(uniq), dtype=np.float32)
+    for batch in loader:
+        batch = batch.to(device)
+        h = model.encode(batch.x, batch.edge_index)[: batch.batch_size]
+        s = torch.sigmoid(model.classifier(h).squeeze(-1))
+        fila = pos[batch.n_id[: batch.batch_size].cpu().numpy()]
+        emb[fila] = h.cpu().numpy()
+        sc[fila] = s.cpu().numpy()
+    model.cpu()
+    return emb[inv], sc[inv]
+
+
 def _as_scorer(obj, data, cfg):
     """
     Normaliza a `callable(node_idx) -> np.float32[]`.

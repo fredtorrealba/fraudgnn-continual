@@ -77,8 +77,8 @@ gnn:
   # 23.7K con 3 — o sea que 1 capa entrena ~7x más barato.
   #
   hidden_dims: [256]               # 1 capa   431 -> 256
-  # hidden_dims: [256, 128]        # 2 capas  431 -> 256 -> 128
-  # hidden_dims: [256, 128, 64]    # 3 capas  431 -> 256 -> 128 -> 64  (original)
+  # hidden_dims: [256, 256]        # 2 capas  431 -> 256 -> 128
+  # hidden_dims: [256, 256, 256]    # 3 capas  431 -> 256 -> 128 -> 64  (original)
   #
   mlp_head_dim: 32                 # cabeza clasificadora: última capa -> 32 -> 1
   dropout: 0.3
@@ -140,6 +140,13 @@ hybrid:
   # Umbral por VOLUMEN de alertas, no fijo. La GNN entrena con pos_weight ~27
   # (scores inflados) y la cabeza devuelve probabilidades calibradas ~3%: con
   # 0.5 el híbrido no alertaría casi nada y ningún ciclo de CL desplegaría.
+  # La GNN entrega hoy UN escalar (gnn_score) contra 431 columnas tabulares.
+  # Con esto se entrena además una variante que recibe el EMBEDDING entero: el
+  # vector de la última capa (431+8+dim columnas; con hidden_dims [256] son
+  # 695). El número de variante se calcula solo a partir de hidden_dims.
+  # Coste: el parquet del OOF pasa de ~4 MB a ~500 MB y XGBoost entrena sobre
+  # 695 columnas. Ponlo en false para volver al comportamiento anterior.
+  usar_embedding: true
   alert_budget_pct: 2.0            # % del mes que se marca para revisión
   cl_head:
     # Warm start de la cabeza en cada ciclo: la mezcla 40/60 son ~20 filas, así

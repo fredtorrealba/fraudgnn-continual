@@ -44,7 +44,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from src.gnn.models import build_model
 from src.gnn.train_gnn import make_loader
-from src.continual_learning.validate import score_nodes
+from src.continual_learning.validate import embed_and_score_nodes
 from src.utils.common import (ensure_dirs, get_device, get_logger, load_config,
                               resolve, set_seed)
 
@@ -191,6 +191,13 @@ def main():
 
     fold = _folds(data, nodos, k, seed)
     scores = np.zeros(len(nodos), dtype=np.float32)
+    # Además del escalar se guarda el EMBEDDING: el vector de la última capa,
+    # antes de que el clasificador de la GNN lo colapse a un solo número. El
+    # escalar es todo lo que la red puede decirle al modelo tabular hoy, y
+    # compite contra 431 columnas; el embedding ensancha ese canal x256.
+    # Ambos salen de las MISMAS K redes out-of-fold, así que el embedding es
+    # tan honesto como el score: ninguna red vio la transacción que describe.
+    emb = None
     t0 = time.time()
     for f in range(k):
         fuera = fold == f
@@ -199,16 +206,23 @@ def main():
         mask_tr = torch.zeros(data.num_nodes, dtype=torch.bool)
         mask_tr[torch.tensor(nodos[~fuera], dtype=torch.long)] = True
         model = _entrenar(nombre, seed, epocas, data, mask_tr, cfg, device)
-        scores[fuera] = score_nodes(model, data, nodos[fuera], cfg)
-        del model
+        h, s_fold = embed_and_score_nodes(model, data, nodos[fuera], cfg)
+        scores[fuera] = s_fold
+        if emb is None:
+            emb = np.zeros((len(nodos), h.shape[1]), dtype=np.float32)
+        emb[fuera] = h
+        del model, h
     minutos = round((time.time() - t0) / 60, 1)
 
-    pd.DataFrame({"node_idx": nodos, "gnn_score": scores}).to_parquet(
-        ruta_parquet(cfg, args.window), index=False)
+    salida = {"node_idx": nodos, "gnn_score": scores}
+    salida.update({f"emb_{i}": emb[:, i] for i in range(emb.shape[1])})
+    pd.DataFrame(salida).to_parquet(ruta_parquet(cfg, args.window), index=False)
+    log.info("Guardado: gnn_score + embedding de %d dimensiones", emb.shape[1])
 
     diag = _diagnostico(scores, fold, data.month.numpy()[nodos])
     informe = {"window": args.window, "folds": k, "modelo": nombre, "seed": seed,
                "epocas": epocas, "n_nodos": int(len(nodos)), "minutos": minutos,
+               "dim_embedding": int(emb.shape[1]),
                "diagnostico": diag}
     with open(ruta_informe(cfg, args.window), "w") as fh:
         json.dump(informe, fh, indent=2, ensure_ascii=False)

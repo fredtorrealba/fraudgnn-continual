@@ -33,12 +33,37 @@ def nombre_modelo(variant: int) -> str:
     return f"hybrid_head_{variant}.json"
 
 
-def columnas(variant: int, cols_base: list[str]) -> list[str]:
+# Variante con EMBEDDING: en vez del escalar `gnn_score`, las `dim` columnas
+# del vector de la última capa de la GNN. La red pasa de "asesor que opina un
+# número" a "codificador de grafo": sin ella desaparecen 256 de las 695
+# columnas, no una. El número de variante es 431 + 8 + dim, así que depende de
+# `gnn.hidden_dims`; con [256] son 695.
+def variante_embedding(cols_base: list[str], dim: int) -> int:
+    return len(cols_base) + len(COLS_ESTRUCTURALES) + dim
+
+
+def cols_embedding(df) -> list[str]:
+    """Las columnas `emb_*` presentes en la tabla, en orden."""
+    return sorted((c for c in df.columns if c.startswith("emb_")),
+                  key=lambda c: int(c.split("_")[1]))
+
+
+def columnas(variant: int, cols_base: list[str],
+             cols_emb: list[str] | None = None) -> list[str]:
     if variant == 431:
         return list(cols_base)
     if variant == 439:
         return list(cols_base) + list(COLS_ESTRUCTURALES)
-    return list(cols_base) + list(COLS_ESTRUCTURALES) + ["gnn_score"]
+    if variant == 440:
+        return list(cols_base) + list(COLS_ESTRUCTURALES) + ["gnn_score"]
+    if cols_emb and variant == variante_embedding(cols_base, len(cols_emb)):
+        return list(cols_base) + list(COLS_ESTRUCTURALES) + list(cols_emb)
+    raise ValueError(
+        f"Variante {variant} desconocida. Con {len(cols_base)} columnas base "
+        f"las válidas son 431, 439, 440"
+        + (f" y {variante_embedding(cols_base, len(cols_emb))} (embedding de "
+           f"{len(cols_emb)})" if cols_emb else
+           " (la de embedding exige gnn_oof_*.parquet con columnas emb_*)"))
 
 
 def cargar_tabla(cfg, oof_window: str | None) -> tuple[pd.DataFrame, list[str]]:
@@ -67,14 +92,22 @@ def cargar_tabla(cfg, oof_window: str | None) -> tuple[pd.DataFrame, list[str]]:
     if oof_window:
         oof = pd.read_parquet(proc / f"gnn_oof_{oof_window}.parquet")
         df.loc[oof["node_idx"].values, "gnn_score"] = oof["gnn_score"].values
-        log.info("gnn_score OOF (%s): %d filas", oof_window, len(oof))
+        # Embedding, si la corrida del OOF lo dejó. Igual que gnn_score, queda
+        # NaN fuera de la ventana: lo rellena quien puntúe con el modelo real.
+        emb = cols_embedding(oof)
+        for c in emb:
+            df[c] = np.nan
+            df.loc[oof["node_idx"].values, c] = oof[c].values
+        log.info("gnn_score OOF (%s): %d filas%s", oof_window, len(oof),
+                 f" + embedding de {len(emb)} dims" if emb else "")
     return df, cols_base
 
 
 def matriz(df: pd.DataFrame, filas: np.ndarray, variant: int,
-           cols_base: list[str]) -> np.ndarray:
+           cols_base: list[str], cols_emb: list[str] | None = None) -> np.ndarray:
     """Matriz de diseño de una variante, en float32 (SMOTE devuelve float64)."""
-    return df.loc[filas, columnas(variant, cols_base)].values.astype(np.float32)
+    return df.loc[filas, columnas(variant, cols_base, cols_emb)].values.astype(
+        np.float32)
 
 
 def guardar(booster, cfg, nombre: str) -> Path:
