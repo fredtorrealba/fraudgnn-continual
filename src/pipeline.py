@@ -87,7 +87,8 @@ STEPS = [
               "~1 min."),
     Step("graph", "[2] Construcción del grafo (PyG)",
          "src.data.build_graph",
-         [("graph_dir", "graph.pt")],
+         [("graph_dir", "graph.pt"),
+          ("processed_dir", "graph_features.parquet")],
          desc="Construye el grafo: nodos = transacciones, aristas = comparten "
               "entidad (tarjeta / email / dispositivo) dentro de 30 días, con tope "
               "de 50 aristas por nodo para evitar hubs. ~4 min, ~22M aristas."),
@@ -101,6 +102,22 @@ STEPS = [
               "neighbor sampling 15-10-5 (nunca ve el grafo entero). Elige la mejor "
               "por AUC walk-forward semanal. EL PASO CARO: 2-4 h con GPU. "
               "Reanudable por corrida Y por época."),
+    Step("oof", "[5a] gnn_score honesto por validación cruzada (meses 1-4)",
+         "src.hybrid.oof", [("processed_dir", "gnn_oof_train.parquet"),
+                            ("reports_dir", "oof_train.json")],
+         args=["--window", "train"],
+         desc="Entrena K redes dejando un trozo fuera cada vez y puntúa el "
+              "excluido. Sin esto, la columna gnn_score sobre los meses 1-4 "
+              "reflejaría lo que la red MEMORIZÓ, no lo que acierta, y la "
+              "cabeza aprendería a copiarla. ~20 min."),
+    Step("hybrid", "[5b] Cabeza XGBoost del sistema híbrido (3 variantes)",
+         "src.hybrid.train_head",
+         [("models_dir", "hybrid_head_440.json"),
+          ("reports_dir", "hybrid_variants.json")],
+         args=["--window", "train"],
+         desc="Entrena la cabeza con 431 / 439 / 440 columnas para separar "
+              "cuánto aporta la estructura del grafo y cuánto la red. Optuna "
+              "corre UNA vez y las tres comparten hiperparámetros. ~12 min."),
     Step("refit", "[6] Refit del ganador sobre train + validación",
          "src.gnn.refit",
          [("models_dir", "refit_model.pt"), ("reports_dir", "refit.json")],
@@ -108,10 +125,24 @@ STEPS = [
               "épocas, así que se reentrena DESDE CERO con todos los datos hasta "
               "el mes 5 (+21%). Sin early stopping — las épocas se heredan del "
               "pico de la corrida ganadora. El mes 6 sigue intacto. ~35 min GPU."),
+    Step("oof_refit", "[6a] gnn_score honesto sobre meses 1-5",
+         "src.hybrid.oof", [("processed_dir", "gnn_oof_trainval.parquet"),
+                            ("reports_dir", "oof_trainval.json")],
+         args=["--window", "trainval"],
+         desc="Lo mismo que `oof` pero sobre la ventana del refit. ~25 min."),
+    Step("hybrid_refit", "[6b] Cabeza de producción + umbral operativo",
+         "src.hybrid.train_head",
+         [("models_dir", "hybrid_head_prod.json"),
+          ("reports_dir", "hybrid_thresholds.json")],
+         args=["--window", "trainval"],
+         desc="Reentrena la variante ganadora con meses 1-5 (sin Optuna, hereda "
+              "los hiperparámetros) y fija el umbral por presupuesto de alertas "
+              "sobre el mes 5. ~3 min."),
     Step("cl", "[7] Ciclo de Continual Learning (mes 6 por semanas)",
          "src.continual_learning.cl_orchestrator",
          [("reports_dir", "cl_cycles.json"),
           ("reports_dir", "gnn_cl_test_scores.npz"),
+          ("reports_dir", "hybrid_cl_test_scores.npz"),
           ("graph_dir", "graph_scored.pt")],
          desc="Simula el mes 6 semana a semana. Por cada una: mide qué fraudes se "
               "escaparon, dispara el gatillo si hay patrón nuevo, hace fine-tuning "

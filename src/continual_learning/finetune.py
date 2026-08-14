@@ -28,7 +28,8 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from src.gnn.sampling import fanouts, make_neighbor_loader
+from src.continual_learning.mixture import mezcla_40_60
+from src.gnn.sampling import fanouts, loader_opts, make_neighbor_loader
 from src.utils.common import get_device, get_logger, load_config
 
 log = get_logger("cl.finetune")
@@ -72,12 +73,11 @@ def finetune(model, data, adapt_nodes: np.ndarray, buffer_nodes: np.ndarray,
             m.eval()
 
     # --- composición del set de fine-tuning: 40% nuevos / 60% buffer ---
+    # La misma función la usa el warm start de la cabeza XGBoost, con la misma
+    # semilla: así las dos piezas del sistema adaptan sobre las MISMAS filas.
+    seed_nodes = mezcla_40_60(adapt_nodes, buffer_nodes, mix_new)
     n_new = len(adapt_nodes)
-    n_buf = int(round(n_new * (1 - mix_new) / max(mix_new, 1e-6)))
-    rng = np.random.default_rng(42)
-    buf_sample = rng.choice(buffer_nodes, size=min(n_buf, len(buffer_nodes)),
-                            replace=False)
-    seed_nodes = np.concatenate([adapt_nodes, buf_sample])
+    buf_sample = seed_nodes[n_new:]
 
     # pos_weight recalculado AL CONJUNTO QUE ENTRENA AHORA (~1.2)
     y_mix = data.y[torch.tensor(seed_nodes, dtype=torch.long)].numpy()
@@ -89,9 +89,12 @@ def finetune(model, data, adapt_nodes: np.ndarray, buffer_nodes: np.ndarray,
 
     seed_mask = torch.zeros(data.num_nodes, dtype=torch.bool)
     seed_mask[torch.tensor(seed_nodes, dtype=torch.long)] = True
+    # sin_aristas SÍ debe propagarse: si no, la ablación quedaría a medias
+    # (activa en compare_gnns/refit pero inactiva en todo el ciclo de CL).
     loader = make_neighbor_loader(data, num_neighbors=fanouts(cfg),
                                   input_nodes=seed_mask,
-                                  batch_size=ft["batch_size"], shuffle=True)
+                                  batch_size=ft["batch_size"], shuffle=True,
+                                  sin_aristas=loader_opts(cfg)["sin_aristas"])
     # Sin num_workers: el fine-tuning trabaja con decenas de muestras (mezcla
     # 40/60 de casos nuevos + buffer). Un pool de procesos para 1-2 batches es
     # puro overhead, y su destrucción repetida ensucia el log.

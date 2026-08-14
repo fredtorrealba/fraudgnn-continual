@@ -24,15 +24,22 @@ guardan los scores del baseline-en-el-tiempo para la comparación final.
 Uso:
   python -m src.continual_learning.cl_orchestrator
 """
-import json
 import sys
-import time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from src.utils.omp import guard_omp
+
+# ANTES de importar torch o xgboost: este proceso carga los dos y en macOS sus
+# runtimes de OpenMP se pisan y el intérprete muere con SIGSEGV.
+guard_omp()
+
+import json
+import time
 
 import numpy as np
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from src.continual_learning.control_set import ControlSet
 from src.continual_learning.finetune import finetune
 from src.continual_learning.replay_buffer import ReplayBuffer
@@ -40,6 +47,7 @@ from src.continual_learning.splitter import split_new_pattern
 from src.continual_learning.trigger import ConfirmedCase, NoveltyQueue
 from src.continual_learning.validate import dial_overrides, score_nodes, validate_cycle
 from src.gnn.models import build_model
+from src.hybrid.system import HybridSystem, cargar_cabeza, cargar_struct, cargar_umbral
 from src.utils.common import ensure_dirs, get_logger, load_config, resolve, set_seed
 from src.utils.metrics import full_report
 
@@ -85,8 +93,25 @@ def run():
     current_model, model_name = load_selected_model(cfg, data)
     buffer, control = init_memory_sets(cfg, data, current_model)
 
+    # --- sistema en operación: híbrido si la cabeza existe, GNN sola si no ---
+    # Que degrade a GNN sola no es un apaño: permite correr el ciclo antiguo sin
+    # tocar nada, que es como se comparan los dos sistemas.
+    struct = cargar_struct(cfg)
+    current_head = cargar_cabeza(cfg)
+    thr_hibrido = cargar_umbral(cfg)
+    hibrido = current_head is not None and struct is not None
+    if hibrido:
+        log.info("Sistema en operación: HÍBRIDO (GNN + %d columnas del grafo + "
+                 "cabeza XGBoost) | umbral %.4f", struct.shape[1], thr_hibrido)
+    else:
+        log.info("Sistema en operación: GNN sola")
+
+    def sistema(gnn, head):
+        return HybridSystem(gnn, head if hibrido else None,
+                            struct, cfg, thr_hibrido if hibrido else None)
+
     queue = NoveltyQueue(cfg, persist=False)
-    thr = cfg["gnn"]["threshold"]
+    thr = thr_hibrido if hibrido else cfg["gnn"]["threshold"]
     history = []
     pattern_counter = 0
 
@@ -101,8 +126,10 @@ def run():
         log.info("========== SEMANA %d del mes de test (%d txn) ==========",
                  week, len(week_idx))
 
-        # --- OPERACIÓN: el modelo vigente scorea la semana ---
-        scores = score_nodes(current_model, data, week_idx, cfg)
+        # --- OPERACIÓN: el sistema vigente scorea la semana ---
+        # El gatillo debe mirar lo que el sistema REAL habría alertado, así que
+        # aquí se usa el híbrido completo, no solo la GNN.
+        scores = sistema(current_model, current_head).score(data, week_idx)
         y_week = data.y[torch.tensor(week_idx)].numpy().astype(int)
         pre_report = full_report(y_week, scores, thr)
         log.info("Recall de la semana ANTES de adaptar: %.4f", pre_report["recall"])
@@ -141,10 +168,22 @@ def run():
                 new_model, ft_info = finetune(
                     current_model, data, adapt_nodes,
                     buffer.node_indices(), cfg, overrides)
+
+                # La cabeza se adapta con la MISMA mezcla y la MISMA semilla que
+                # acaba de usar la GNN: ambas piezas ven las filas idénticas.
+                new_head, head_info = current_head, None
+                if hibrido:
+                    from src.hybrid.head_cl import warm_start
+                    new_head, head_info = warm_start(
+                        current_head, new_model, data, struct, adapt_nodes,
+                        buffer.node_indices(), cfg, overrides)
+                    ft_info["cabeza"] = head_info
+
                 elapsed_h = (time.time() - t_fire) / 3600
-                verdict = validate_cycle(new_model, current_model, data,
-                                         verif_nodes, control.node_indices(),
-                                         elapsed_h, cfg)
+                verdict = validate_cycle(sistema(new_model, new_head).scorer(data),
+                                         sistema(current_model, current_head).scorer(data),
+                                         data, verif_nodes, control.node_indices(),
+                                         elapsed_h, cfg, threshold=thr)
                 verdict["finetune_info"] = ft_info
                 if verdict["deploy"]:
                     break
@@ -186,8 +225,14 @@ def run():
                 log.warning(diag)
 
             if verdict and verdict["deploy"]:
-                # --- DESPLIEGUE: reemplaza al modelo anterior ---
+                # --- DESPLIEGUE: reemplaza al sistema anterior ---
+                # Las dos piezas se despliegan JUNTAS: la cabeza se afinó sobre
+                # los scores de esta GNN, así que separarlas las descalibraría.
                 current_model = new_model
+                if hibrido and new_head is not None:
+                    current_head = new_head
+                    current_head.save_model(
+                        str(models_dir / "production_head.json"))
                 torch.save({"model_name": model_name,
                             "in_dim": cfg["gnn"]["in_dim"],
                             "state_dict": {k: v.cpu() for k, v
@@ -199,6 +244,9 @@ def run():
 
                 # --- ACTUALIZAR CONJUNTOS (regla de oro) ---
                 y_all = data.y.numpy().astype(int)
+                # El buffer guarda el score de la GNN, no el del sistema: su
+                # semántica es "dificultad para la red", que es lo que decide
+                # qué casos frontera conviene conservar para el repaso.
                 s_adapt = score_nodes(current_model, data, adapt_nodes, cfg)
                 buffer.update_with_adaptation(
                     [{"node_idx": int(n), "y": int(y_all[n]),
@@ -211,8 +259,8 @@ def run():
                     pattern_id,
                     buffer_nodes=set(int(i) for i in buffer.node_indices()))
 
-                # recall de la MISMA semana con el modelo ya adaptado
-                s_after = score_nodes(current_model, data, week_idx, cfg)
+                # recall de la MISMA semana con el sistema ya adaptado
+                s_after = sistema(current_model, current_head).score(data, week_idx)
                 cycle_log["recall_after"] = full_report(y_week, s_after, thr)["recall"]
                 log.info("Recall de la semana DESPUÉS de adaptar: %.4f "
                          "(antes: %.4f)", cycle_log["recall_after"],
@@ -222,10 +270,21 @@ def run():
 
     # --- scores finales del sistema GNN+CL sobre TODO el mes 6 ---
     # (para la comparación OE4 contra XGBoost congelado)
+    # Se emiten los scores de AMBOS sistemas sobre el mes 6, para que la
+    # comparación final pueda medir la GNN sola y el híbrido con los mismos
+    # datos y el mismo modelo final. El .npz de la GNN mantiene su nombre y su
+    # formato: nada de lo que ya consume ese archivo se entera del cambio.
+    y_test = data.y[torch.tensor(test_idx_all)].numpy()
     final_scores = score_nodes(current_model, data, test_idx_all, cfg)
     np.savez_compressed(reports_dir / "gnn_cl_test_scores.npz",
                         node_idx=test_idx_all, scores=final_scores,
-                        y=data.y[torch.tensor(test_idx_all)].numpy())
+                        y=y_test)
+    if hibrido:
+        s_hib = sistema(current_model, current_head).score(data, test_idx_all)
+        np.savez_compressed(reports_dir / "hybrid_cl_test_scores.npz",
+                            node_idx=test_idx_all, scores=s_hib, y=y_test,
+                            umbral=np.array([thr_hibrido]))
+        log.info("Scores del híbrido sobre el mes 6 -> hybrid_cl_test_scores.npz")
     # persistir el grafo con los fraud_score poblados: el nodo queda con
     # features + isFraud + fraud_score
     data.fraud_score[torch.tensor(test_idx_all, dtype=torch.long)] = \

@@ -26,29 +26,76 @@ examen. Nunca al revés.
 
 ---
 
-## Las 8 etapas
+## El sistema híbrido
+
+Medimos que la GNN sola **no supera** al baseline tabular, pero que el grafo
+**sí aporta**: quitarle las aristas le cuesta el 55% del PR-AUC, y detecta 132
+fraudes que XGBoost no ve. La conclusión: el grafo tiene señal, pero una GNN
+end-to-end es peor extrayendo datos tabulares que un ensemble de árboles.
+
+El sistema entregado le da a XGBoost la señal del grafo ya digerida:
+
+```
+transacción
+   ├─► 431 columnas originales
+   ├─► 8 columnas estructurales del grafo   (contadas, sin etiquetas)
+   └─► gnn_score                            (la opinión de la GNN)
+                    ↓
+            cabeza XGBoost  →  P(fraude)
+```
+
+Sin la GNN falta una de las 440 columnas. Y tres variantes separan de dónde
+viene cada mejora: **431** (referencia) / **439** (+ estructura) / **440**
+(+ la red).
+
+## Las 12 etapas
 
 | # | Etapa | Qué hace | Produce |
 |---|---|---|---|
 | 1 | `download` | Baja IEEE-CIS de Kaggle (590K txn etiquetadas) | `data/raw/*.csv` |
 | 2 | `preprocess` | Une, codifica, imputa y parte los 6 meses | `data/processed/full.parquet` |
-| 3 | `graph` | Nodos = txn, aristas = entidad compartida | `data/graph/graph.pt` |
+| 3 | `graph` | Nodos = txn, aristas = entidad compartida, **+ 8 columnas estructurales** | `graph.pt`, `graph_features.parquet` |
 | 4 | `gnn` | 2 arquitecturas × 3 semillas = 6 corridas, y elige | `models/selected_model.json` |
-| 5 | `refit` | Reentrena al ganador añadiendo el mes 5 | `models/refit_model.pt` |
-| 6 | `cl` | Mes 6 semana a semana: gatillo → fine-tuning → veredicto | `reports/cl_cycles.json` |
-| 7 | `xgboost` | Baseline tabular **congelado** | `models/xgboost_baseline.json` |
-| 8 | `final` | Comparación a igual presupuesto de alertas | `reports/final_comparison.json` |
+| 5 | `oof` | **`gnn_score` honesto** por validación cruzada (meses 1-4) | `gnn_oof_train.parquet` |
+| 6 | `hybrid` | Cabeza XGBoost, 3 variantes | `hybrid_head_{431,439,440}.json` |
+| 7 | `refit` | Reentrena al ganador añadiendo el mes 5 | `models/refit_model.pt` |
+| 8 | `oof_refit` | `gnn_score` honesto sobre meses 1-5 | `gnn_oof_trainval.parquet` |
+| 9 | `hybrid_refit` | Cabeza de producción + **umbral operativo** | `hybrid_head_prod.json` |
+| 10 | `cl` | Mes 6 semana a semana; **adaptan las dos piezas** | `reports/cl_cycles.json` |
+| 11 | `xgboost` | Baseline tabular **congelado** (viene versionado en git) | `models/xgboost_baseline.json` |
+| 12 | `final` | baseline vs GNN sola vs híbrido, a igual presupuesto | `reports/final_comparison.json` |
+
+### Por qué existen las etapas `oof`
+
+La GNN **memorizó** las transacciones con las que entrenó. Si su score sobre
+esas mismas filas se usara como columna de XGBoost, la cabeza vería una columna
+casi perfecta y aprendería a copiarla — y en el mes 6, donde la red no ha
+memorizado nada, se rompería.
+
+`oof` parte los meses de entrenamiento en 4 trozos y entrena 4 redes, cada una
+dejando un trozo fuera. Cada transacción recibe el score de una red **que nunca
+la vio**. Las 4 se descartan: solo sobrevive la columna.
+
+Los folds son **aleatorios estratificados por (mes, clase)**, no temporales: con
+folds temporales `gnn_score` quedaría correlacionado con el calendario y
+XGBoost lo usaría como proxy de la fecha.
+
+### El umbral no es 0.5
+
+La GNN entrena con `pos_weight ≈ 27` y sus scores están inflados; la cabeza
+devuelve probabilidades calibradas (~3%). Con un umbral fijo el híbrido no
+alertaría casi nada. El umbral es el **cuantil que produce
+`hybrid.alert_budget_pct` de alertas**, medido sobre el mes 5.
 
 Las **3 semillas** existen porque entrenar tiene azar: con una sola corrida no
 sabrías si una arquitectura ganó por buena o por suerte.
 
-`xgboost` va en la posición 7 y no en la 3: solo depende de `preprocess`, así que
-ponerlo tarde deja que el paso caro (`gnn`) arranque antes.
-
 ```
-download → preprocess → graph ─┬─► gnn → refit → cl ─┐
-                               │                      ├─► final
-                               └─────► xgboost ───────┘
+download → preprocess → graph ─┬─► gnn → oof → hybrid → refit → oof_refit ─┐
+                               │                                            │
+                               │                          hybrid_refit → cl ┤
+                               │                                            ├─► final
+                               └────────────► xgboost (congelado) ──────────┘
 ```
 
 ---
@@ -82,6 +129,13 @@ fraudgnn/
 │   ├── baseline_xgboost/
 │   │   ├── smote_pipeline.py    SMOTE, solo sobre train
 │   │   └── train_xgboost.py     Optuna + modelo CONGELADO
+│   ├── hybrid/                  el sistema híbrido GNN + XGBoost
+│   │   ├── features.py          8 columnas estructurales (sin etiquetas)
+│   │   ├── oof.py               gnn_score honesto por validación cruzada
+│   │   ├── head.py              ensamblado de las 440 columnas + IO
+│   │   ├── train_head.py        entrena la cabeza (3 variantes)
+│   │   ├── head_cl.py           warm start de la cabeza en cada ciclo
+│   │   └── system.py            GNN + cabeza en operación
 │   ├── comparison/final_comparison.py
 │   └── utils/                   config, logging, semillas, dispositivo, métricas
 ├── scripts/
@@ -328,6 +382,7 @@ compute:
   n_jobs: -1              # núcleos de CPU. En contenedor, la cuota REAL
 gnn:
   hidden_dims: [256]      # PROFUNDIDAD: cada capa es un SALTO en el grafo
+  sin_aristas: false      # true = ablación: anula el grafo (mide qué aporta)
   fanouts: [15, 10, 5]    # vecinos por salto; se recortan a las capas
   batch_size: 1024
   num_workers: 4          # procesos de muestreo en paralelo
@@ -335,6 +390,11 @@ gnn:
   seeds: [42, 123, 2026]
 xgboost:
   device: "auto"          # auto | cuda | cpu
+hybrid:
+  oof_folds: 4            # trozos para el gnn_score honesto
+  variants: [431, 439, 440]
+  optuna_on_variant: 431  # se afina sobre la MÁS PEQUEÑA a propósito
+  alert_budget_pct: 2.0   # umbral por volumen de alertas, no fijo
 ```
 
 **Sobre la profundidad**: la homofilia medida en este dataset dice que la señal
@@ -362,6 +422,13 @@ está a 1 salto (separación fraude/legítima 3.9x), se pierde a 2 (0.7x) y se
   calibraciones distintas no son comparables: el que tiene `pos_weight` alto
   alerta más y parece mejor en recall. `final_comparison.py` reporta también a
   igual número de alertas y a igual precisión.
+- **`gnn_score` out-of-fold.** Un modelo no puede puntuar honestamente lo que
+  entrenó. Sin validación cruzada, la cabeza aprendería a copiar una columna que
+  en producción no acierta tanto — el fallo clásico del stacking.
+- **Optuna una sola vez, sobre la variante más pequeña.** Si cada variante
+  buscara sus hiperparámetros, una diferencia confundiría "más información" con
+  "sorteo más afortunado". Afinando sobre 431 se le regala la ventaja a la
+  referencia y el resultado del híbrido es una cota inferior conservadora.
 - **Refit antes del test.** El mes 5 se gasta en decidir; una vez decidido, se
   reentrena al ganador desde cero con los meses 1-5. Las épocas se heredan del
   pico de la corrida original (sin validación no hay early stopping) — limitación

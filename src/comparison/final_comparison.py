@@ -27,19 +27,13 @@ import os
 import sys
 from pathlib import Path
 
-# macOS: este es el único módulo que carga PyTorch y XGBoost en el mismo
-# proceso, y cada uno trae su propio runtime de OpenMP (torch empaqueta el
-# suyo; XGBoost usa el libomp de Homebrew). Con los dos multihilo a la vez el
-# intérprete muere con SIGSEGV al llamar a load_model(). Limitar OpenMP a un
-# hilo es el único workaround que funciona (KMP_DUPLICATE_LIB_OK no basta), y
-# tiene que definirse ANTES de importar torch/xgboost. En Linux hay un solo
-# runtime, así que no se toca nada.
-if sys.platform == "darwin":
-    # Asignación directa, NO setdefault: el pipeline padre exporta
-    # OMP_NUM_THREADS desde compute.n_jobs y el subproceso lo hereda, así que
-    # un setdefault no llegaría a aplicarse nunca. En macOS esto no es un valor
-    # por defecto sino un requisito para no segfaultear.
-    os.environ["OMP_NUM_THREADS"] = "1"
+# Este módulo carga PyTorch y XGBoost en el mismo proceso: en macOS hay que
+# limitar OpenMP ANTES de importarlos o el intérprete muere con SIGSEGV.
+# Ver src/utils/omp.py.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from src.utils.omp import guard_omp
+
+guard_omp()
 
 import numpy as np
 import pandas as pd
@@ -176,6 +170,17 @@ def main():
     cl_pack = np.load(reports_dir / "gnn_cl_test_scores.npz")
     gnn_cl_scores, y_gnn, test_idx = cl_pack["scores"], cl_pack["y"], cl_pack["node_idx"]
 
+    # El sistema híbrido, si la corrida lo produjo. Sin él todo lo demás sigue
+    # funcionando igual: la comparación GNN vs baseline no depende de esto.
+    ruta_hib = reports_dir / "hybrid_cl_test_scores.npz"
+    hib_scores = None
+    if ruta_hib.exists():
+        hib_pack = np.load(ruta_hib)
+        hib_scores = hib_pack["scores"]
+        assert np.array_equal(hib_pack["node_idx"], test_idx), \
+            "los scores del híbrido no están alineados con los de la GNN"
+        log.info("Sistema híbrido cargado (%d scores)", len(hib_scores))
+
     data = torch.load(resolve(cfg, "graph_dir") / "graph.pt", weights_only=False)
     gnn_orig_scores = original_gnn_scores_on_test(cfg, data, test_idx)
 
@@ -219,15 +224,22 @@ def main():
          "recall_gnn_cl": recall_at_budget(y_gnn, gnn_cl_scores, k)}
         for k in presupuestos
     ]
+    # --- el sistema híbrido, en los mismos barridos ---
+    sistemas = {"gnn_cl": gnn_cl_scores}
+    if hib_scores is not None:
+        sistemas["hibrido"] = hib_scores
+        for fila, k in zip(por_presupuesto, presupuestos):
+            fila["recall_hibrido"] = recall_at_budget(y_gnn, hib_scores, k)
+
     por_precision = []
     for objetivo in PRECISION_TARGETS:
         rx, kx = recall_at_precision(y_xgb, xgb_scores, objetivo)
-        rg, kg = recall_at_precision(y_gnn, gnn_cl_scores, objetivo)
-        por_precision.append({
-            "precision_objetivo": objetivo,
-            "xgboost": {"recall": rx, "n_alertas": kx},
-            "gnn_cl": {"recall": rg, "n_alertas": kg},
-        })
+        fila = {"precision_objetivo": objetivo,
+                "xgboost": {"recall": rx, "n_alertas": kx}}
+        for etq, sc in sistemas.items():
+            r, k = recall_at_precision(y_gnn, sc, objetivo)
+            fila[etq] = {"recall": r, "n_alertas": k}
+        por_precision.append(fila)
 
     # A igual presupuesto (el de XGBoost en su threshold), ¿quién gana?
     r_xgb_ref = recall_at_budget(y_xgb, xgb_scores, n_alertas_xgb)
@@ -249,8 +261,16 @@ def main():
     semanal = por_semana(test_df, y_gnn, xgb_scores, gnn_cl_scores, thr)
     desplego = cl_desplego(cfg)
 
+    globales = {"xgboost_frozen": rep_xgb, "gnn_continual_learning": rep_cl}
+    if hib_scores is not None:
+        # Umbral propio: el híbrido no comparte escala con la GNN (ver
+        # hybrid/head.py: umbral_por_presupuesto).
+        thr_hib = float(hib_pack["umbral"][0]) if "umbral" in hib_pack else thr
+        globales["hibrido"] = full_report(y_gnn, hib_scores, thr_hib)
+        globales["hibrido"]["umbral_usado"] = thr_hib
+
     result = {
-        "month6_overall": {"xgboost_frozen": rep_xgb, "gnn_continual_learning": rep_cl},
+        "month6_overall": globales,
         "matched_budget": {
             "nota": ("Recall cuando ambos modelos emiten el MISMO número de "
                      "alertas. Es la comparación con sentido operativo: el "
@@ -315,18 +335,24 @@ def main():
              100 * (gnn_cl_scores >= thr).sum() / len(y_gnn),
              rep_cl["recall"], rep_cl["precision"])
     log.info("-- A IGUAL presupuesto de alertas (comparación válida) --")
+    hay_hib = hib_scores is not None
     for fila in por_presupuesto:
-        log.info("  %6d alertas (%5.2f%%) | XGBoost %.4f | GNN+CL %.4f | gana %s",
+        cand = {"XGBoost": fila["recall_xgboost"], "GNN+CL": fila["recall_gnn_cl"]}
+        if hay_hib:
+            cand["híbrido"] = fila["recall_hibrido"]
+        log.info("  %6d alertas (%5.2f%%) | XGBoost %.4f | GNN+CL %.4f%s | gana %s",
                  fila["n_alertas"], fila["pct_del_mes"],
                  fila["recall_xgboost"], fila["recall_gnn_cl"],
-                 "XGBoost" if fila["recall_xgboost"] > fila["recall_gnn_cl"] else "GNN+CL")
+                 f" | híbrido {fila['recall_hibrido']:.4f}" if hay_hib else "",
+                 max(cand, key=cand.get))
     log.info("-- A IGUAL precisión --")
+    fmt = lambda d: ("—" if d["recall"] is None
+                     else f"{d['recall']:.4f} ({d['n_alertas']} alertas)")
     for fila in por_precision:
-        fmt = lambda d: ("—" if d["recall"] is None
-                         else f"{d['recall']:.4f} ({d['n_alertas']} alertas)")
-        log.info("  precisión %3.0f%% | XGBoost %-22s | GNN+CL %s",
+        log.info("  precisión %3.0f%% | XGBoost %-22s | GNN+CL %-22s%s",
                  100 * fila["precision_objetivo"], fmt(fila["xgboost"]),
-                 fmt(fila["gnn_cl"]))
+                 fmt(fila["gnn_cl"]),
+                 f" | híbrido {fmt(fila['hibrido'])}" if hay_hib else "")
     if semanal:
         log.info("-- SEMANA A SEMANA (el mes agregado puede inflar el AUC) --")
         for f in semanal["semanas"]:
@@ -340,10 +366,10 @@ def main():
                  rep_xgb.get("auc_roc", float("nan")),
                  rep_cl.get("auc_roc", float("nan")))
     log.info("-- Threshold-independiente --")
-    log.info("  XGBoost  ROC-AUC %.4f | PR-AUC %.4f",
-             rep_xgb.get("auc_roc", float("nan")), rep_xgb.get("pr_auc", float("nan")))
-    log.info("  GNN+CL   ROC-AUC %.4f | PR-AUC %.4f",
-             rep_cl.get("auc_roc", float("nan")), rep_cl.get("pr_auc", float("nan")))
+    for etq, rep in (("XGBoost", rep_xgb), ("GNN+CL", rep_cl),
+                     *((("híbrido", globales["hibrido"]),) if hay_hib else ())):
+        log.info("  %-8s ROC-AUC %.4f | PR-AUC %.4f", etq,
+                 rep.get("auc_roc", float("nan")), rep.get("pr_auc", float("nan")))
     log.info("-- Emergentes --")
     log.info("  XGBoost %.4f | GNN+CL %.4f | gap %+.4f (KPI >= %.2f: %s)",
              recall_xgb_emerging, recall_cl_emerging, gap,

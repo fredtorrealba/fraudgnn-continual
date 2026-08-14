@@ -60,8 +60,12 @@ def build_edges(df: pd.DataFrame, cfg: dict) -> np.ndarray:
     dts = df["TransactionDT"].values
 
     degree = np.zeros(len(df), dtype=np.int32)
-    edges = set()
+    # dict en vez de set: conserva QUÉ entidad creó cada arista. El grafo se
+    # sigue usando como homogéneo, pero guardar el tipo permite analizar la
+    # contribución de cada relación (y deja abierta la vía heterogénea).
+    edges: dict[tuple[int, int], int] = {}
     keys = entity_keys(df, cfg)
+    tipos = {name: i for i, name in enumerate(keys)}
 
     for etype, key_series in keys.items():
         groups = defaultdict(list)
@@ -86,21 +90,24 @@ def build_edges(df: pd.DataFrame, cfg: dict) -> np.ndarray:
                         continue
                     e = (j, i) if j < i else (i, j)
                     if e not in edges:
-                        edges.add(e)
+                        edges[e] = tipos[etype]
                         degree[i] += 1
                         degree[j] += 1
                         n_edges_type += 1
         log.info("Aristas tipo %-7s: %d", etype, n_edges_type)
 
     if not edges:
-        return np.zeros((2, 0), dtype=np.int64)
+        return (np.zeros((2, 0), dtype=np.int64),
+                np.zeros((0,), dtype=np.int8))
     arr = np.array(list(edges), dtype=np.int64).T
+    etypes = np.fromiter(edges.values(), dtype=np.int8, count=len(edges))
     # Grafo no dirigido -> duplicar en ambos sentidos.
     # ascontiguousarray NO es cosmético: .T y [::-1] devuelven vistas en orden
     # Fortran, torch.tensor() PRESERVA esos strides, y el sampler nativo
     # (pyg_lib.ops.index_sort) falla con "Input should be contiguous".
-    return np.ascontiguousarray(
-        np.concatenate([arr, arr[::-1]], axis=1))
+    edge_index = np.ascontiguousarray(np.concatenate([arr, arr[::-1]], axis=1))
+    edge_type = np.ascontiguousarray(np.concatenate([etypes, etypes]))
+    return edge_index, edge_type
 
 
 def main():
@@ -114,7 +121,7 @@ def main():
     feature_cols = meta["feature_cols"]
 
     log.info("Construyendo aristas para %d nodos...", len(df))
-    edge_index = build_edges(df, cfg)
+    edge_index, edge_type = build_edges(df, cfg)
     log.info("Total aristas (dirigidas x2): %d", edge_index.shape[1])
 
     from torch_geometric.data import Data
@@ -129,6 +136,7 @@ def main():
     data.week_in_month = torch.tensor(df["week_in_month"].values, dtype=torch.long)
     # Cada nodo lleva: features (x) + etiqueta (y) + fraud_score.
     # El score parte en NaN y lo va llenando el modelo al operar.
+    data.edge_type = torch.tensor(edge_type, dtype=torch.int8)
     data.fraud_score = torch.full((data.num_nodes,), float("nan"))
     for split in ["train", "val", "test"]:
         setattr(data, f"{split}_mask",
@@ -137,6 +145,15 @@ def main():
     torch.save(data, graph_dir / "graph.pt")
     log.info("Grafo: %d nodos, %d aristas, %d features",
              data.num_nodes, data.edge_index.shape[1], data.x.shape[1])
+
+    # Columnas estructurales para el modelo tabular del sistema híbrido.
+    # Se calculan aquí porque dependen de las mismas claves de entidad, pero
+    # van a parquet y no al grafo: quien las consume (XGBoost) no carga torch.
+    from src.hybrid.features import construir, ruta
+    feats = construir(df, cfg)
+    feats.to_parquet(ruta(cfg), index=False)
+    log.info("Columnas estructurales -> %s (%d filas x %d)",
+             ruta(cfg).name, len(feats), feats.shape[1])
     if data.x.shape[1] != cfg["gnn"]["in_dim"]:
         log.warning("in_dim real (%d) != config (%d). Actualiza gnn.in_dim en "
                     "config.yaml antes de entrenar.", data.x.shape[1], cfg["gnn"]["in_dim"])

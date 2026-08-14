@@ -28,7 +28,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from src.gnn.sampling import fanouts, make_neighbor_loader
+from src.gnn.sampling import fanouts, loader_opts, make_neighbor_loader
 from src.utils.common import get_device, get_logger, load_config
 from src.utils.metrics import full_report, recall_at_threshold
 
@@ -49,8 +49,11 @@ def score_nodes(model, data, node_idx: np.ndarray, cfg) -> np.ndarray:
     # de 2 a 5000 nodos. Levantar procesos persistentes para eso es más caro que
     # el muestreo, y al destruirlos tan seguido PyTorch escupe cientos de
     # "Bad file descriptor" y "semaphore released too many times" al cerrar.
+    # sin_aristas SÍ debe propagarse (ver finetune.py). num_workers se queda
+    # en 0 a propósito: este loader se recrea decenas de veces por ciclo.
     loader = make_neighbor_loader(data, num_neighbors=fanouts(cfg),
-                                  input_nodes=mask, batch_size=512, shuffle=False)
+                                  input_nodes=mask, batch_size=512, shuffle=False,
+                                  sin_aristas=loader_opts(cfg)["sin_aristas"])
     scores = np.zeros(data.num_nodes, dtype=np.float32)
     for batch in loader:
         batch = batch.to(device)
@@ -60,33 +63,59 @@ def score_nodes(model, data, node_idx: np.ndarray, cfg) -> np.ndarray:
     return scores[node_idx]
 
 
+def _as_scorer(obj, data, cfg):
+    """
+    Normaliza a `callable(node_idx) -> np.float32[]`.
+
+    Un `nn.Module` se envuelve en `score_nodes`, así que el modo GNN sola queda
+    EXACTAMENTE igual que antes. Un sistema híbrido ya expone esa interfaz vía
+    `HybridSystem.scorer()`. Gracias a esto `validate.py` no importa xgboost y
+    la doble validación sirve para los dos sistemas sin ramas condicionales.
+    """
+    if callable(obj) and not hasattr(obj, "state_dict"):
+        return obj
+    return lambda node_idx: score_nodes(obj, data, node_idx, cfg)
+
+
 def validate_cycle(new_model, old_model, data,
                    verification_nodes: np.ndarray,
                    control_nodes: np.ndarray,
                    elapsed_hours: float,
-                   cfg: dict | None = None) -> dict:
+                   cfg: dict | None = None,
+                   threshold: float | None = None) -> dict:
     """
-    Compara modelo NUEVO vs ANTERIOR sobre:
+    Compara sistema NUEVO vs ANTERIOR sobre:
       - datos del patrón NUEVO (verificación, que ninguno entrenó)
       - datos ANTIGUOS (set de control, que ninguno entrenó)
     Devuelve el veredicto + la dirección del dial si falla.
+
+    `new_model`/`old_model` aceptan un modelo de PyTorch o un scorer ya
+    preparado (ver `_as_scorer`), lo que permite validar la GNN sola o el
+    sistema híbrido completo con el mismo código.
+
+    `threshold` es explícito porque los dos sistemas NO comparten escala: la
+    GNN entrena con pos_weight ~27 y sus scores están inflados, mientras la
+    cabeza XGBoost devuelve probabilidades calibradas. Usar 0.5 para el híbrido
+    dejaría casi cero alertas y ningún ciclo llegaría a desplegar.
     """
     cfg = cfg or load_config()
     v = cfg["continual_learning"]["validation"]
-    thr = cfg["gnn"]["threshold"]
+    thr = cfg["gnn"]["threshold"] if threshold is None else float(threshold)
+    score_new = _as_scorer(new_model, data, cfg)
+    score_old = _as_scorer(old_model, data, cfg)
 
     y_verif = data.y[torch.tensor(verification_nodes)].numpy()
     y_ctrl = data.y[torch.tensor(control_nodes)].numpy()
 
     # --- patrón nuevo (todos son fraudes confirmados -> recall directo) ---
-    s_new_v = score_nodes(new_model, data, verification_nodes, cfg)
-    s_old_v = score_nodes(old_model, data, verification_nodes, cfg)
+    s_new_v = score_new(verification_nodes)
+    s_old_v = score_old(verification_nodes)
     recall_new_on_pattern = recall_at_threshold(y_verif, s_new_v, thr)
     recall_old_on_pattern = recall_at_threshold(y_verif, s_old_v, thr)
 
     # --- datos antiguos (control, distribución real) ---
-    s_new_c = score_nodes(new_model, data, control_nodes, cfg)
-    s_old_c = score_nodes(old_model, data, control_nodes, cfg)
+    s_new_c = score_new(control_nodes)
+    s_old_c = score_old(control_nodes)
     recall_new_on_control = recall_at_threshold(y_ctrl, s_new_c, thr)
     recall_old_on_control = recall_at_threshold(y_ctrl, s_old_c, thr)
 

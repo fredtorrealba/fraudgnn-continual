@@ -101,7 +101,7 @@ gnn:
   # ABLACIÓN: true anula TODAS las aristas (cada nodo queda aislado y el modelo
   # se convierte en una MLP con la misma capacidad). Responde si el grafo aporta
   # algo: si el AUC no baja, la GNN nunca lo estaba usando. No modifica graph.pt.
-  sin_aristas: true
+  sin_aristas: false
   num_workers: 4                   # 0 = todo en el proceso principal
   pin_memory: true                 # copia CPU->GPU más rápida (cientos de MB/batch)
   seeds: [42, 123, 2026]           # 3 corridas para la comparación GraphSAGE vs GAT
@@ -114,12 +114,41 @@ xgboost:
   smote:
     sampling_strategy: 0.5         # fraudes sintéticos hasta ratio 1:2 (solo en TRAIN)
     k_neighbors: 5
+    # Se midió contra scale_pos_weight con los mismos hiperparámetros:
+    #   SMOTE            PR-AUC 0.5866   594,273 filas
+    #   scale_pos_weight PR-AUC 0.5627   410,601 filas
+    # SMOTE gana 0.024, así que se mantiene. Coste asumido: al aplicarlo a las
+    # columnas del grafo interpola valores sin vecindario real detrás. Ambos
+    # modelos comparados reciben idéntico tratamiento, así que la comparación
+    # no se ve afectada. La GNN no puede usarlo (un nodo sintético no tiene
+    # aristas) y sigue con pos_weight en la loss.
   optuna_trials: 30                # búsqueda bayesiana de hiperparámetros
   # Dónde entrena XGBoost: "auto" usa la GPU si hay CUDA, si no CPU.
   # En una VM con GPU esto baja la búsqueda de 30 trials de ~35 min a minutos.
   # Fuerza "cpu" si quieres el baseline reproducible en cualquier máquina.
   device: "auto"                   # auto | cuda | cpu
   early_stopping_rounds: 50
+
+hybrid:
+  # Sistema híbrido: GNN + columnas del grafo + cabeza XGBoost.
+  # La cabeza recibe 431 features originales + 8 estructurales + gnn_score.
+  oof_folds: 4                     # trozos para el gnn_score honesto
+  variants: [431, 439, 440]        # 431 solo / +estructurales / +gnn_score
+  optuna_on_variant: 431           # se afina sobre la MÁS PEQUEÑA a propósito:
+                                   # así la ventaja de 440 es una cota inferior
+                                   # conservadora, no atacable por hiperparámetros
+  # Umbral por VOLUMEN de alertas, no fijo. La GNN entrena con pos_weight ~27
+  # (scores inflados) y la cabeza devuelve probabilidades calibradas ~3%: con
+  # 0.5 el híbrido no alertaría casi nada y ningún ciclo de CL desplegaría.
+  alert_budget_pct: 2.0            # % del mes que se marca para revisión
+  cl_head:
+    # Warm start de la cabeza en cada ciclo: la mezcla 40/60 son ~20 filas, así
+    # que reentrenar desde cero daría ruido. Árboles poco profundos para que
+    # solo puedan hacer correcciones groseras con tan pocos puntos.
+    rounds: 30
+    lr_scale: 0.1
+    max_depth: 3
+    min_child_weight: 5
 
 continual_learning:
   trigger:
