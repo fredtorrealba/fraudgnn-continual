@@ -47,6 +47,7 @@ from src.continual_learning.splitter import split_new_pattern
 from src.continual_learning.trigger import ConfirmedCase, NoveltyQueue
 from src.continual_learning.validate import dial_overrides, score_nodes, validate_cycle
 from src.gnn.models import build_model
+from src.hybrid.head import umbral_por_presupuesto
 from src.hybrid.system import HybridSystem, cargar_cabeza, cargar_struct, cargar_umbral
 from src.utils.common import ensure_dirs, get_logger, load_config, resolve, set_seed
 from src.utils.metrics import full_report
@@ -111,7 +112,13 @@ def run():
                             struct, cfg, thr_hibrido if hibrido else None)
 
     queue = NoveltyQueue(cfg, persist=False)
+    # Umbral de arranque. Si el sistema es híbrido se RECALIBRA cada semana (ver
+    # dentro del bucle): congelar un umbral no aguanta el drift. Medido sobre
+    # esta corrida, el 0.845 calibrado en el mes 5 para un 2% de alertas produce
+    # solo un 1,07% en el mes 6 -> el sistema alerta la mitad de lo previsto y
+    # deja escapar fraudes que sí habría marcado con el presupuesto correcto.
     thr = thr_hibrido if hibrido else cfg["gnn"]["threshold"]
+    pct_presupuesto = float((cfg.get("hybrid") or {}).get("alert_budget_pct", 2.0))
     history = []
     pattern_counter = 0
 
@@ -131,8 +138,22 @@ def run():
         # aquí se usa el híbrido completo, no solo la GNN.
         scores = sistema(current_model, current_head).score(data, week_idx)
         y_week = data.y[torch.tensor(week_idx)].numpy().astype(int)
+
+        # Presupuesto de alertas POR SEMANA, no umbral fijo. Un equipo de
+        # revisión tiene capacidad constante, no un corte de probabilidad
+        # constante; y así el punto de operación no se desplaza con el drift.
+        # Solo aplica al híbrido: la GNN sola conserva su umbral de config para
+        # que la comparación entre ambos sistemas siga siendo la de siempre.
+        if hibrido:
+            thr = umbral_por_presupuesto(scores, pct_presupuesto)
+            log.info("Umbral de la semana por presupuesto (%.1f%%): %.4f "
+                     "(congelado del mes 5: %.4f)", pct_presupuesto, thr,
+                     thr_hibrido)
+
         pre_report = full_report(y_week, scores, thr)
-        log.info("Recall de la semana ANTES de adaptar: %.4f", pre_report["recall"])
+        log.info("Recall de la semana ANTES de adaptar: %.4f | %d alertas (%.2f%%)",
+                 pre_report["recall"], int((scores >= thr).sum()),
+                 100 * (scores >= thr).mean())
 
         # --- ETIQUETADO HUMANO (simulado con etiquetas reales) + GATILLO ---
         fired = False

@@ -320,9 +320,26 @@ def main():
     if hib_scores is not None:
         # Umbral propio: el híbrido no comparte escala con la GNN (ver
         # hybrid/head.py: umbral_por_presupuesto).
-        thr_hib = float(hib_pack["umbral"][0]) if "umbral" in hib_pack else thr
+        # Punto de operación por PRESUPUESTO sobre el propio mes 6, no el
+        # umbral congelado en el mes 5. Medido: ese umbral produce un 1,07% de
+        # alertas en el mes 6 en vez del 2% configurado (los scores se
+        # desplazan entre meses), lo que deja al híbrido artificialmente
+        # conservador —842 TP y solo 81 FP— y no refleja lo que un equipo con
+        # capacidad fija revisaría. Se reporta también el congelado para que la
+        # magnitud del drift quede a la vista.
+        from src.hybrid.head import umbral_por_presupuesto
+        pct = float((cfg.get("hybrid") or {}).get("alert_budget_pct", 2.0))
+        thr_hib = umbral_por_presupuesto(hib_scores, pct)
+        thr_frio = float(hib_pack["umbral"][0]) if "umbral" in hib_pack else thr
         globales["hibrido"] = full_report(y_gnn, hib_scores, thr_hib)
         globales["hibrido"]["umbral_usado"] = thr_hib
+        globales["hibrido"]["umbral_congelado_mes5"] = thr_frio
+        globales["hibrido"]["alertas_con_umbral_congelado"] = int(
+            (hib_scores >= thr_frio).sum())
+        globales["hibrido"]["nota_umbral"] = (
+            f"Umbral recalculado sobre el mes 6 para un {pct}% de alertas. "
+            f"El congelado del mes 5 ({thr_frio:.4f}) solo produce "
+            f"{100 * (hib_scores >= thr_frio).mean():.2f}% aquí.")
     for etq, sc in sistemas.items():
         if etq.startswith("control_"):
             globales[etq] = full_report(y_gnn, sc, thr)
