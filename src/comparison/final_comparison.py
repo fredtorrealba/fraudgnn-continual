@@ -140,9 +140,19 @@ def xgboost_scores_on_test(cfg) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
     with open(proc / "feature_cols.json") as f:
         cols = json.load(f)["feature_cols"]
     test = df[df.split == "test"].reset_index(drop=True)
-    model = xgb.XGBClassifier()
-    model.load_model(resolve(cfg, "models_dir") / "xgboost_baseline.json")
-    return (model.predict_proba(test[cols].values)[:, 1],
+    # Booster nativo, NO XGBClassifier: el wrapper de sklearn comprueba
+    # `self._estimator_type`, que las versiones nuevas de scikit-learn ya no
+    # definen, y load_model revienta con "TypeError: _estimator_type undefined".
+    # El Booster no depende de sklearn, así que es inmune a ese vaivén de
+    # versiones. Es además lo que ya hace src/hybrid/head.py:cargar().
+    # device=cpu: si el modelo se entrenó en GPU quedaría en cuda:0 y predecir
+    # sobre numpy caería a DMatrix (ver train_xgboost.inferir_en_cpu).
+    booster = xgb.Booster()
+    booster.load_model(str(resolve(cfg, "models_dir") / "xgboost_baseline.json"))
+    booster.set_param({"nthread": 1, "device": "cpu"})
+    # binary:logistic -> inplace_predict devuelve ya P(fraude) en 1-D
+    scores = booster.inplace_predict(test[cols].values.astype(np.float32))
+    return (np.asarray(scores, dtype=np.float64),
             test["isFraud"].values.astype(int), test)
 
 

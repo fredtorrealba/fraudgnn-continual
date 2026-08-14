@@ -181,12 +181,12 @@ cd fraudgnn
 En un contenedor, `nproc` reporta los del host (96), no tu cuota:
 
 ```bash
-if [ -r /sys/fs/cgroup/cpu.max ] && [ "$(cut -d' ' -f1 /sys/fs/cgroup/cpu.max)" != "max" ]; then
-    n=$(awk '{print int($1/$2)}' /sys/fs/cgroup/cpu.max)
-elif [ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us ] && [ "$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us)" -gt 0 ]; then
-    n=$(( $(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us) / $(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us) ))
-else n=$(nproc); fi
-echo "n_jobs: $n | num_workers: $(( n>3 ? n-3 : 1 ))"
+N=$(if [ -f /sys/fs/cgroup/cpu.max ]; then awk '{print ($1=="max")?"0":int($1/$2)}' /sys/fs/cgroup/cpu.max; \
+    elif [ -f /sys/fs/cgroup/cpu/cpu.cfs_quota_us ]; then \
+      q=$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us); p=$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us); \
+      [ "$q" -le 0 ] && echo 0 || echo $((q/p)); else echo 0; fi)
+[ "$N" -eq 0 ] && N=$(nproc)
+echo "núcleos: $N  ->  n_jobs: $((N*85/100))  |  num_workers: $((N*65/100))"
 ```
 
 Con más hilos que núcleos el kernel **congela el contenedor** periódicamente
