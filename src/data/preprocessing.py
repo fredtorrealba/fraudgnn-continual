@@ -75,7 +75,7 @@ def add_temporal_columns(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     )
 
 
-def encode_and_impute(df: pd.DataFrame, train_mask: pd.Series):
+def encode_and_impute(df: pd.DataFrame, train_mask: pd.Series, cfg: dict):
     """Label encoding de categóricas + imputación, ajustados SOLO con train."""
     id_like = {"TransactionID", "isFraud", "TransactionDT", "month", "week_in_month"}
     feature_cols = [c for c in df.columns if c not in id_like]
@@ -128,7 +128,7 @@ def main():
 
     train_months = set(cfg["data"]["train_months"])
     train_mask = df["month"].isin(train_months)
-    df, feature_cols = encode_and_impute(df, train_mask)
+    df, feature_cols = encode_and_impute(df, train_mask, cfg)
 
     # Asignación de split, en una sola pasada (np.select en vez de 4
     # asignaciones sucesivas, que volverían a fragmentar el frame).
