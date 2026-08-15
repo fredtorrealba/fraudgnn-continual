@@ -298,7 +298,10 @@ def main():
         rev = (nombre, f"tiene_{nombre}", "transaction")
         ei = data[rev].edge_index
         t = data["transaction"].time[ei[1]]
-        orden = torch.argsort(ei[0] * (int(t.max()) + 1) + t)
+        # stable=True: dos transacciones de la MISMA entidad pueden compartir
+        # TransactionDT (son segundos). Sin estabilidad, el desempate varía entre
+        # corridas y con él qué vecinos baja `temporal_strategy="last"`.
+        orden = torch.argsort(ei[0] * (int(t.max()) + 1) + t, stable=True)
         data[rev].edge_index = ei[:, orden]
 
     torch.save(data, graph_dir / "graph.pt")
