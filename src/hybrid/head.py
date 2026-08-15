@@ -88,7 +88,7 @@ def columnas(variante: str, cols_base: list[str],
         # que `control` reciba también el reloj. Mientras no lo tenga, parte del
         # "aporte del grafo" será en realidad __hora_dia.
         return [c for c in cols_base
-                if c not in ("__hora_dia", "__pos_temporal")]
+                if c not in ("__hora_dia", "__delta_anterior")]
     if variante == "solo_gnn":
         # El COMPLETO: es lo único que recibe, necesita saber de sí misma
         if not cols_emb:

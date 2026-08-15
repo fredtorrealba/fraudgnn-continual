@@ -89,14 +89,36 @@ graph:
   # tamaño de la ENTIDAD.
   max_entity_degree: 500
   vecinos_por_entidad: 10          # cuántas transacciones trae cada entidad
-  # Features que la GNN necesita para poder aprender lo que dan las columnas
-  # C (conteos) y D (tiempos), y que no tenía:
-  #   __hora_dia, __pos_temporal   el CUÁNDO (TransactionDT se excluye por ser
-  #                                identificador, así que la red no veía la hora)
-  #   __grado_<entidad>            CUÁNTAS transacciones tiene su entidad, antes
-  #                                de que el muestreo cape a 10
-  # Sin esto, quitarle las C y D al tabular es pedirle a la GNN que adivine algo
-  # que nunca ve.
+  # Features derivadas, para recuperar lo que daban las columnas C (conteos) y
+  # D (tiempos) que la ablación quita. Quién las calcula NO es lo mismo:
+  #
+  #   __hora_dia          preprocess   hora del día en [0,1]. TransactionDT se
+  #                                    excluye por ser identificador, así que sin
+  #                                    esto nadie ve la hora. CÍCLICA: las 3 de
+  #                                    la mañana son 0.125 en enero y en junio,
+  #                                    así que se solapa al 99.9% entre splits.
+  #
+  #   __delta_anterior    preprocess   log1p(segundos desde la compra ANTERIOR de
+  #                                    la misma card1); -1 si no hay anterior.
+  #                                    Es lo que daba D1. Causal (diff hacia
+  #                                    atrás) y comparable entre meses: "hace 2
+  #                                    horas" vale igual en enero que en junio.
+  #                                    OJO: al fabricarla se devuelve parte de lo
+  #                                    que quita la ablación — decláralo al
+  #                                    comparar corridas.
+  #
+  #   __grado_<entidad>   build_graph  cuántas transacciones tiene su entidad,
+  #                                    antes de que el muestreo cape a 10. Es
+  #                                    estructura del grafo, por eso va aquí y
+  #                                    no en preprocess.
+  #
+  # DESCARTADA — __pos_temporal (posición en los 6 meses): train ocupa
+  # [0, 0.667] y validación [0.667, 0.834], 0% de solapamiento. Los árboles no
+  # extrapolan, así que fuera de la ventana es una constante; dentro da un valor
+  # único por fila y permite memorizar. Medido: los meses in-sample pasaron de
+  # 0.53 a 0.86 de PR-AUC y el mes 5 no se movió. No la vuelvas a meter.
+  #
+  # Este flag solo controla los __grado_*; las dos de preprocess van siempre.
   features_derivadas: true
 
 gnn:

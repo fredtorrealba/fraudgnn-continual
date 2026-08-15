@@ -63,6 +63,27 @@ def load_raw(raw_dir: Path) -> pd.DataFrame:
     return df.copy()
 
 
+def _delta_tarjeta(df: pd.DataFrame) -> pd.Series:
+    """
+    Segundos desde la transacción anterior de la MISMA card1, en log1p.
+
+    CAUSAL: `diff()` sobre el orden temporal mira solo hacia atrás, nunca al
+    futuro. La primera compra de cada tarjeta no tiene anterior y se marca con
+    -1, un valor fuera del rango de log1p (que empieza en 0) para que el modelo
+    pueda distinguir "hace mucho" de "no hay anterior".
+
+    NO REORDENA el DataFrame. El índice de fila de full.parquet es el índice de
+    nodo del grafo (contrato implícito que protegen los asserts de hybrid/), así
+    que se ordena una copia, se calcula, y se devuelve al orden original con
+    reindex.
+    """
+    orden = df["TransactionDT"].astype("float64").argsort(kind="stable")
+    tmp = df.iloc[orden]
+    delta = tmp.groupby("card1")["TransactionDT"].diff()
+    delta = delta.reindex(df.index)
+    return np.log1p(delta).fillna(-1.0)
+
+
 def add_temporal_columns(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     spm = cfg["data"]["seconds_per_month"]
     # assign() en vez de dos asignaciones sueltas: insertar columnas una a una
@@ -73,8 +94,19 @@ def add_temporal_columns(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
         # porque calculado allí no llegaba al parquet: la GNN sabía la hora y las
         # cabezas tabulares no. Esa información entraba en `gnn_mas_tabular`
         # dentro del embedding, así que parte del "aporte del grafo" era el reloj.
+        # Solo la CÍCLICA. `__pos_temporal` (posición en los 6 meses) se quitó:
+        # train ocupa [0, 0.667] y validación [0.667, 0.834] — 0% de
+        # solapamiento. Los árboles no extrapolan, así que fuera de la ventana
+        # de entrenamiento se comporta como una constante; dentro, en cambio,
+        # da un valor único por fila y permite memorizar. Medido: los meses
+        # in-sample subieron de 0.53 a 0.86 de PR-AUC y el mes 5 no se movió.
+        # La hora del día sí generaliza: se solapa al 99.9% entre splits.
         __hora_dia=(dt % 86400) / 86400.0,
-        __pos_temporal=(dt - dt.min()) / max(dt.max() - dt.min(), 1),
+        # Segundos desde la compra ANTERIOR de la misma tarjeta, en log.
+        # Es lo que daba D1 y que la ablación quitó, y a diferencia de la
+        # posición absoluta SÍ generaliza: "hace 2 horas" significa lo mismo en
+        # enero que en junio, así que el valor cae dentro del rango aprendido.
+        __delta_anterior=_delta_tarjeta(df),
         month=(df["TransactionDT"] // spm).astype(int) + 1,
         # Semana relativa dentro del mes (simula el "futuro que llega" en test)
         week_in_month=(((df["TransactionDT"] % spm) // (spm // 4)) + 1)
