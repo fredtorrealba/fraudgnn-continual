@@ -139,16 +139,21 @@ def ruta_modelo_operativo(cfg) -> tuple[Path, str]:
     return models_dir / sel["checkpoint"], f"{sel['selected']} seed {sel['seed']}"
 
 
-def make_loader(data, mask, cfg, shuffle=True, balancear=False):
+def make_loader(data, mask, cfg, shuffle=True, balancear=False, seed=42):
     """
     Loader heterogéneo con muestreo temporal.
 
     `balancear=True` solo en ENTRENAMIENTO: repite fraudes reales como semilla
     hasta que el lote lleve ~50% de cada clase. En validación y test jamás, o
     las métricas dejarían de reflejar la distribución real.
+
+    `seed` SE PROPAGA. Antes se quedaba en el 42 por defecto, así que las tres
+    réplicas (42/123/2026) repetían EXACTAMENTE los mismos fraudes y solo
+    diferían en los pesos iniciales. Las réplicas existen para medir varianza:
+    si comparten el muestreo, miden menos de la que hay.
     """
     return make_hetero_loader(data, cfg, mask, shuffle=shuffle,
-                              balancear=balancear)
+                              balancear=balancear, seed=seed)
 
 
 @torch.no_grad()
@@ -233,7 +238,7 @@ def train(model_name: str, seed: int, cfg: dict | None = None,
         pos_weight=torch.tensor(pos_weight, device=device))
 
     train_loader = make_loader(data, m_tr, cfg, shuffle=True,
-                               balancear=balancear)
+                               balancear=balancear, seed=seed)
     # El primer batch es la prueba de que todo se aplicó: cuántos nodos de cada
     # tipo bajó el sampler, y qué proporción de fraude tienen las semillas
     # (debe rondar 0.50 con balanceo, ~0.035 sin él).

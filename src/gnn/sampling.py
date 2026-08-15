@@ -211,12 +211,21 @@ def make_hetero_loader(data, cfg, mask, shuffle=True, batch_size=None,
         extra = {"num_workers": n_w, "persistent_workers": True,
                  "prefetch_factor": int(opts["prefetch_factor"])}
 
+    # Generador EXPLÍCITO para el shuffle. Sin él, DataLoader usa el generador
+    # global de torch, así que el orden de los lotes depende de cuánto azar se
+    # haya consumido antes de crear el loader. Funciona por accidente mientras
+    # nadie meta una llamada aleatoria en medio; con uno propio, el orden es el
+    # mismo siempre.
+    gen = torch.Generator()
+    gen.manual_seed(int(seed))
+
     return NeighborLoader(
         data,
         num_neighbors=fanouts_hetero(data, cfg),
         input_nodes=(TXN, semillas),
         batch_size=batch_size or cfg["gnn"]["batch_size"],
         shuffle=shuffle,
+        generator=gen,
         time_attr="time",              # causalidad: solo vecinos anteriores
         temporal_strategy="last",      # y de esos, los más recientes
         pin_memory=bool(opts["pin_memory"]),
