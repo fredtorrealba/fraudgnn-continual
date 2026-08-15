@@ -88,17 +88,44 @@ def main(n: int, seed: int = 7):
     df["card5"] = 226.0
     df["addr1"] = (df["card1"] % 400 + 100).astype(float)
 
+    # D1 = días desde la PRIMERA transacción de la tarjeta, como en el dataset
+    # real. La entidad `uid` es (card1, addr1, día-D1): ese día de alta es
+    # constante por cliente y es lo que la identifica. Sin D1 la entidad `uid`
+    # sale con CERO nodos y el smoke test no prueba su código.
+    dia = df["TransactionDT"] // 86400
+    df["D1"] = (dia - dia.groupby(df["card1"]).transform("min")).astype(float)
+    # Nulos en ~8%: el dataset real los tiene y `clave_entidad` debe DESCARTAR
+    # esas filas, no inventarles una clave. Aquí se ejercita ese camino.
+    df.loc[rng.random(n) < 0.08, "D1"] = np.nan
+
+    # C y D de relleno: no llevan señal, existen para que la ablación
+    # (excluir_prefijos V/C/D) tenga algo real que quitar y se compruebe que
+    # el filtro deja pasar card1/addr1/dist y corta C1/D2.
+    for k in range(1, 15):
+        df[f"C{k}"] = rng.poisson(2.0, n).astype(float)
+    for k in range(2, 16):
+        df[f"D{k}"] = rng.integers(0, 400, n).astype(float)
+
 
     tx_cols = [c for c in df.columns]
     df[tx_cols].to_csv(resolve(cfg, "raw_dir") / "train_transaction.csv", index=False)
 
     # identity: solo una parte de las transacciones tiene identidad
     has_id = rng.random(n) < 0.4
+    m = int(has_id.sum())
+    # id_33 lo pide la entidad `device`; id_13/17/19/20 la entidad `net`. Sin
+    # ellas ambas salen con CERO nodos: el grafo del smoke test no se parecería
+    # al real y no probaría el código de esas entidades.
     ident = pd.DataFrame({
         "TransactionID": df.loc[has_id, "TransactionID"],
-        "DeviceInfo": rng.choice([f"dev{k}" for k in range(n_devices)], has_id.sum()),
-        "id_30": rng.choice(["Windows 10", "iOS 15", "Android 12", None], has_id.sum()),
-        "id_31": rng.choice(["chrome", "safari", "firefox", None], has_id.sum()),
+        "DeviceInfo": rng.choice([f"dev{k}" for k in range(n_devices)], m),
+        "id_30": rng.choice(["Windows 10", "iOS 15", "Android 12", None], m),
+        "id_31": rng.choice(["chrome", "safari", "firefox", None], m),
+        "id_33": rng.choice(["1920x1080", "1366x768", "2560x1440", None], m),
+        "id_13": rng.choice([13.0, 14.0, 49.0, 52.0, np.nan], m),
+        "id_17": rng.choice([100.0, 121.0, 166.0, 225.0, np.nan], m),
+        "id_19": rng.choice([266.0, 312.0, 410.0, 529.0, np.nan], m),
+        "id_20": rng.choice([222.0, 325.0, 507.0, 533.0, np.nan], m),
     })
     ident.to_csv(resolve(cfg, "raw_dir") / "train_identity.csv", index=False)
     log.info("Demo sintética: %d txn (%.2f%% fraude, patrón B solo en mes 6) "
