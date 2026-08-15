@@ -160,7 +160,26 @@ gnn:
   # Lotes pequeños dan gradientes más ruidosos, que ayudan a escapar de
   # mínimos locales. Con balanceo de semillas, 256 son 128 fraudes + 128
   # normales por lote.
-  batch_size: 256
+  # Lotes GRANDES a propósito. El cuello de botella NO es el cálculo sino el
+  # número de transferencias worker -> proceso principal: cada lote de un grafo
+  # heterogéneo son 30+ tensores (5 tipos de nodo, 10 de arista) que hay que
+  # serializar. Medido con 256: 1.604 lotes por época, GPU al 5%, 3,7 min/época.
+  # Con 1024 son 401 lotes — mismo trabajo, la cuarta parte de viajes.
+  # VRAM: 250 MB con 256, ~1 GB con 1024, de 19.500 disponibles.
+  # FÍJALO ANTES de la primera corrida: cambia la dinámica de entrenamiento y
+  # las 6 semillas deben compartirlo.
+  # MEDIDO en la corrida real (/proc, 20 muestras): el proceso principal estaba
+  # en R (ejecutando) 14 de 20 veces y los 12 workers en S (durmiendo) 20 de 20,
+  # con la GPU al 4%. O sea: el muestreo NO es el cuello y el cálculo tampoco.
+  # El tiempo se va en ORQUESTAR: HeteroConv recorre los 10 tipos de arista en
+  # un bucle de Python y lanza una convolución por cada uno.
+  #     10 aristas x 2 capas x 1.604 lotes = 32.000 kernels diminutos por época
+  # Cada kernel se despacha en microsegundos y la GPU espera al siguiente: el
+  # coste está en el Python que los lanza, y ese coste es POR LOTE.
+  # Con 2048 son 201 lotes/época en vez de 1.604: 8x menos orquestación.
+  # VRAM: 250 MB con 256 -> ~1,5 GB con 2048, de 19.500 disponibles.
+  # FÍJALO ANTES de la primera corrida: las 6 semillas deben compartirlo.
+  batch_size: 2048
   lr: 0.001
   # Regularización L2: penaliza pesos grandes para que la red no memorice
   # los fraudes concretos del entrenamiento. No se estaba aplicando en el
@@ -186,7 +205,11 @@ gnn:
   # 12 de los 16 vCPU muestreando; los 4 restantes, para el proceso
   # principal y la GPU. El muestreo de vecinos es el cuello de botella
   # de `gnn` y `oof` (las dos etapas caras), no las multiplicaciones.
-  num_workers: 12                  # 0 = todo en el proceso principal
+  # 4 y no 12: medido con /proc, los 12 workers estaban DORMIDOS en las 20
+  # muestras. Llenan su cola y esperan, porque el cuello está en el proceso
+  # principal. Subirlos no aporta nada y cada uno copia el grafo.
+  num_workers: 4                   # 0 = todo en el proceso principal
+  prefetch_factor: 4               # lotes que cada worker deja listos
   pin_memory: true                 # copia CPU->GPU más rápida (cientos de MB/batch)
   seeds: [42, 123, 2026]           # 3 corridas por arquitectura
   gat_heads: 4
@@ -225,7 +248,11 @@ gnn:
   # trials y la GNN cero: la comparación no era justa en esfuerzo de ajuste.
   # No es paridad de cómputo (un trial de XGBoost cuesta 13 s y uno de GNN
   # ~5 min) pero sí de protocolo, que es lo que se defiende.
-  optuna_trials: 30
+  # 12 y no 30: cada trial son epochs//4 = 12 épocas sobre 410.601 nodos.
+  # A 30 trials x 2 arquitecturas la etapa `gnn` sola pasaba de 40 horas.
+  # Sigue siendo búsqueda bayesiana con el mismo sampler; decláralo en la
+  # memoria junto a los 30 trials que sí reciben las cabezas XGBoost.
+  optuna_trials: 12
   threshold: 0.5                   # umbral de alerta P(fraude) >= 0.5
   kpi_auc: 0.93                    # KPI OE2: AUC-ROC > 0.93
 

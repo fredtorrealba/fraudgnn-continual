@@ -51,6 +51,7 @@ def loader_opts(cfg: dict) -> dict:
     g = cfg.get("gnn", {})
     return {"num_workers": g.get("num_workers", 0),
             "pin_memory": g.get("pin_memory", False),
+            "prefetch_factor": g.get("prefetch_factor", 2),
             "sin_aristas": g.get("sin_aristas", False)}
 
 
@@ -181,8 +182,15 @@ def make_hetero_loader(data, cfg, mask, shuffle=True, batch_size=None,
     n_w = int(opts["num_workers"]) if (shuffle or n_semillas >= 20_000) else 0
     extra = {}
     if n_w:
-        # persistent_workers evita respawnear procesos en CADA época
-        extra = {"num_workers": n_w, "persistent_workers": True}
+        # persistent_workers evita respawnear procesos en CADA época.
+        # prefetch_factor = lotes que cada worker deja LISTOS por adelantado.
+        # Con el defecto (2) los workers terminan y se quedan esperando: medido
+        # en la corrida real, 12 workers al 2,5% de CPU y la GPU al 5% — nadie
+        # saturado porque todos esperaban. Subirlo hace que sigan muestreando
+        # mientras la GPU consume, que es lo que llena la tubería.
+        # Coste: RAM = workers x prefetch x tamaño del lote.
+        extra = {"num_workers": n_w, "persistent_workers": True,
+                 "prefetch_factor": int(opts["prefetch_factor"])}
 
     return NeighborLoader(
         data,

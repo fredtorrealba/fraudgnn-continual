@@ -31,6 +31,7 @@ Uso:
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -209,8 +210,9 @@ def buscar_hiperparametros(model_name: str, cfg) -> dict:
         # los workers cada trial dejaría 12 procesos vivos hasta el final del
         # proceso. Con 30 trials x 2 arquitecturas son 720 procesos colgados.
         try:
-            mejor = 0.0
+            mejor, t_trial = 0.0, time.time()
             for ep in range(1, epocas + 1):
+                t_ep = time.time()
                 modelo.train()
                 for batch in tr:
                     batch = batch.to(device)
@@ -221,10 +223,24 @@ def buscar_hiperparametros(model_name: str, cfg) -> dict:
                     loss.backward()
                     opt.step()
                 yv, sv = evaluate(modelo, va, device)
-                mejor = max(mejor, float(average_precision_score(yv, sv)))
+                pr = float(average_precision_score(yv, sv))
+                mejor = max(mejor, pr)
+                # Una línea POR ÉPOCA. Sin esto, un trial son 12 épocas sin
+                # imprimir nada: con la barra de Optuna avanzando solo al
+                # terminar el trial, quedaban decenas de minutos a ciegas sin
+                # saber si el proceso avanzaba o se había colgado.
+                log.info("  [%s] trial %d · época %2d/%d · PR-AUC %.4f "
+                         "(mejor %.4f) · %.1f min", model_name, trial.number,
+                         ep, epocas, pr, mejor, (time.time() - t_ep) / 60)
                 trial.report(mejor, ep)
                 if trial.should_prune():
+                    log.info("  [%s] trial %d PODADO en la época %d (%.1f min)",
+                             model_name, trial.number, ep,
+                             (time.time() - t_trial) / 60)
                     raise optuna.TrialPruned()
+            log.info("  [%s] trial %d LISTO · PR-AUC %.4f · %.1f min",
+                     model_name, trial.number, mejor,
+                     (time.time() - t_trial) / 60)
             return mejor
         finally:
             cerrar_loader(tr)
