@@ -184,7 +184,11 @@ def buscar_hiperparametros(model_name: str, cfg) -> dict:
         g["lr"] = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
         g["dropout"] = trial.suggest_float("dropout", 0.0, 0.5)
         ancho = trial.suggest_categorical("ancho", [64, 128, 256])
-        g["hidden_dims"] = [ancho] * trial.suggest_int("capas", 1, 2)
+        # MÍNIMO 2 capas: con una sola, los nodos de entidad llegan a la
+        # transacción todavía en ceros y el grafo no aporta nada (models.py lo
+        # rechaza con un ValueError). El rango 1-2 venía del grafo homogéneo,
+        # donde una capa sí tenía sentido; aquí hacía fallar el primer trial.
+        g["hidden_dims"] = [ancho] * trial.suggest_int("capas", 2, 3)
         g["mlp_head_dim"] = trial.suggest_categorical("mlp_head_dim", [16, 32, 64])
         g["in_dim"] = data["transaction"].x.shape[1]
         wd = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
@@ -244,7 +248,10 @@ def aplicar_hiperparametros(cfg, best: dict) -> dict:
         if k in best:
             g[k] = best[k]
     if "ancho" in best:
-        g["hidden_dims"] = [best["ancho"]] * int(best.get("capas", 1))
+        # El default es 2, no 1: si `capas` faltara (un estudio antiguo, un
+        # enqueue_trial incompleto) se construiría una GNN de una capa, que en
+        # el grafo heterogéneo no llega a propagar nada y muere en build_model.
+        g["hidden_dims"] = [best["ancho"]] * max(2, int(best.get("capas", 2)))
     return cfg
 
 

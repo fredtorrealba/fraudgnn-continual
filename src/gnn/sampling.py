@@ -70,7 +70,9 @@ def fanouts_hetero(data, cfg: dict) -> dict:
     Con 5 tipos de entidad y 10 por entidad, el vecindario de una transacción es
     de hasta 50 transacciones, todas anteriores a ella.
     """
-    n_capas = len(cfg["gnn"].get("hidden_dims", [256]))
+    # Default de 2 capas: el bipartito necesita dos saltos para que una
+    # transacción alcance a otra. El [256] de antes venía del grafo homogéneo.
+    n_capas = len(cfg["gnn"].get("hidden_dims", [64, 64]))
     por_entidad = int(cfg["graph"].get("vecinos_por_entidad", 10))
     out = {}
     for et in data.edge_types:
