@@ -3,8 +3,8 @@ Paso 5 — COMPARACIÓN GraphSAGE vs GAT (OE2).
 
 Protocolo (walk-forward × 3):
 - Cada arquitectura se entrena 3 veces (seeds 42/123/2026) con el mismo
-  split temporal (entrena meses 1-4, valida mes 5).
-- Además del AUC sobre el mes 5 completo, cada modelo se evalúa SEMANA A
+  ventanas del config (entrena `gnn_entrena`, valida `gnn_valida`).
+- Además del AUC sobre la ventana completa, cada modelo se evalúa SEMANA A
   SEMANA dentro del mes de validación (walk-forward: semanas 1→4, el
   "futuro que va llegando"). La selección usa el AUC promedio de las
   semanas × seeds — así la comparación premia consistencia temporal y no
@@ -232,9 +232,12 @@ def run_all(cfg, force: bool = False):
         tareas.append((model, seed, c, force, par))
 
     if par > 1 and len(tareas) > 1:
+        # Nunca más procesos que tareas: con 2 corridas y paralelo_corridas=6
+        # se levantaban 6 procesos para 2 trabajos.
+        n_proc = min(par, len(tareas))
         log.info("Entrenando %d corridas con %d procesos EN PARALELO",
-                 len(tareas), par)
-        _en_paralelo(_entrenar_una, tareas, par)
+                 len(tareas), n_proc)
+        _en_paralelo(_entrenar_una, tareas, n_proc)
     else:
         for i, (model, seed, c, f, _) in enumerate(tareas, 1):
             info = None if f else resume_info(model, seed, c)
@@ -255,7 +258,7 @@ def buscar_hiperparametros(model_name: str, cfg) -> dict:
     sí de protocolo, que es lo que se defiende: AMBOS modelos recibieron búsqueda
     bayesiana con el mismo número de trials y el mismo sampler.
 
-    Cada trial entrena con meses 1-4 y se puntúa por PR-AUC sobre el mes 5 —
+    Cada trial entrena con `gnn_entrena` y se puntúa por PR-AUC sobre `gnn_valida` —
     la misma métrica y el mismo conjunto con que se elige la cabeza XGBoost.
     `MedianPruner` mata pronto los trials que van claramente peor que la mediana,
     que es lo que hace viable el presupuesto.
@@ -352,7 +355,7 @@ def buscar_hiperparametros(model_name: str, cfg) -> dict:
             cerrar_loader(va)
             del modelo
 
-    log.info("[%s] Optuna: %d trials (PR-AUC sobre el mes 5)", model_name, n_trials)
+    log.info("[%s] Optuna: %d trials (PR-AUC sobre gnn_valida)", model_name, n_trials)
     estudio = optuna.create_study(
         direction="maximize",
         sampler=optuna.samplers.TPESampler(seed=42),   # mismo sampler que XGBoost

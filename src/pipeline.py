@@ -122,7 +122,7 @@ STEPS = [
               "DISTINTOS y las 32 columnas mezclaban idiomas (medido: la cabeza "
               "mixta cortó en 2 árboles contra 517 del control). Con ventanas "
               "separadas basta UNA red. ~2 min."),
-    Step("heads", "[5b] Las tres cabezas XGBoost (meses 1-4)",
+    Step("heads", "[5b] Las tres cabezas XGBoost (ventana cabezas_entrenan)",
          "src.hybrid.train_head",
          [("models_dir", "hybrid_head_control.json"),
           ("reports_dir", "heads_variantes.json")],

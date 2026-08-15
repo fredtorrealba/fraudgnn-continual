@@ -58,6 +58,6 @@ bash scripts/run_pipeline.sh --skip download
 echo
 echo "────────────────────────────────────────────────────────────"
 echo "  Smoke test OK en $(( $(date +%s) - t0 ))s"
-echo "  Informe: $SB/reports/exploracion_mes5.json"
+echo "  Resumen: $SB/reports/resumen.json"
 echo "  El proyecto en $PROY NO se tocó."
 echo "────────────────────────────────────────────────────────────"

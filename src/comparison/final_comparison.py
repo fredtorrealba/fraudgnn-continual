@@ -16,7 +16,7 @@ diferencia no significa nada.
 TRES CORTES DE MÉTRICAS
     por mes (1-6)  los meses 1-5 van marcados IN-SAMPLE: el modelo entrenó con
                    ellos y sus números son optimistas por construcción
-    mes 5          validación — donde se eligió arquitectura y cabeza
+    cabezas_validan  donde se eligió el nº de árboles y el umbral
     mes 6          test — no se toca hasta aquí
 
 EL UMBRAL NO ES 0.5
@@ -231,7 +231,7 @@ def main():
     # red sacaba de él? Si `solo_gnn` supera a `gnn_sola`, la respuesta es sí.
     if "gnn_score" in df.columns and df["gnn_score"].notna().any():
         scores["gnn_sola"] = df["gnn_score"].fillna(0.0).values.astype(np.float64)
-        log.info("'gnn_sola' añadida como referencia (el gnn_score del OOF)")
+        log.info("'gnn_sola' añadida como referencia (el gnn_score de la red única)")
 
     meses_txt = "la ventana cabezas_entrenan"
     resultado = {"modo": "ventanas",
