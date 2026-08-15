@@ -39,7 +39,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from src.gnn.sampling import cerrar_loader  # noqa: E402
 from src.utils.ventanas import mascaras_grafo  # noqa: E402
-from src.utils.common import (ensure_dirs, get_device, get_logger, load_config,
+from src.utils.common import (ensure_dirs, get_device, get_logger, load_config, set_seed,
                               load_state, resolve, state_path, update_state)
 
 log = get_logger("compare_gnns")
@@ -289,6 +289,15 @@ def buscar_hiperparametros(model_name: str, cfg) -> dict:
     y_val = data["transaction"].y[_m_va].numpy()
 
     def objetivo(trial):
+        # SEMILLA POR TRIAL. Sin esto, cada trial arrancaba con el estado que
+        # hubiera dejado el anterior, así que dos corridas idénticas daban
+        # resultados distintos: medido, graphsage dio 0.3077 y 0.2912 con el
+        # MISMO dato. Las corridas finales sí eran deterministas porque
+        # `train_gnn.train` sí llama a set_seed.
+        #
+        # Se deriva del número de trial para que cada uno sea distinto pero
+        # REPRODUCIBLE: el trial 7 siempre arranca igual.
+        set_seed(42 + trial.number)
         c = json.loads(json.dumps(cfg))          # copia profunda por trial
         g = c["gnn"]
         g["lr"] = trial.suggest_float("lr", 1e-4, 1e-2, log=True)

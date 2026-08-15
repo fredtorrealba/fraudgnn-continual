@@ -43,7 +43,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from src.gnn.models import TXN, build_model, cfg_arquitectura
 from src.continual_learning.validate import embed_and_score_nodes
-from src.utils.common import ensure_dirs, get_logger, load_config, resolve
+from src.utils.common import ensure_dirs, get_logger, load_config, resolve, set_seed
 from src.utils.ventanas import mascaras_grafo
 
 log = get_logger("hybrid.embed")
@@ -65,6 +65,9 @@ def main():
     if not ruta.exists():
         raise SystemExit(f"Falta {ruta.name}: corre la etapa `gnn` primero.")
 
+    # La misma semilla que entrenó la red: `embed_and_score_nodes` construye un
+    # loader y, aunque no baraje, el muestreo de vecinos usa el generador.
+    set_seed(seed)
     data = torch.load(resolve(cfg, "graph_dir") / "graph.pt", weights_only=False)
     ck = torch.load(ruta, weights_only=False)
     c = cfg_arquitectura(nombre, cfg, ck)
