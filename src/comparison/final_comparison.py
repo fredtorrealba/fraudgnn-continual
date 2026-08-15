@@ -42,6 +42,7 @@ from src.hybrid.head import (cargar, cargar_tabla, cols_embedding,  # noqa: E402
                              umbral_por_presupuesto)
 from src.utils.common import (ensure_dirs, get_logger, load_config,  # noqa: E402
                               resolve)
+from sklearn.metrics import average_precision_score  # noqa: E402
 from src.utils.metrics import full_report  # noqa: E402
 
 log = get_logger("comparison")
@@ -91,6 +92,78 @@ def _confusion(y, s, thr):
     return rep
 
 
+def bootstrap_delta(y, s_a, s_b, n_rep: int = 1000, seed: int = 42) -> dict:
+    """
+    ¿La diferencia de PR-AUC entre dos cabezas es real o es ruido del mes?
+
+    Sin esto, un +0.004 y un +0.04 se leen igual en el informe, y en un mes con
+    ~2.900 fraudes el primero cabe de sobra dentro del error de muestreo.
+
+    Bootstrap EMPAREJADO: se remuestrean FILAS (las mismas para ambas cabezas)
+    y se recalcula la diferencia en cada réplica. Emparejar importa —las dos
+    puntúan las mismas transacciones y sus errores están correlacionados—:
+    tratarlas como independientes ensancharía el intervalo sin motivo.
+
+    Mide el error de MUESTREO del mes de evaluación, no la varianza de
+    entrenamiento (eso exigiría reentrenar con varias semillas). Es la cota
+    optimista: si el intervalo ya cruza el cero, la varianza de entrenamiento
+    solo puede empeorarlo.
+    """
+    y = np.asarray(y); s_a = np.asarray(s_a); s_b = np.asarray(s_b)
+    rng = np.random.default_rng(seed)
+    n = len(y)
+    obs = average_precision_score(y, s_b) - average_precision_score(y, s_a)
+    deltas = []
+    for _ in range(n_rep):
+        i = rng.integers(0, n, n)
+        if y[i].sum() == 0 or y[i].sum() == len(i):
+            continue                       # réplica sin ambas clases: no hay curva
+        deltas.append(average_precision_score(y[i], s_b[i]) -
+                      average_precision_score(y[i], s_a[i]))
+    d = np.asarray(deltas)
+    lo, hi = np.percentile(d, [2.5, 97.5])
+    return {"delta_observado": round(float(obs), 5),
+            "ic95": [round(float(lo), 5), round(float(hi), 5)],
+            "p_delta_mayor_que_cero": round(float((d > 0).mean()), 4),
+            "significativo": bool(lo > 0 or hi < 0),
+            "n_replicas": int(len(d))}
+
+
+def importancia_por_bloque(booster, cols: list[str]) -> dict:
+    """
+    Cuánta GANANCIA saca la cabeza de cada bloque de columnas.
+
+    Responde algo que ninguna métrica de rendimiento contesta: si el embedding
+    aporta +0.000, ¿es que el grafo no sirve, o que XGBoost ni lo miró? Con la
+    ganancia por bloque se distingue: importancia ~0 significa que los árboles
+    no encontraron un corte útil en esas 32 columnas.
+
+    La ganancia se reparte por columna; se agrega por bloque y se normaliza,
+    así que las cifras son porcentajes del total y suman 100.
+    """
+    g = booster.get_score(importance_type="gain")   # solo columnas USADAS
+    # XGBoost nombra f0, f1... por POSICIÓN cuando entrena desde numpy.
+    por_col = {}
+    for k, v in g.items():
+        i = int(k[1:]) if k.startswith("f") and k[1:].isdigit() else None
+        if i is not None and i < len(cols):
+            por_col[cols[i]] = float(v)
+    total = sum(por_col.values()) or 1.0
+    bloques = {"tabular": 0.0, "embedding": 0.0}
+    for c, v in por_col.items():
+        bloques["embedding" if c.startswith(("emb_", "embv_")) else "tabular"] += v
+    n_emb = sum(1 for c in cols if c.startswith(("emb_", "embv_")))
+    return {
+        "ganancia_pct": {k: round(100 * v / total, 2) for k, v in bloques.items()},
+        "columnas_usadas": len(por_col),
+        "columnas_totales": len(cols),
+        "embedding_usadas": sum(1 for c in por_col
+                                if c.startswith(("emb_", "embv_"))),
+        "embedding_totales": n_emb,
+        "top10": sorted(por_col.items(), key=lambda kv: -kv[1])[:10],
+    }
+
+
 def main():
     cfg = load_config()
     ensure_dirs(cfg)
@@ -125,16 +198,22 @@ def main():
     y_all = df["isFraud"].values.astype(int)
 
     # --- puntuar TODO el dataset con cada cabeza de producción -------------
-    scores = {}
+    scores, imp = {}, {}
     for v in variantes:
         ruta = modelos_dir / nombre_modelo(v, sufijo)
         if not ruta.exists():
             log.warning("Falta %s — se omite '%s'", ruta.name, v)
             continue
         booster = cargar(cfg, ruta.name)
-        X = df[columnas(v, cols_base, cols_emb, cols_embv)].values.astype(np.float32)
+        cols_v = columnas(v, cols_base, cols_emb, cols_embv)
+        X = df[cols_v].values.astype(np.float32)
         scores[v] = np.asarray(booster.inplace_predict(X), dtype=np.float64)
-        log.info("'%s' cargada (%d columnas)", v, X.shape[1])
+        imp[v] = importancia_por_bloque(booster, cols_v)
+        log.info("'%s' cargada (%d columnas) | ganancia: tabular %.1f%% / "
+                 "embedding %.1f%% | usa %d de %d columnas del embedding",
+                 v, X.shape[1], imp[v]["ganancia_pct"]["tabular"],
+                 imp[v]["ganancia_pct"]["embedding"],
+                 imp[v]["embedding_usadas"], imp[v]["embedding_totales"])
         del X
     if not scores:
         raise SystemExit(
@@ -268,6 +347,7 @@ def main():
             "solo_gnn_pr_auc": s_,
             "aporte_del_grafo": round(g - c, 4) if (c and g) else None,
             "medido_en": corte,
+            "importancia": imp,
             "nota": (f"Ambas con {meses_txt} y mismos hiperparámetros: la "
                      "diferencia es el aporte del grafo, sin confundirlo con "
                      "la ventana de entrenamiento."
@@ -280,6 +360,32 @@ def main():
                  corte, g, c, g - c)
         if s_ is not None:
             log.info("  solo_gnn: %.4f  (techo del grafo aislado)", s_)
+
+        # ¿Ese delta sobrevive al ruido del mes? Sin esto, un +0.004 y un
+        # +0.04 se leen igual en el informe.
+        sel_v = split == ("test" if produccion else "val")
+        bs = bootstrap_delta(y_all[sel_v], scores["control"][sel_v],
+                             scores["gnn_mas_tabular"][sel_v])
+        resultado["atribucion"]["bootstrap"] = bs
+        log.info("  bootstrap emparejado (1000 réplicas sobre %s):", corte)
+        log.info("    delta %+.5f | IC95 [%+.5f, %+.5f] | P(delta>0) = %.3f",
+                 bs["delta_observado"], bs["ic95"][0], bs["ic95"][1],
+                 bs["p_delta_mayor_que_cero"])
+        if bs["significativo"]:
+            log.info("    -> el intervalo NO cruza el cero: la diferencia se "
+                     "sostiene")
+        else:
+            log.info("    -> el intervalo CRUZA EL CERO: con estos datos no se "
+                     "puede afirmar que haya diferencia")
+
+        # Y si el aporte es ~0, ¿es que el grafo no sirve o que XGBoost ni lo
+        # miró? La ganancia por bloque separa las dos explicaciones.
+        e = imp.get("gnn_mas_tabular", {})
+        if e:
+            log.info("  la cabeza mixta saca el %.1f%% de su ganancia del "
+                     "embedding (%d de %d columnas usadas)",
+                     e["ganancia_pct"]["embedding"], e["embedding_usadas"],
+                     e["embedding_totales"])
 
     # Fichero distinto: un informe de exploración NO debe pisar el definitivo.
     salida = reports_dir / ("final_comparison.json" if produccion
