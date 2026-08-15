@@ -40,7 +40,6 @@ from src.baseline_xgboost.smote_pipeline import apply_smote
 from src.baseline_xgboost.train_xgboost import (inferir_en_cpu,
                                                 objective_factory, xgb_device)
 from src.hybrid.head import (VARIANTES, cargar_tabla, cols_embedding, columnas,
-                             filtrar_prefijos,
                              guardar, matriz, nombre_modelo,
                              umbral_por_presupuesto)
 from src.utils.common import (ensure_dirs, get_logger, load_config, n_jobs,
@@ -105,14 +104,8 @@ def main():
     cols_emb = cols_embedding(df, "completo")
     cols_embv = cols_embedding(df, "vecinos")
 
-    # Ablación de columnas, aplicada a TODAS las cabezas por igual.
-    prefijos = cfg["xgboost"].get("excluir_prefijos") or []
-    if prefijos:
-        antes = len(cols_base)
-        cols_base = filtrar_prefijos(cols_base, prefijos)
-        log.info("ABLACIÓN: se excluyen los prefijos %s -> %d columnas "
-                 "tabulares en vez de %d, para las TRES cabezas",
-                 prefijos, len(cols_base), antes)
+    # La ablación de prefijos ya la aplicó cargar_tabla, para que las cabezas
+    # y final_comparison no puedan discrepar en el ancho de la matriz.
     if (cfg["xgboost"].get("capacidad_limitada") or {}).get("activo"):
         log.info("ABLACIÓN: capacidad limitada activa para las TRES cabezas: %s",
                  {k: v for k, v in cfg["xgboost"]["capacidad_limitada"].items()

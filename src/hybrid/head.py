@@ -150,6 +150,19 @@ def cargar_tabla(cfg, oof_window: str | None) -> tuple[pd.DataFrame, list[str]]:
         log.info("embedding (%s): %d filas, %d dims%s", oof_window, len(oof),
                  len(emb),
                  f" | AVISO: {faltan} filas sin embedding" if faltan else "")
+
+    # La ABLACIÓN se aplica AQUÍ, no en cada consumidor. Estaba solo en
+    # train_head.py: las cabezas se entrenaban con 63 columnas y
+    # final_comparison las puntuaba con 431, y XGBoost moría con
+    # "Feature shape mismatch, expected: 63, got 431". Cualquier consumidor
+    # nuevo repetiría el fallo. Un solo sitio, imposible que diverjan.
+    prefijos = list(cfg["xgboost"].get("excluir_prefijos") or [])
+    if prefijos:
+        antes = len(cols_base)
+        cols_base = filtrar_prefijos(cols_base, prefijos)
+        log.info("ABLACIÓN: se excluyen los prefijos %s -> %d columnas "
+                 "tabulares en vez de %d, para TODAS las cabezas",
+                 prefijos, len(cols_base), antes)
     return df, cols_base
 
 

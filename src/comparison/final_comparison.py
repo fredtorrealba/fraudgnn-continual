@@ -206,6 +206,15 @@ def main():
             continue
         booster = cargar(cfg, ruta.name)
         cols_v = columnas(v, cols_base, cols_emb, cols_embv)
+        # EL ANCHO LO DICTA EL BOOSTER, nunca una constante (regla 1). Sin este
+        # assert el fallo llega como "Feature shape mismatch, expected: 63, got
+        # 431" desde las tripas de XGBoost, sin decir qué cabeza ni por qué.
+        esperado = booster.num_features()
+        assert len(cols_v) == esperado, (
+            f"La cabeza '{v}' se entrenó con {esperado} columnas y aquí se le "
+            f"arman {len(cols_v)}. Suele significar que la ablación "
+            f"(xgboost.excluir_prefijos) cambió DESPUÉS de entrenarla: vuelve a "
+            f"correr `heads`.")
         X = df[cols_v].values.astype(np.float32)
         scores[v] = np.asarray(booster.inplace_predict(X), dtype=np.float64)
         imp[v] = importancia_por_bloque(booster, cols_v)
