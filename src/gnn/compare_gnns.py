@@ -116,6 +116,87 @@ def show_runs(cfg, force: bool = False):
     return pending
 
 
+# ── PARALELISMO ────────────────────────────────────────────────────────────
+# Las 8 tareas de esta etapa son INDEPENDIENTES: los 2 estudios de Optuna no se
+# miran entre sí, y las 6 corridas solo cambian de semilla. En serie dejaban la
+# máquina al 13% de CPU y 11% de GPU.
+#
+# Procesos y no hilos: el GIL serializaría el bucle de Python de HeteroConv, que
+# es justo el cuello. Y con arranque "spawn" y no "fork", porque un fork con el
+# contexto de CUDA ya creado en el padre da comportamiento indefinido.
+#
+# Cada proceso carga su copia de graph.pt (~1-2 GB) y usa ~1,5 GB de VRAM, así
+# que los dos límites son la RAM y la VRAM. Se controlan desde el config.
+
+def _limitar_hilos(cfg: dict, par: int) -> None:
+    """
+    Reparte los núcleos ENTRE los procesos paralelos.
+
+    Cada hijo hereda OMP_NUM_THREADS del padre, así que con `compute.n_jobs: 14`
+    y 3 procesos se pedirían 42 hilos sobre 16 vCPU. Eso no va más rápido: el
+    kernel quema la cuota del cgroup en milisegundos y CONGELA los procesos el
+    resto de cada ventana de 100 ms — el mismo fallo que documenta n_jobs.
+
+    Se llama ANTES de importar torch: las variables de OpenMP las lee libgomp
+    al primer uso, y una vez leídas ya no se pueden cambiar.
+    """
+    import os
+    n = max(1, int((cfg.get("compute") or {}).get("n_jobs", 1)) // max(1, par))
+    for v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS",
+              "NUMEXPR_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+        os.environ[v] = str(n)
+    cfg.setdefault("compute", {})["n_jobs"] = n
+
+
+def _entrenar_una(args):
+    """Una corrida (modelo, semilla). A nivel de módulo para que spawn la pueda
+    serializar."""
+    model, seed, cfg, force, par = args
+    _limitar_hilos(cfg, par)
+    from src.gnn.train_gnn import train
+    train(model, seed, cfg, force=force)
+    return (model, seed)
+
+
+def _buscar_una(args):
+    """La búsqueda de Optuna de UNA arquitectura."""
+    arq, cfg, par = args
+    _limitar_hilos(cfg, par)
+    return arq, buscar_hiperparametros(arq, cfg)
+
+
+def _en_paralelo(fn, tareas: list, n: int):
+    """Ejecuta `fn` sobre `tareas` con `n` procesos. Devuelve los resultados."""
+    import multiprocessing as mp
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    ctx = mp.get_context("spawn")
+    salida = []
+    with ProcessPoolExecutor(max_workers=n, mp_context=ctx) as ex:
+        futuros = {ex.submit(fn, t): t for t in tareas}
+        for fut in as_completed(futuros):
+            # Si un proceso hijo revienta, la excepción sale AQUÍ y no en
+            # silencio: mejor parar que quedarse con 5 corridas de 6.
+            salida.append(fut.result())
+    return salida
+
+
+def _buscar_todas(arqs: list[str], cfg) -> dict[str, dict]:
+    """Optuna de cada arquitectura, en paralelo si el config lo permite."""
+    par = max(1, int(cfg["gnn"].get("paralelo_optuna", 1)))
+    if par > 1 and len(arqs) > 1:
+        log.info("Optuna de %d arquitecturas EN PARALELO (%d procesos)",
+                 len(arqs), min(par, len(arqs)))
+        n = min(par, len(arqs))
+        # Copia por arquitectura: `_limitar_hilos` MUTA el cfg que recibe, y
+        # compartir el mismo diccionario entre las dos tareas dividiría n_jobs
+        # dos veces.
+        tareas = [(a, json.loads(json.dumps(cfg)), n) for a in arqs]
+        res = _en_paralelo(_buscar_una, tareas, n)
+        return dict(res)
+    return {a: buscar_hiperparametros(a, cfg) for a in arqs}
+
+
 def run_all(cfg, force: bool = False):
     init_state(cfg, force)
     from src.gnn.train_gnn import resume_info, train
@@ -129,17 +210,38 @@ def run_all(cfg, force: bool = False):
 
     # La búsqueda va ANTES de las semillas: las 3 corridas de cada arquitectura
     # tienen que compartir hiperparámetros o no serían réplicas de lo mismo.
+    #
+    # CADA ARQUITECTURA CON LOS SUYOS. Antes esto era un bucle que llamaba a
+    # `aplicar_hiperparametros(cfg, ...)` sobre el MISMO cfg: los de gatv2 se
+    # calculaban, se aplicaban, y los de graphsage los pisaban. Las 6 corridas
+    # entrenaban con los de graphsage, la búsqueda de gatv2 se tiraba a la
+    # basura, y la comparación entre arquitecturas quedaba inválida —gatv2
+    # competía con hiperparámetros ajustados para su rival.
+    arqs = sorted({m for m, _ in pending})
+    mejores: dict[str, dict] = {}
     if int(cfg["gnn"].get("optuna_trials", 0)) > 0:
-        for arq in sorted({m for m, _ in pending}):
-            aplicar_hiperparametros(cfg, buscar_hiperparametros(arq, cfg))
+        mejores = _buscar_todas(arqs, cfg)
 
-    for i, (model, seed) in enumerate(pending, 1):
-        info = None if force else resume_info(model, seed, cfg)
-        desde = (f"retoma en la época {info['epoch'] + 1} de {cfg['gnn']['epochs']}"
-                 if info else f"desde cero (época 1 de {cfg['gnn']['epochs']})")
-        log.info("=== [%d/%d] %s seed=%d — %s ===",
-                 i, len(pending), model, seed, desde)
-        train(model, seed, cfg, force=force)
+    par = max(1, int(cfg["gnn"].get("paralelo_corridas", 1)))
+    tareas = []
+    for model, seed in pending:
+        c = json.loads(json.dumps(cfg))          # copia por corrida
+        if model in mejores:
+            aplicar_hiperparametros(c, mejores[model])
+        tareas.append((model, seed, c, force, par))
+
+    if par > 1 and len(tareas) > 1:
+        log.info("Entrenando %d corridas con %d procesos EN PARALELO",
+                 len(tareas), par)
+        _en_paralelo(_entrenar_una, tareas, par)
+    else:
+        for i, (model, seed, c, f, _) in enumerate(tareas, 1):
+            info = None if f else resume_info(model, seed, c)
+            desde = (f"retoma en la época {info['epoch'] + 1} de {c['gnn']['epochs']}"
+                     if info else f"desde cero (época 1 de {c['gnn']['epochs']})")
+            log.info("=== [%d/%d] %s seed=%d — %s ===",
+                     i, len(tareas), model, seed, desde)
+            train(model, seed, c, force=f)
 
 
 def buscar_hiperparametros(model_name: str, cfg) -> dict:

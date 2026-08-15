@@ -253,6 +253,21 @@ gnn:
   # Sigue siendo búsqueda bayesiana con el mismo sampler; decláralo en la
   # memoria junto a los 30 trials que sí reciben las cabezas XGBoost.
   optuna_trials: 12
+
+  # ── PARALELISMO de la etapa `gnn` ─────────────────────────────────────────
+  # Las 8 tareas son independientes: 2 estudios de Optuna + 6 corridas que solo
+  # cambian de semilla. En serie la máquina quedaba al 13% de CPU y 11% de GPU.
+  #
+  # Cada proceso cuesta ~1,5 GB de VRAM y ~2 GB de RAM (su copia de graph.pt),
+  # más `num_workers` procesos de muestreo. Con 20 GB de VRAM y 62 de RAM el
+  # techo práctico está en 4-6. Súbelos hasta que `nvidia-smi` marque ~80% de
+  # VRAM o el CPU se sature; bájalos si ves OOM.
+  #
+  #   1 = en serie (como antes)
+  #   2 = las dos arquitecturas de Optuna a la vez
+  #   3-4 = además, varias semillas a la vez
+  paralelo_optuna: 2               # como mucho, tantas como arquitecturas (2)
+  paralelo_corridas: 6             # de las 6 corridas, cuántas a la vez
   threshold: 0.5                   # umbral de alerta P(fraude) >= 0.5
   kpi_auc: 0.93                    # KPI OE2: AUC-ROC > 0.93
 

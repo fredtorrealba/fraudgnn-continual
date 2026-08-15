@@ -193,15 +193,35 @@ def load_state(cfg: dict) -> dict:
 
 
 def _update_section(cfg: dict, section: str, key: str, **fields) -> dict:
-    st = load_state(cfg)
-    entry = st.setdefault(section, {}).setdefault(key, {})
-    entry.update(fields)
-    now = datetime.now().isoformat(timespec="seconds")
-    entry["updated"] = now
-    st["updated"] = now
+    """
+    Actualiza una entrada del archivo de estado, con CERROJO.
+
+    Es un leer-modificar-escribir, y desde que la etapa `gnn` entrena varias
+    corridas en procesos paralelos hay varias a la vez. Sin cerrojo se pierden
+    actualizaciones: A lee, B lee, A escribe, B escribe y borra lo de A. El
+    `_atomic_write` evita el archivo a medias, pero no esa carrera.
+
+    El cerrojo es un archivo aparte (.lock) y no el propio estado, porque
+    `_atomic_write` sustituye el archivo por otro y el bloqueo se perdería con
+    el inodo viejo.
+    """
+    import fcntl
+
     p = state_path(cfg)
     p.parent.mkdir(parents=True, exist_ok=True)    # primera corrida: lo crea
-    _atomic_write(p, json.dumps(st, indent=2))
+    lock = p.with_suffix(p.suffix + ".lock")
+    with open(lock, "w") as fl:
+        fcntl.flock(fl, fcntl.LOCK_EX)
+        try:
+            st = load_state(cfg)
+            entry = st.setdefault(section, {}).setdefault(key, {})
+            entry.update(fields)
+            now = datetime.now().isoformat(timespec="seconds")
+            entry["updated"] = now
+            st["updated"] = now
+            _atomic_write(p, json.dumps(st, indent=2))
+        finally:
+            fcntl.flock(fl, fcntl.LOCK_UN)
     return st
 
 

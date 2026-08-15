@@ -361,7 +361,7 @@ def train(model_name: str, seed: int, cfg: dict | None = None,
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--model", choices=["graphsage", "gat"], required=True)
+    p.add_argument("--model", choices=["graphsage", "gatv2"], required=True)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--force", action="store_true",
                    help="Reentrenar desde cero aunque ya exista el resultado")
