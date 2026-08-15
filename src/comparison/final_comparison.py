@@ -373,6 +373,16 @@ def main():
         json.dump(resultado, f, indent=2, ensure_ascii=False)
     log.info("-> %s", salida)
 
+    # El resumen se genera AQUÍ y no como etapa aparte: es derivado, cuesta
+    # milisegundos, y una etapa con salida propia se saltaría por "ya hecha"
+    # dejando un resumen viejo junto a métricas nuevas.
+    try:
+        from src.comparison.resumen import main as _resumen
+        _resumen(escribir_json=True)
+    except Exception as e:                       # nunca debe tumbar la corrida
+        log.warning("El resumen falló (%s). Las métricas están en %s",
+                    e, salida)
+
 
 if __name__ == "__main__":
     main()

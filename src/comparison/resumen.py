@@ -1,19 +1,26 @@
 """
 TODAS las métricas de la corrida, en un solo sitio.
 
-    python3 scripts/resumen.py            imprime el resumen
-    python3 scripts/resumen.py --json     además escribe reports/resumen.json
+Lo llama `final_comparison` al terminar, así que sale con cada corrida del
+pipeline. También se puede lanzar suelto:
 
-Recoge lo que cada etapa dejó suelto y lo junta por FASE, en el orden en que
-ocurren. Existe porque los números acababan repartidos en ocho ficheros y había
-que abrir todos para contar una historia.
+    python3 -m src.comparison.resumen            solo imprime
+    python3 -m src.comparison.resumen --json     además escribe resumen.json
+
+Recoge lo que cada etapa dejó suelto y lo junta en cuatro bloques, con LAS
+MISMAS SEIS MÉTRICAS en los tres momentos que importan: las redes en
+`gnn_valida`, las cabezas en `cabezas_validan` y todas en `examen`. Más el
+recall al 2% aparte, que es la métrica de negocio.
+
+Existe porque los números acababan repartidos en ocho ficheros y había que
+abrirlos todos para contar una historia.
 """
 import argparse
 import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from src.utils.common import load_config, resolve
 
 

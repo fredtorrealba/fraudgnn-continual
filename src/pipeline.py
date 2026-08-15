@@ -80,7 +80,6 @@ CL_ACTIVO = False
 # porque la GNN y las cabezas compartían los meses 1-4: había que reentrenarlo
 # todo incorporando el mes 5. Con `ventanas` cada bloque tiene un trabajo y no
 # hay nada que reentrenar — el bloque `examen` nunca se toca hasta el informe.
-FASE = "exploracion"          # se conserva por los nombres de los informes
 
 STEPS = [
     Step("download", "[0] Descarga del dataset IEEE-CIS",
@@ -130,19 +129,17 @@ STEPS = [
          desc="control / solo_gnn / gnn_mas_tabular con los mismos "
               "hiperparámetros y la misma ventana, para que la diferencia sea "
               "atribuible solo a las columnas. Optuna corre UNA vez. ~15 min."),
-    Step("final",
-         "[7] Métricas de las 3 cabezas: por mes y " +
-         ("mes 5 y mes 6" if FASE == "produccion" else "MES 5"),
+    Step("final", "[7] Métricas: cabezas_validan y examen",
          "src.comparison.final_comparison",
-         [("reports_dir", "final_comparison.json" if FASE == "produccion"
-                          else "exploracion_mes5.json")],
-         desc="Compara control / solo_gnn / gnn_mas_tabular sobre " +
-              ("el mes 6" if FASE == "produccion" else
-               "el MES 5 (el 6 sigue sellado)") +
-              ": a threshold fijo, a IGUAL presupuesto de alertas y a IGUAL "
-              "precisión. Las dos últimas son las comparables — con "
-              "calibraciones distintas, el threshold fijo mide agresividad, "
-              "no detección. ~1 min."),
+         [("reports_dir", "final_comparison.json"),
+          ("reports_dir", "resumen.json")],
+         desc="Compara control / gnn_mas_tabular / solo_gnn sobre `examen`, el "
+              "bloque que no entrenó ni validó nada. A igual presupuesto de "
+              "alertas (el 2% es el punto operativo) y a igual precisión: con "
+              "calibraciones distintas, un umbral fijo mide agresividad y no "
+              "detección. Añade el bootstrap del aporte y la importancia por "
+              "bloque. Al terminar deja reports/resumen.json con las seis "
+              "métricas de las redes, las cabezas y el examen. ~1 min."),
 ]
 
 BY_NAME = {s.name: s for s in STEPS}
