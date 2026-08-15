@@ -289,15 +289,25 @@ def buscar_hiperparametros(model_name: str, cfg) -> dict:
     y_val = data["transaction"].y[_m_va].numpy()
 
     def objetivo(trial):
-        # SEMILLA POR TRIAL. Sin esto, cada trial arrancaba con el estado que
-        # hubiera dejado el anterior, así que dos corridas idénticas daban
-        # resultados distintos: medido, graphsage dio 0.3077 y 0.2912 con el
-        # MISMO dato. Las corridas finales sí eran deterministas porque
-        # `train_gnn.train` sí llama a set_seed.
+        # LA MISMA SEMILLA PARA TODOS LOS TRIALS, a propósito.
         #
-        # Se deriva del número de trial para que cada uno sea distinto pero
-        # REPRODUCIBLE: el trial 7 siempre arranca igual.
-        set_seed(42 + trial.number)
+        # Cada trial es dos cosas a la vez: unos hiperparámetros (los elige
+        # Optuna) y una inicialización de pesos (azar). Si la inicialización
+        # cambia entre trials, cuando uno gana no se sabe si fue por sus
+        # hiperparámetros o porque le tocó mejor arranque.
+        #
+        # Y el arranque pesa MÁS que la señal: medido en el smoke, los mismos
+        # hiperparámetros dieron 0.3077 y 0.2912 según cómo inicializaran —
+        # 0.016 de diferencia, cuando entre trials suele haber menos.
+        #
+        # Fijándola, lo único que varía entre trials son los hiperparámetros y
+        # la comparación queda limpia. La robustez frente a la inicialización se
+        # mide DESPUÉS, en las 6 corridas finales con las semillas 42/123/2026:
+        # cada fase hace un trabajo en vez de mezclarlos.
+        #
+        # (Antes tampoco se llamaba a set_seed aquí: cada trial arrancaba con el
+        # estado que dejara el anterior, así que ni siquiera era reproducible.)
+        set_seed(42)
         c = json.loads(json.dumps(cfg))          # copia profunda por trial
         g = c["gnn"]
         g["lr"] = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
