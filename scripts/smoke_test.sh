@@ -55,9 +55,24 @@ python3 scripts/make_synthetic_demo.py --n 40000
 echo "== [4/4] Pipeline completo =="
 t0=$(date +%s)
 bash scripts/run_pipeline.sh --skip download
+# Los resultados se COPIAN al proyecto, a una subcarpeta propia. La corrida
+# sigue siendo aislada —si escribiera en reports/ directamente, el pipeline
+# creería que las etapas están hechas y se las saltaría CON DATOS SINTÉTICOS—
+# pero así no hay que ir a buscarlos a /tmp, que además se borra al parar el pod.
+DEST="$PROY/reports/smoke"
+rm -rf "$DEST" && mkdir -p "$DEST"
+cp -R "$SB"/reports/. "$DEST"/ 2>/dev/null
+cp "$SB"/models/selected_model.json "$DEST"/ 2>/dev/null
+cp "$SB"/data/graph/graph_meta.json "$DEST"/ 2>/dev/null
+
 echo
 echo "────────────────────────────────────────────────────────────"
 echo "  Smoke test OK en $(( $(date +%s) - t0 ))s"
-echo "  Resumen: $SB/reports/resumen.json"
-echo "  El proyecto en $PROY NO se tocó."
+echo
+echo "  Resultados copiados a  reports/smoke/"
+ls -1 "$DEST" | sed 's/^/     /'
+echo
+echo "     cat reports/smoke/resumen.json"
+echo
+echo "  El pipeline real no se tocó: reports/ y models/ siguen intactos."
 echo "────────────────────────────────────────────────────────────"
