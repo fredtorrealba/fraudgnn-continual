@@ -100,7 +100,10 @@ graph:
   features_derivadas: true
 
 gnn:
-  in_dim: 431                      # features por transacción (valor real del grafo)
+  # SOLO informativo: el ancho real lo lee cada entrenamiento del propio
+  # grafo (train_gnn.py y compare_gnns.py lo sobrescriben). Depende de la
+  # ablación y de las features derivadas, así que no intentes cuadrarlo.
+  in_dim: 70                       # 63 tabulares + hora/posición + grados
   # --- PROFUNDIDAD: cada capa es un SALTO en el grafo -------------------------
   # Descomenta UNA. El número de capas es len(hidden_dims) y los `fanouts` se
   # recortan solos a esa longitud (src/gnn/sampling.py: fanouts()).

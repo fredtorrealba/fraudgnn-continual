@@ -31,8 +31,25 @@ log = get_logger("preprocessing")
 
 # Columnas que se usan para construir ARISTAS del grafo: se conservan crudas
 # (además de su versión codificada) porque el builder del grafo las necesita.
-EDGE_RAW_COLS = ["card1", "card2", "card3", "card5", "addr1",
-                 "P_emaildomain", "DeviceInfo", "id_30", "id_31"]
+def edge_raw_cols(cfg: dict) -> list[str]:
+    """
+    Columnas que hay que preservar SIN codificar, para construir las entidades.
+
+    Se derivan de `graph.entidades` en vez de escribirse a mano. La lista fija
+    que había aquí se quedó atrás cuando se añadieron las entidades `device` y
+    `net`: faltaban id_33 e id_13/17/19/20, y `build_graph` las omitía enteras
+    con un WARNING fácil de pasar por alto. Dos de las cinco entidades no
+    existían y el grafo se construía igualmente.
+
+    Derivarlas del config significa que añadir una entidad nueva no obliga a
+    tocar este archivo: si está en `graph.entidades`, su columna se preserva.
+    """
+    cols = []
+    for spec in (cfg.get("graph", {}).get("entidades") or {}).values():
+        for c in spec.get("cols", []):
+            if c not in cols:
+                cols.append(c)
+    return cols
 
 
 def load_raw(raw_dir: Path) -> pd.DataFrame:
@@ -71,10 +88,18 @@ def encode_and_impute(df: pd.DataFrame, train_mask: pd.Series):
     # Se añaden TODAS de una vez con concat: en bucle serían ~10 inserciones
     # sucesivas sobre un DataFrame ancho, que es justo lo que pandas penaliza
     # con PerformanceWarning ("DataFrame is highly fragmented").
+    pedidas = edge_raw_cols(cfg)
     crudas = {f"raw__{c}": df[c].astype(str).replace("nan", np.nan)
-              for c in EDGE_RAW_COLS if c in df.columns}
+              for c in pedidas if c in df.columns}
     if crudas:
         df = pd.concat([df, pd.DataFrame(crudas, index=df.index)], axis=1)
+    # Avisar AQUÍ, donde se puede arreglar, y no dos etapas más tarde cuando
+    # build_graph descarta la entidad entera sin decir de dónde venía.
+    ausentes = [c for c in pedidas if c not in df.columns]
+    if ausentes:
+        log.warning("Estas columnas las piden las entidades de config y NO "
+                    "están en el dataset: %s. Las entidades que dependan de "
+                    "ellas se omitirán en `graph`.", ausentes)
 
     # Categóricas: mapa de categorías aprendido en train; lo no visto -> -1
     for c in cat_cols:

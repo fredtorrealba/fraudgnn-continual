@@ -40,7 +40,10 @@ pip install -q --no-cache-dir "$(grep '^xgboost' requirements.txt)"
 WHL="https://data.pyg.org/whl/torch-${TORCH}+${CUDA}.html"
 echo "   buscando ruedas en $WHL"
 pip install -q torch-geometric
-if pip install -q pyg-lib torch-sparse -f "$WHL"; then
+# torch-scatter NO es opcional para el rendimiento: `aggr` incluye max y std,
+# y sin él PyG cae a una implementación lenta en Python y avisa en CADA batch
+# ("scatter(reduce='max') can be accelerated via the 'torch-scatter' package").
+if pip install -q pyg-lib torch-sparse torch-scatter -f "$WHL"; then
     echo "   sampler nativo instalado"
 else
     # NO es opcional. El fallback casero en numpy solo servía para grafos

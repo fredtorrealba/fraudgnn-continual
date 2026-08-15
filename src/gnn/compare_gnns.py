@@ -330,20 +330,36 @@ def collect(cfg) -> dict:
 
 
 def select(results: dict, cfg) -> dict:
-    sage, gat = results.get("graphsage"), results.get("gat")
-    if sage and gat:
-        diff = sage["auc_mean"] - gat["auc_mean"]
-        if abs(diff) < TIE_MARGIN:
-            winner, reason = "graphsage", (
-                f"Empate técnico en AUC (Δ={diff:+.4f} < {TIE_MARGIN}). Gana "
-                "GraphSAGE por costo de inferencia fijo e inductividad (producción).")
-        elif diff > 0:
-            winner, reason = "graphsage", f"Mayor AUC promedio (Δ={diff:+.4f})."
-        else:
-            winner, reason = "gat", f"Mayor AUC promedio (Δ={-diff:+.4f})."
+    # Los nombres salen del CONFIG, no escritos a mano. Este bloque comparaba
+    # results.get("gat") cuando la arquitectura pasó a llamarse "gatv2": la
+    # búsqueda siempre devolvía None, se caía al else y GraphSAGE ganaba por
+    # incomparecencia, con el mensaje "Única arquitectura disponible" aunque
+    # las dos hubieran corrido. La comparación central del capstone estaba
+    # desactivada en silencio.
+    disponibles = [m for m in cfg["gnn"].get("arquitecturas", MODELS)
+                   if results.get(m)]
+    if not disponibles:
+        raise SystemExit("Ninguna arquitectura tiene resultados: revisa el "
+                         "paso `gnn`.")
+    if len(disponibles) == 1:
+        winner = disponibles[0]
+        reason = (f"Única arquitectura con resultados: {winner}. Las demás "
+                  f"({', '.join(m for m in cfg['gnn'].get('arquitecturas', MODELS) if m != winner)}) "
+                  "no dejaron corridas.")
     else:
-        winner = "graphsage" if sage else "gat"
-        reason = "Única arquitectura con resultados disponibles."
+        orden = sorted(disponibles, key=lambda m: -results[m]["auc_mean"])
+        primero, segundo = orden[0], orden[1]
+        diff = results[primero]["auc_mean"] - results[segundo]["auc_mean"]
+        if diff < TIE_MARGIN and "graphsage" in disponibles:
+            # Empate técnico: decide producción, no el decimal de ruido.
+            winner = "graphsage"
+            reason = (f"Empate técnico (Δ={diff:.4f} < {TIE_MARGIN} entre "
+                      f"{primero} y {segundo}). Gana GraphSAGE por costo de "
+                      "inferencia fijo e inductividad (producción).")
+        else:
+            winner = primero
+            reason = (f"Mayor PR-AUC walk-forward: {primero} {results[primero]['auc_mean']:.4f} "
+                      f"contra {segundo} {results[segundo]['auc_mean']:.4f} (Δ={diff:+.4f}).")
 
     best_seed_runs = results[winner]["runs"]
     # la mejor seed también se elige por su promedio walk-forward.
@@ -355,7 +371,11 @@ def select(results: dict, cfg) -> dict:
                               else r.get("pr_auc", 0.0) for r in best_seed_runs]))
     best_seed = best_seed_runs[best_idx]["seed"]
 
-    kpi_ok = results[winner]["auc_mean"] > cfg["gnn"]["kpi_auc"]
+    # El KPI (0.93) es de AUC-ROC MENSUAL, así que se compara contra
+    # `auc_month_mean`. Antes se comparaba contra `auc_mean`, que desde el
+    # cambio a PR-AUC walk-forward vale ~0.29: el aviso saltaba SIEMPRE, aunque
+    # el ROC mensual fuese 0.9435 y el KPI estuviera cumplido de sobra.
+    kpi_ok = results[winner]["auc_month_mean"] > cfg["gnn"]["kpi_auc"]
     # La época del PICO de la corrida ganadora. Se anota aquí —y no solo dentro
     # del checkpoint— para que el paso `refit` pueda releerla sin cargar 2 MB de
     # pesos, y para que quede a la vista qué número se heredó.
@@ -368,8 +388,11 @@ def select(results: dict, cfg) -> dict:
         "reason": reason,
         "auc_mean": results[winner]["auc_mean"],
         "auc_std": results[winner]["auc_std"],
+        "auc_month_mean": results[winner]["auc_month_mean"],
+        "pr_auc_mean": results[winner].get("pr_auc_mean"),
         "kpi_auc_target": cfg["gnn"]["kpi_auc"],
         "kpi_auc_ok": bool(kpi_ok),
+        "kpi_medido_sobre": "auc_roc mensual",
     }
 
 
@@ -396,8 +419,11 @@ def main():
     selection = select(results, cfg)
     log.info("SELECCIONADA: %s (%s)", selection["selected"], selection["reason"])
     if not selection["kpi_auc_ok"]:
-        log.warning("OJO: AUC %.4f no supera el KPI %.2f — revisar features/grafo.",
-                    selection["auc_mean"], selection["kpi_auc_target"])
+        log.warning("OJO: AUC-ROC mensual %.4f no supera el KPI %.2f — "
+                    "revisar features/grafo. (El PR-AUC walk-forward, que es "
+                    "lo que SELECCIONA, es %.4f: son métricas distintas.)",
+                    selection["auc_month_mean"], selection["kpi_auc_target"],
+                    selection["auc_mean"])
 
     out = resolve(cfg, "models_dir") / "selected_model.json"
     with open(out, "w") as f:

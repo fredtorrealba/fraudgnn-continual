@@ -249,9 +249,16 @@ def main():
 
     log.info("Guardado: %d tipos de entidad, %d aristas (x2 con las inversas)",
              len(meta["entidades"]), meta["n_aristas_total"])
-    if data["transaction"].x.shape[1] != cfg["gnn"]["in_dim"]:
-        log.warning("in_dim real (%d) != config (%d): actualiza gnn.in_dim",
-                    data["transaction"].x.shape[1], cfg["gnn"]["in_dim"])
+    # INFO, no WARNING: `train_gnn` y `compare_gnns` sobrescriben in_dim con el
+    # ancho REAL del grafo antes de construir el modelo, así que el valor del
+    # config no se usa nunca. Como el ancho depende de la ablación y de las
+    # features derivadas, el config quedaría desfasado a cada cambio y el aviso
+    # saltaría siempre sin que hubiera nada que arreglar.
+    real = data["transaction"].x.shape[1]
+    if real != cfg["gnn"].get("in_dim"):
+        log.info("in_dim: %d features por transacción (el config dice %s; manda "
+                 "el real, se toma del grafo en cada entrenamiento)",
+                 real, cfg["gnn"].get("in_dim"))
 
 
 if __name__ == "__main__":
