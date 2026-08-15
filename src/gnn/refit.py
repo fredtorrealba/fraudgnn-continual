@@ -39,7 +39,7 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from src.gnn.models import TXN, build_model
+from src.gnn.models import TXN, build_model, cfg_arquitectura
 from src.gnn.train_gnn import make_loader
 from src.utils.common import (ensure_dirs, get_device, get_logger, load_config,
                               resolve, set_seed)
@@ -114,6 +114,9 @@ def main():
     pos_weight = float((y_tr == 0).sum() / max(1, (y_tr == 1).sum()))
     log.info("pos_weight recalculado: %.2f", pos_weight)
 
+    # Arquitectura de la GANADORA (checkpoint o cache de Optuna), no la del
+    # config: los pesos son nuevos, pero la forma tiene que ser la misma.
+    cfg = cfg_arquitectura(nombre, cfg)
     model = build_model(nombre, cfg, data.metadata()).to(device)  # pesos NUEVOS
     optimizer = torch.optim.Adam(
         model.parameters(), lr=cfg["gnn"]["lr"],

@@ -238,6 +238,46 @@ class FraudGATv2(_BaseHeteroGNN):
         return h_txn
 
 
+def cfg_arquitectura(model_name: str, cfg: dict, ckpt: dict | None = None) -> dict:
+    """
+    El cfg con la arquitectura REAL de esa red, no la del config global.
+
+    Desde que cada arquitectura usa SUS hiperparámetros de Optuna, `cfg["gnn"]`
+    ya no describe a ninguna red concreta: graphsage puede haber salido con
+    [128,128,128] y gatv2 con [128,128], mientras el config sigue diciendo
+    [64,64]. Reconstruir desde el config daba:
+
+        RuntimeError: size mismatch for convs.0... copying a param with shape
+        torch.Size([128, 280]) ... current model is torch.Size([64, 280])
+
+    Se resuelve en tres saltos, de más fiable a menos:
+      1. el propio checkpoint, si trae `hidden_dims` (lo guarda train_gnn)
+      2. reports/optuna_<arq>.json, el cache de la búsqueda
+      3. el config tal cual (sin Optuna, o red entrenada antes de este cambio)
+    """
+    import json
+    from src.utils.common import resolve
+
+    c = json.loads(json.dumps(cfg))
+    g = c["gnn"]
+    if ckpt and ckpt.get("hidden_dims"):
+        g["hidden_dims"] = list(ckpt["hidden_dims"])
+        if ckpt.get("mlp_head_dim"):
+            g["mlp_head_dim"] = int(ckpt["mlp_head_dim"])
+        return c
+
+    cache = resolve(cfg, "reports_dir") / f"optuna_{model_name}.json"
+    if cache.exists():
+        with open(cache) as f:
+            best = (json.load(f) or {}).get("mejores_params") or {}
+        if "ancho" in best:
+            g["hidden_dims"] = [best["ancho"]] * max(2, int(best.get("capas", 2)))
+        for k in ("dropout", "mlp_head_dim", "lr"):
+            if k in best:
+                g[k] = best[k]
+    return c
+
+
 def build_model(name: str, cfg: dict, metadata):
     g = cfg["gnn"]
     common = dict(metadata=metadata, in_dim=g["in_dim"],

@@ -45,7 +45,7 @@ import pandas as pd
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from src.gnn.models import TXN, build_model
+from src.gnn.models import TXN, build_model, cfg_arquitectura
 from src.gnn.sampling import cerrar_loader
 from src.gnn.train_gnn import make_loader
 from src.continual_learning.validate import embed_and_score_nodes
@@ -109,8 +109,17 @@ def _folds(data, nodos: np.ndarray, k: int, seed: int) -> np.ndarray:
 
 
 def _entrenar(nombre, seed, epocas, data, mask_train, cfg, device):
-    """Una red del OOF: desde cero, épocas fijas, sin early stopping."""
+    """
+    Una red del OOF: desde cero, épocas fijas, sin early stopping.
+
+    La arquitectura sale de `cfg_arquitectura`, no del config global: estas K
+    redes tienen que ser RÉPLICAS de la ganadora, y desde que cada arquitectura
+    usa sus propios hiperparámetros de Optuna el config ya no la describe. Con
+    una arquitectura distinta, el embedding que producen no sería comparable
+    con el que el modelo real genera para los meses de fuera de ventana.
+    """
     set_seed(seed)
+    cfg = cfg_arquitectura(nombre, cfg)
     model = build_model(nombre, cfg, data.metadata()).to(device)
     y_tr = data[TXN].y[mask_train]
     pos_weight = float((y_tr == 0).sum() / max(1, (y_tr == 1).sum()))
@@ -265,8 +274,8 @@ def main():
                 f"Falta {ruta_real.name}, necesario para puntuar los meses "
                 f"fuera de la ventana '{args.window}'.")
         ck = torch.load(ruta_real, weights_only=False)
-        cfg_real = dict(cfg)
-        cfg_real["gnn"] = {**cfg["gnn"], "in_dim": ck["in_dim"]}
+        cfg_real = cfg_arquitectura(ck["model_name"], cfg, ck)
+        cfg_real["gnn"]["in_dim"] = ck["in_dim"]
         real = build_model(ck["model_name"], cfg_real, data.metadata())
         real.load_state_dict(ck["state_dict"])
         log.info("Meses fuera de la ventana (%d nodos): los puntúa %s, que "

@@ -337,6 +337,12 @@ def train(model_name: str, seed: int, cfg: dict | None = None,
     # cualquier máquina (Linux/CUDA, Mac/MPS o CPU pelado)
     _atomic_torch_save({"model_name": model_name, "seed": seed,
                         "in_dim": cfg["gnn"]["in_dim"],
+                        # La ARQUITECTURA va dentro: desde que cada red usa sus
+                        # hiperparámetros de Optuna, el config global ya no la
+                        # describe y reconstruirla desde ahí revienta al cargar
+                        # los pesos.
+                        "hidden_dims": list(cfg["gnn"]["hidden_dims"]),
+                        "mlp_head_dim": int(cfg["gnn"]["mlp_head_dim"]),
                         "best_epoch": best_epoch,
                         "state_dict": {k: v.cpu()
                                        for k, v in model.state_dict().items()}},

@@ -399,14 +399,18 @@ def weekly_val_aucs(model_name: str, seed: int, cfg) -> list[float]:
     from sklearn.metrics import average_precision_score
 
     from src.continual_learning.validate import score_nodes
-    from src.gnn.models import build_model
+    from src.gnn.models import build_model, cfg_arquitectura
 
     data = torch.load(resolve(cfg, "graph_dir") / "graph.pt", weights_only=False)
     ckpt = torch.load(resolve(cfg, "models_dir") / f"{model_name}_seed{seed}.pt",
                       weights_only=False)
-    cfg["gnn"]["in_dim"] = ckpt["in_dim"]
-    model = build_model(model_name, cfg, data.metadata())
+    # La arquitectura sale del checkpoint (o del cache de Optuna), NO del cfg:
+    # cada arquitectura tiene la suya y el cfg global no describe a ninguna.
+    c = cfg_arquitectura(model_name, cfg, ckpt)
+    c["gnn"]["in_dim"] = ckpt["in_dim"]
+    model = build_model(model_name, c, data.metadata())
     model.load_state_dict(ckpt["state_dict"])
+    cfg = c                                   # el scorer usa el mismo cfg
 
     val_nodes = torch.where(data["transaction"].val_mask)[0].numpy()
     scores = score_nodes(model, data, val_nodes, cfg)
