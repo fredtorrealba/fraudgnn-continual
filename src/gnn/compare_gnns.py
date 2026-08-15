@@ -36,7 +36,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from src.utils.common import (ensure_dirs, get_logger, load_config,
+from src.utils.common import (ensure_dirs, get_device, get_logger, load_config,
                               load_state, resolve, state_path, update_state)
 
 log = get_logger("compare_gnns")
@@ -47,12 +47,15 @@ TIE_MARGIN = 0.005  # si el AUC difiere menos que esto, decide producción
 # memoria o a ir demasiado lenta, mejor saberlo en la primera corrida que tras
 # hora y media de GraphSAGE. El orden NO afecta los resultados: train() llama a
 # set_seed(seed) al inicio de cada corrida, así que cada una es independiente.
-MODELS = ("gat", "graphsage")
+# Las arquitecturas salen del config (gnn.arquitecturas), no de una
+# constante: cambiar de GAT a GATv2 no debería exigir tocar código.
+MODELS = ("graphsage", "gatv2")   # valor por defecto si falta en config
 
 
 def plan(cfg) -> list[tuple[str, int]]:
     """Las 6 corridas del protocolo, en orden fijo."""
-    return [(m, s) for m in MODELS for s in cfg["gnn"]["seeds"]]
+    arqs = cfg["gnn"].get("arquitecturas", MODELS)
+    return [(m, s) for m in arqs for s in cfg["gnn"]["seeds"]]
 
 
 def init_state(cfg, force: bool = False):
@@ -86,13 +89,14 @@ def show_runs(cfg, force: bool = False):
     pending = []
     hd = cfg["gnn"]["hidden_dims"]
     log.info("--- Corridas GNN (%d arquitecturas x %d seeds) ---",
-             len(MODELS), len(cfg["gnn"]["seeds"]))
+             len(cfg["gnn"].get("arquitecturas", MODELS)),
+             len(cfg["gnn"]["seeds"]))
     log.info("    arquitectura: %d capa(s) [%s] = %d salto(s) en el grafo",
              len(hd), ", ".join(map(str, hd)), len(hd))
     if cfg["gnn"].get("sin_aristas"):
         log.warning("    ABLACIÓN ACTIVA: sin_aristas=true -> el grafo se anula, "
                     "cada nodo queda aislado y el modelo es una MLP")
-    for model in MODELS:
+    for model in cfg["gnn"].get("arquitecturas", MODELS):
         listas, faltan = [], []
         for seed in cfg["gnn"]["seeds"]:
             (listas if is_done(model, seed, cfg) and not force
@@ -121,6 +125,12 @@ def run_all(cfg, force: bool = False):
         return
     log.info("Faltan %d de %d corridas.", len(pending), total)
 
+    # La búsqueda va ANTES de las semillas: las 3 corridas de cada arquitectura
+    # tienen que compartir hiperparámetros o no serían réplicas de lo mismo.
+    if int(cfg["gnn"].get("optuna_trials", 0)) > 0:
+        for arq in sorted({m for m, _ in pending}):
+            aplicar_hiperparametros(cfg, buscar_hiperparametros(arq, cfg))
+
     for i, (model, seed) in enumerate(pending, 1):
         info = None if force else resume_info(model, seed, cfg)
         desde = (f"retoma en la época {info['epoch'] + 1} de {cfg['gnn']['epochs']}"
@@ -130,11 +140,130 @@ def run_all(cfg, force: bool = False):
         train(model, seed, cfg, force=force)
 
 
-def weekly_val_aucs(model_name: str, seed: int, cfg) -> list[float]:
-    """Walk-forward dentro del mes de validación: AUC por semana (1..4).
-    Scorea los nodos de validación una sola vez y corta por semana."""
+def buscar_hiperparametros(model_name: str, cfg) -> dict:
+    """
+    Búsqueda bayesiana para la GNN — lo que hasta ahora solo tenía XGBoost.
+
+    La comparación era injusta en esfuerzo de ajuste: XGBoost recibía 30 trials
+    de Optuna y la GNN corría con valores puestos a mano. No es paridad de
+    cómputo (un trial de XGBoost cuesta ~13 s y uno de GNN ~5 min, 23x más) pero
+    sí de protocolo, que es lo que se defiende: AMBOS modelos recibieron búsqueda
+    bayesiana con el mismo número de trials y el mismo sampler.
+
+    Cada trial entrena con meses 1-4 y se puntúa por PR-AUC sobre el mes 5 —
+    la misma métrica y el mismo conjunto con que se elige la cabeza XGBoost.
+    `MedianPruner` mata pronto los trials que van claramente peor que la mediana,
+    que es lo que hace viable el presupuesto.
+
+    El resultado se cachea en reports/optuna_{modelo}.json: la búsqueda es la
+    parte cara y no debe repetirse al relanzar el pipeline.
+    """
+    import optuna
     import torch
-    from sklearn.metrics import roc_auc_score
+    from sklearn.metrics import average_precision_score
+
+    from src.gnn.models import build_model
+    from src.gnn.train_gnn import evaluate, make_loader
+
+    cache = resolve(cfg, "reports_dir") / f"optuna_{model_name}.json"
+    if cache.exists():
+        with open(cache) as f:
+            prev = json.load(f)
+        log.info("[%s] hiperparámetros ya buscados (PR-AUC %.4f) — se reutilizan",
+                 model_name, prev.get("mejor_valor", float("nan")))
+        return prev["mejores_params"]
+
+    n_trials = int(cfg["gnn"].get("optuna_trials", 30))
+    data = torch.load(resolve(cfg, "graph_dir") / "graph.pt", weights_only=False)
+    device = get_device()
+    y_val = data["transaction"].y[data["transaction"].val_mask].numpy()
+
+    def objetivo(trial):
+        c = json.loads(json.dumps(cfg))          # copia profunda por trial
+        g = c["gnn"]
+        g["lr"] = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
+        g["dropout"] = trial.suggest_float("dropout", 0.0, 0.5)
+        ancho = trial.suggest_categorical("ancho", [64, 128, 256])
+        g["hidden_dims"] = [ancho] * trial.suggest_int("capas", 1, 2)
+        g["mlp_head_dim"] = trial.suggest_categorical("mlp_head_dim", [16, 32, 64])
+        g["in_dim"] = data["transaction"].x.shape[1]
+        wd = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
+        # épocas cortas: la búsqueda compara configuraciones, no exprime cada una
+        epocas = max(3, cfg["gnn"]["epochs"] // 4)
+
+        balancear = bool(g.get("balanceo_semillas", False))
+        pw = (float(g.get("pos_weight_con_balanceo", 1.0)) if balancear else
+              float((y_val == 0).sum() / max(1, (y_val == 1).sum())))
+        modelo = build_model(model_name, c, data.metadata()).to(device)
+        opt = torch.optim.Adam(modelo.parameters(), lr=g["lr"], weight_decay=wd)
+        crit = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pw, device=device))
+
+        tr = make_loader(data, data["transaction"].train_mask, c, True, balancear)
+        va = make_loader(data, data["transaction"].val_mask, c, False)
+        mejor = 0.0
+        for ep in range(1, epocas + 1):
+            modelo.train()
+            for batch in tr:
+                batch = batch.to(device)
+                n = batch["transaction"].batch_size
+                opt.zero_grad()
+                loss = crit(modelo(batch.x_dict, batch.edge_index_dict, batch)[:n],
+                            batch["transaction"].y[:n])
+                loss.backward()
+                opt.step()
+            yv, sv = evaluate(modelo, va, device)
+            mejor = max(mejor, float(average_precision_score(yv, sv)))
+            trial.report(mejor, ep)
+            if trial.should_prune():
+                raise optuna.TrialPruned()
+        del modelo
+        return mejor
+
+    log.info("[%s] Optuna: %d trials (PR-AUC sobre el mes 5)", model_name, n_trials)
+    estudio = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=42),   # mismo sampler que XGBoost
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=2))
+    estudio.optimize(objetivo, n_trials=n_trials, show_progress_bar=True)
+
+    best = dict(estudio.best_params)
+    with open(cache, "w") as f:
+        json.dump({"modelo": model_name, "n_trials": n_trials,
+                   "mejor_valor": estudio.best_value, "mejores_params": best,
+                   "podados": sum(1 for t in estudio.trials
+                                  if t.state.name == "PRUNED")},
+                  f, indent=2, ensure_ascii=False)
+    log.info("[%s] mejor PR-AUC %.4f | %s", model_name, estudio.best_value, best)
+    return best
+
+
+def aplicar_hiperparametros(cfg, best: dict) -> dict:
+    """Traduce lo que devuelve Optuna a la forma que espera `cfg["gnn"]`."""
+    g = cfg["gnn"]
+    for k in ("lr", "dropout", "mlp_head_dim"):
+        if k in best:
+            g[k] = best[k]
+    if "ancho" in best:
+        g["hidden_dims"] = [best["ancho"]] * int(best.get("capas", 1))
+    return cfg
+
+
+def weekly_val_aucs(model_name: str, seed: int, cfg) -> list[float]:
+    """
+    Walk-forward dentro del mes de validación: PR-AUC por semana (1..4).
+
+    PR-AUC y no ROC-AUC, por coherencia con el resto del proyecto y porque con
+    3,4% de fraude el ROC comprime las diferencias: la misma comparación que en
+    PR-AUC da 0.0348 en ROC da 0.0073. Elegir arquitectura con una métrica que
+    apenas distingue es pedir que la elección salga por azar.
+
+    Por SEMANA y no sobre el mes entero porque el mes agregado se infla con la
+    correlación temporal: medido en la ablación sin aristas, un modelo daba
+    0.8524 sobre el mes completo y 0.6075 de media semanal — estaba separando
+    por PERIODO, no por fraude. Dentro de una semana esa correlación no existe.
+    """
+    import torch
+    from sklearn.metrics import average_precision_score
 
     from src.continual_learning.validate import score_nodes
     from src.gnn.models import build_model
@@ -143,27 +272,27 @@ def weekly_val_aucs(model_name: str, seed: int, cfg) -> list[float]:
     ckpt = torch.load(resolve(cfg, "models_dir") / f"{model_name}_seed{seed}.pt",
                       weights_only=False)
     cfg["gnn"]["in_dim"] = ckpt["in_dim"]
-    model = build_model(model_name, cfg)
+    model = build_model(model_name, cfg, data.metadata())
     model.load_state_dict(ckpt["state_dict"])
 
-    val_nodes = torch.where(data.val_mask)[0].numpy()
-    scores = score_nodes(model, data, torch.tensor(val_nodes), cfg)
-    y = data.y.numpy()[val_nodes]
-    weeks = data.week_in_month.numpy()[val_nodes]
+    val_nodes = torch.where(data["transaction"].val_mask)[0].numpy()
+    scores = score_nodes(model, data, val_nodes, cfg)
+    y = data["transaction"].y.numpy()[val_nodes]
+    weeks = data["transaction"].week_in_month.numpy()[val_nodes]
 
     aucs = []
     for w in sorted(np.unique(weeks)):
         m = weeks == w
         if y[m].sum() == 0 or y[m].sum() == m.sum():
             continue  # semana sin ambas clases: AUC indefinido, se omite
-        aucs.append(float(roc_auc_score(y[m], scores[m])))
+        aucs.append(float(average_precision_score(y[m], scores[m])))
     return aucs
 
 
 def collect(cfg) -> dict:
     reports_dir = resolve(cfg, "reports_dir")
     results = {}
-    for model in ("graphsage", "gat"):
+    for model in cfg["gnn"].get("arquitecturas", ["graphsage", "gatv2"]):
         runs = []
         for seed in cfg["gnn"]["seeds"]:
             f = reports_dir / f"{model}_seed{seed}_val.json"
@@ -213,8 +342,10 @@ def select(results: dict, cfg) -> dict:
     # la mejor seed también se elige por su promedio walk-forward.
     # OJO: la seed se lee del propio reporte — si faltara alguna corrida,
     # indexar cfg["gnn"]["seeds"] apuntaría a la seed equivocada.
+    # PR-AUC semanal medio. El fallback a pr_auc mensual solo actúa si alguna
+    # semana quedó sin ambas clases y no hubo curva que calcular.
     best_idx = int(np.argmax([np.mean(r["weekly_auc"]) if r.get("weekly_auc")
-                              else r["auc_roc"] for r in best_seed_runs]))
+                              else r.get("pr_auc", 0.0) for r in best_seed_runs]))
     best_seed = best_seed_runs[best_idx]["seed"]
 
     kpi_ok = results[winner]["auc_mean"] > cfg["gnn"]["kpi_auc"]

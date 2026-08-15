@@ -28,7 +28,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from src.gnn.sampling import fanouts, loader_opts, make_neighbor_loader
+from src.gnn.sampling import make_hetero_loader
 from src.utils.common import get_device, get_logger, load_config
 from src.utils.metrics import full_report, recall_at_threshold
 
@@ -36,98 +36,84 @@ log = get_logger("cl.validate")
 
 
 @torch.no_grad()
-def score_nodes(model, data, node_idx: np.ndarray, cfg) -> np.ndarray:
-    """Scores del modelo sobre nodos específicos, vía subgrafos sampleados."""
-    device = get_device()
-    model = model.to(device).eval()
-    mask = torch.zeros(data.num_nodes, dtype=torch.bool)
-    # as_tensor en vez de tensor(): si node_idx YA es un tensor, tensor() copia
-    # y avisa con UserWarning. as_tensor no copia ni avisa.
-    mask[torch.as_tensor(node_idx, dtype=torch.long)] = True
-    # SIN num_workers a propósito: este loader se crea de nuevo en cada intento
-    # de cada semana (4 semanas x 3 intentos x N validaciones) sobre conjuntos
-    # de 2 a 5000 nodos. Levantar procesos persistentes para eso es más caro que
-    # el muestreo, y al destruirlos tan seguido PyTorch escupe cientos de
-    # "Bad file descriptor" y "semaphore released too many times" al cerrar.
-    # sin_aristas SÍ debe propagarse (ver finetune.py). num_workers se queda
-    # en 0 a propósito: este loader se recrea decenas de veces por ciclo.
-    loader = make_neighbor_loader(data, num_neighbors=fanouts(cfg),
-                                  input_nodes=mask, batch_size=512, shuffle=False,
-                                  sin_aristas=loader_opts(cfg)["sin_aristas"])
-    scores = np.zeros(data.num_nodes, dtype=np.float32)
-    for batch in loader:
-        batch = batch.to(device)
-        s = torch.sigmoid(model(batch.x, batch.edge_index)[: batch.batch_size])
-        scores[batch.n_id[: batch.batch_size].cpu().numpy()] = s.cpu().numpy()
-    model.cpu()
-    return scores[node_idx]
+def score_nodes(model, data, node_idx, cfg) -> np.ndarray:
+    """P(fraude) de esos nodos. Envoltorio sobre `embed_and_score_nodes`."""
+    return embed_and_score_nodes(model, data, node_idx, cfg)[2]
 
 
 @torch.no_grad()
-def embed_and_score_nodes(model, data, node_idx: np.ndarray, cfg):
+def embed_and_score_nodes(model, data, node_idx, cfg):
     """
-    Embedding y score en UNA sola pasada de muestreo.
+    LOS DOS embeddings y el score, en UNA sola pasada de muestreo.
 
-    El score ES `sigmoid(classifier(embedding))`, así que calcular los dos por
-    separado recorrería el grafo dos veces para el mismo resultado. Devuelve
-    (embeddings [n, dim], scores [n]).
+    Devuelve (completo, vecinos, scores) porque cada cabeza necesita uno
+    distinto y calcularlos por separado recorrería el grafo dos veces:
 
-    QUÉ embedding devuelve lo decide `hybrid.embedding_modo` del config, y se
-    lee AQUÍ a propósito: los tres consumidores —`hybrid/oof.py` (que entrena
-    la cabeza), `hybrid/system.py` (que la sirve) y `hybrid/head_cl.py` (que la
-    adapta)— pasan por esta función, así que no pueden desincronizarse.
+        completo  "yo + mi vecindario"   -> para `solo_gnn`, que no recibe
+                                            nada más: sin las features propias
+                                            no sabría nada de la transacción
+        vecinos   "solo mi vecindario"   -> para `gnn_mas_tabular`, que YA
+                                            recibe las features propias en su
+                                            bloque tabular: incluirlas otra vez
+                                            sería gastar columnas en repetir
 
-        completo  h_i = lin_l(mean(x_j)) + lin_r(x_i)   "yo + mi vecindario"
-        vecinos   h_i = lin_l(mean(x_j))                solo el vecindario
+    El score ES `sigmoid(classifier(embedding))`, así que calcularlos por
+    separado recorrería el grafo dos veces para el mismo resultado.
+    Devuelve (embeddings [n, dim], scores [n]).
 
-    El modo `vecinos` existe porque XGBoost ya tiene `x_i` entre sus 431
-    columnas: con `completo` la mitad del embedding le llega repetida.
+    El SCORE sale siempre del camino completo: es el del modelo real.
 
-    El SCORE sale siempre del camino normal (`classifier(embedding completo)`),
-    tanto si el embedding devuelto es el recortado como si no: es el score del
-    modelo real, no una variante suya.
+    Se reserva por nodos ÚNICOS pedidos, no por nodos del grafo — con un
+    embedding de 256 dimensiones, dimensionarlo al grafo entero serían ~600 MB
+    por llamada. Y se pasa por `np.unique` porque `node_idx` puede traer
+    repeticiones (el balanceo de semillas repite fraudes): con un mapeo directo
+    id->fila, las repeticiones quedarían en ceros SIN avisar.
     """
     device = get_device()
     model = model.to(device).eval()
-    mask = torch.zeros(data.num_nodes, dtype=torch.bool)
-    mask[torch.as_tensor(node_idx, dtype=torch.long)] = True
-    loader = make_neighbor_loader(data, num_neighbors=fanouts(cfg),
-                                  input_nodes=mask, batch_size=512, shuffle=False,
-                                  sin_aristas=loader_opts(cfg)["sin_aristas"])
-    # Se reserva por NODOS PEDIDOS, no por nodos del grafo. Con un embedding de
-    # 256 dims, dimensionarlo al grafo entero serían ~600 MB en cada llamada, y
-    # el CL llama a esto decenas de veces por semana. `pos` traduce el id global
-    # que devuelve el loader a la fila que le toca en la salida.
-    # Se reserva por nodos ÚNICOS pedidos, no por nodos del grafo: con 256 dims,
-    # dimensionarlo al grafo entero serían ~600 MB en cada llamada y el CL llama
-    # a esto decenas de veces por semana.
-    # Se pasa por `unique` a propósito: `mezcla_40_60` concatena adaptación y
-    # buffer, que pueden solaparse. Con duplicados, un mapeo directo id->fila
-    # solo rellenaría la última aparición y las demás quedarían en ceros SIN
-    # avisar. `inv` reconstruye el orden y las repeticiones del `node_idx`
-    # original, así que la salida sigue alineada 1 a 1 con lo que se pidió.
+
     node_idx = np.asarray(node_idx, dtype=np.int64)
     uniq, inv = np.unique(node_idx, return_inverse=True)
-    pos = np.full(data.num_nodes, -1, dtype=np.int64)
+    mask = torch.zeros(data["transaction"].num_nodes, dtype=torch.bool)
+    mask[torch.as_tensor(uniq, dtype=torch.long)] = True
+
+    # Los workers se deciden POR TAMAÑO, no por una constante. Los dos usos de
+    # esta función son opuestos:
+    #   CL         decenas de llamadas por ciclo sobre cientos de nodos
+    #              -> levantar 12 procesos cuesta más que el muestreo entero
+    #   oof.py     4 folds de ~102.000 nodos + ~171.000 fuera de ventana
+    #              -> con 0 workers, la etapa muestrea en UN solo núcleo
+    # Con la constante a 0 el segundo caso desperdiciaba 15 de los 16 vCPU.
+    grandes = len(uniq) >= 20_000
+    n_w = int(cfg["gnn"].get("num_workers", 0)) if grandes else 0
+    # Inferencia: sin gradientes que retener, cabe un batch mucho mayor que en
+    # entrenamiento. Solo afecta a la velocidad, nunca al resultado.
+    bs = 2048 if grandes else 512
+    cfg_infer = {**cfg, "gnn": {**cfg["gnn"], "num_workers": n_w}}
+    loader = make_hetero_loader(data, cfg_infer, mask, shuffle=False,
+                                batch_size=bs)
+
+    pos = np.full(data["transaction"].num_nodes, -1, dtype=np.int64)
     pos[uniq] = np.arange(len(uniq))
-    emb = np.zeros((len(uniq), model.dim_embedding), dtype=np.float32)
+    dim = model.dim_embedding
+    emb = np.zeros((len(uniq), dim), dtype=np.float32)      # completo
+    embv = np.zeros((len(uniq), dim), dtype=np.float32)     # solo vecinos
     sc = np.zeros(len(uniq), dtype=np.float32)
-    solo_vecinos = str((cfg.get("hybrid") or {}).get("embedding_modo",
-                                                    "completo")) == "vecinos"
+
     for batch in loader:
         batch = batch.to(device)
-        r = model.encode(batch.x, batch.edge_index,
-                         con_vecinos=solo_vecinos)
-        h_all, vec = r if solo_vecinos else (r, None)
-        h = h_all[: batch.batch_size]
-        # el score SIEMPRE del camino completo: es el del modelo real
-        s = torch.sigmoid(model.classifier(h).squeeze(-1))
-        salida = vec[: batch.batch_size] if solo_vecinos else h
-        fila = pos[batch.n_id[: batch.batch_size].cpu().numpy()]
-        emb[fila] = salida.cpu().numpy()
+        n = batch["transaction"].batch_size
+        e_vec, e_full = model.embed(batch.x_dict, batch.edge_index_dict, batch,
+                                    solo_vecinos=True)
+        s = torch.sigmoid(model.classifier[3](
+            model.classifier[2](e_full[:n]))).squeeze(-1)
+        fila = pos[batch["transaction"].n_id[:n].cpu().numpy()]
+        emb[fila] = e_full[:n].cpu().numpy()
+        embv[fila] = e_vec[:n].cpu().numpy()
         sc[fila] = s.cpu().numpy()
+
     model.cpu()
-    return emb[inv], sc[inv]
+    return emb[inv], embv[inv], sc[inv]
 
 
 def _as_scorer(obj, data, cfg):

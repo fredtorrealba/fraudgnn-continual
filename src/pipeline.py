@@ -69,6 +69,21 @@ class Step:
 
 # El pipeline del capstone, en orden. Las salidas son las que cada módulo
 # escribe al terminar bien — por eso sirven como marca de "paso completado".
+# El continual learning está DESACTIVADO en esta fase. Aquí solo se comparan
+# enfoques —tres cabezas, dos arquitecturas— y para eso el mes 6 tiene que ser
+# test puro: si el CL adaptara el modelo durante el mes 6, las métricas dejarían
+# de medir el enfoque y medirían la adaptación. El código de
+# src/continual_learning/ se conserva intacto y se reactiva cuando haya ganador.
+CL_ACTIVO = False
+
+# FASE. En `exploracion` las etapas 6, 6a y 6b (`refit`/`oof_refit`/
+# `heads_refit`) no se corren: cuestan ~38 min y su único fin es medir el mes 6,
+# que en esta fase debe seguir sellado. El veredicto sale del MES 5 y `final`
+# lo detecta solo (no hay cabezas `_prod`). Al pasar a `produccion` se corren
+# las tres y el mes 6 se abre UNA vez.
+FASE = "exploracion"          # "exploracion" | "produccion"
+SOLO_PRODUCCION = ("refit", "oof_refit", "heads_refit")
+
 STEPS = [
     Step("download", "[0] Descarga del dataset IEEE-CIS",
          "src.data.download_ieee_cis",
@@ -85,16 +100,16 @@ STEPS = [
               "faltantes (mapas y medianas ajustados SOLO con train, sin fuga) y "
               "parte 6 meses por TransactionDT: 1-4 entrenan, 5 valida, 6 es test. "
               "~1 min."),
-    Step("graph", "[2] Construcción del grafo (PyG)",
+    Step("graph", "[2] Grafo HETEROGÉNEO (transacciones + entidades)",
          "src.data.build_graph",
-         [("graph_dir", "graph.pt"),
-          ("processed_dir", "graph_features.parquet")],
-         desc="Construye el grafo: nodos = transacciones, aristas = comparten "
-              "entidad (tarjeta / email / dispositivo) dentro de 30 días, con tope "
-              "de 50 aristas por nodo para evitar hubs. ~4 min, ~22M aristas."),
+         [("graph_dir", "graph.pt"), ("graph_dir", "graph_meta.json")],
+         desc="Nodos transacción + nodos ENTIDAD (uid, card, email, device, "
+              "net), aristas bipartitas. El nodo de entidad aprende un "
+              "vector propio que comparte con sus transacciones. Deja "
+              "graph_meta.json con la cobertura real de cada entidad. ~5 min."),
     # Este paso tiene reanudación propia por seed y por época: aunque se corte
     # a la mitad, al relanzarlo sigue desde la última época guardada.
-    Step("gnn", "[4-5] GraphSAGE vs GAT (3 seeds c/u) + selección",
+    Step("gnn", "[3] GraphSAGE vs GATv2: Optuna + 3 seeds + selección",
          "src.gnn.compare_gnns",
          [("models_dir", "selected_model.json")],
          acepta_force=True,
@@ -102,74 +117,56 @@ STEPS = [
               "neighbor sampling 15-10-5 (nunca ve el grafo entero). Elige la mejor "
               "por AUC walk-forward semanal. EL PASO CARO: 2-4 h con GPU. "
               "Reanudable por corrida Y por época."),
-    Step("oof", "[5a] gnn_score honesto por validación cruzada (meses 1-4)",
+    Step("oof", "[5a] Embedding honesto por validación cruzada (meses 1-4)",
          "src.hybrid.oof", [("processed_dir", "gnn_oof_train.parquet"),
                             ("reports_dir", "oof_train.json")],
          args=["--window", "train"],
-         desc="Entrena K redes dejando un trozo fuera cada vez y puntúa el "
-              "excluido. Sin esto, la columna gnn_score sobre los meses 1-4 "
-              "reflejaría lo que la red MEMORIZÓ, no lo que acierta, y la "
-              "cabeza aprendería a copiarla. ~20 min."),
-    Step("hybrid", "[5b] Cabeza XGBoost del sistema híbrido (variantes)",
+         desc="Entrena K redes dejando un trozo fuera cada vez y saca el "
+              "embedding del excluido. Sin esto, la GNN puntuaría meses que "
+              "MEMORIZÓ y XGBoost aprendería a copiarla. ~16 min."),
+    Step("heads", "[5b] Las tres cabezas XGBoost (meses 1-4)",
          "src.hybrid.train_head",
-         [("models_dir", "hybrid_head_440.json"),
-          ("reports_dir", "hybrid_variants.json")],
+         [("models_dir", "hybrid_head_control.json"),
+          ("reports_dir", "heads_variantes.json")],
          args=["--window", "train"],
-         desc="Entrena la cabeza con 431 / 439 / 440 columnas —y con el "
-              "embedding entero de la GNN si hybrid.usar_embedding— para separar "
-              "cuánto aporta la estructura del grafo y cuánto la red. Optuna "
-              "corre UNA vez y las tres comparten hiperparámetros. ~12 min."),
-    Step("refit", "[6] Refit del ganador sobre train + validación",
-         "src.gnn.refit",
-         [("models_dir", "refit_model.pt"), ("reports_dir", "refit.json")],
-         desc="Refit estándar: la validación ya eligió arquitectura y número de "
-              "épocas, así que se reentrena DESDE CERO con todos los datos hasta "
-              "el mes 5 (+21%). Sin early stopping — las épocas se heredan del "
-              "pico de la corrida ganadora. El mes 6 sigue intacto. ~35 min GPU."),
-    Step("oof_refit", "[6a] gnn_score honesto sobre meses 1-5",
+         desc="control / solo_gnn / gnn_mas_tabular con los mismos "
+              "hiperparámetros y la misma ventana, para que la diferencia sea "
+              "atribuible solo a las columnas. Optuna corre UNA vez. ~15 min."),
+    Step("refit", "[6] La GNN ganadora reentrenada con meses 1-5",
+         "src.gnn.refit", [("models_dir", "refit_model.pt"),
+                           ("reports_dir", "refit.json")],
+         desc="Pesos NUEVOS desde cero: el mes 5 se gastó en decidir y ahora "
+              "se incorpora. ~5 min."),
+    Step("oof_refit", "[6a] Embedding honesto sobre meses 1-5",
          "src.hybrid.oof", [("processed_dir", "gnn_oof_trainval.parquet"),
                             ("reports_dir", "oof_trainval.json")],
          args=["--window", "trainval"],
-         desc="Lo mismo que `oof` pero sobre la ventana del refit. ~25 min."),
-    Step("hybrid_refit", "[6b] Cabeza de producción + umbral operativo",
+         desc="Lo mismo que `oof` en la ventana del refit. ~20 min."),
+    Step("heads_refit", "[6b] Las tres cabezas de producción (meses 1-5)",
          "src.hybrid.train_head",
-         [("models_dir", "hybrid_head_prod.json"),
-          ("reports_dir", "hybrid_thresholds.json")],
+         [("models_dir", "hybrid_head_control_prod.json"),
+          ("reports_dir", "heads_refit.json")],
          args=["--window", "trainval"],
-         desc="Reentrena TODAS las variantes con meses 1-5 (sin Optuna, heredan "
-              "los hiperparámetros) y fija el umbral por presupuesto de alertas "
-              "sobre el mes 5. ~3 min."),
-    Step("cl", "[7] Ciclo de Continual Learning (mes 6 por semanas)",
-         "src.continual_learning.cl_orchestrator",
-         [("reports_dir", "cl_cycles.json"),
-          ("reports_dir", "gnn_cl_test_scores.npz"),
-          ("reports_dir", "hybrid_cl_test_scores.npz"),
-          ("graph_dir", "graph_scored.pt")],
-         desc="Simula el mes 6 semana a semana. Por cada una: mide qué fraudes se "
-              "escaparon, dispara el gatillo si hay patrón nuevo, hace fine-tuning "
-              "40/60 (nuevos + replay buffer) con LR diferenciado por capa, y valida "
-              "que aprendió SIN olvidar. Solo despliega si pasa ambas. ~15 min."),
-    # XGBoost va aquí, no en su posición nominal [3]: solo necesita
-    # `preprocess` (lee full.parquet, no toca el grafo) y su salida la consume
-    # únicamente `final`. Ponerlo al final deja que las 6 corridas GNN —lo caro
-    # y lo que puede fallar— arranquen cuanto antes. Los títulos conservan la
-    # numeración del capstone, que es lógica y no de ejecución.
-    Step("xgboost", "[3] Baseline XGBoost (SMOTE + Optuna) — queda CONGELADO",
-         "src.baseline_xgboost.train_xgboost",
-         [("models_dir", "xgboost_baseline.json"),
-          ("reports_dir", "xgboost_val_metrics.json")],
-         desc="Baseline tabular sobre las MISMAS features: SMOTE en train + "
-              "búsqueda bayesiana con Optuna (30 trials). Queda CONGELADO, nunca se "
-              "reentrena: es el punto de referencia contra el que se mide todo. "
-              "~10 min en GPU."),
-    Step("final", "[8] Comparación final GNN+CL vs XGBoost (OE4)",
+         desc="Las tres DESDE CERO con meses 1-5. No hay warm start ni "
+              "checkpoints reutilizados: solo se heredan los hiperparámetros. "
+              "~12 min."),
+    Step("final",
+         "[7] Métricas de las 3 cabezas: por mes y " +
+         ("mes 5 y mes 6" if FASE == "produccion" else "MES 5"),
          "src.comparison.final_comparison",
-         [("reports_dir", "final_comparison.json")],
-         desc="Compara GNN+CL contra el baseline congelado sobre el mes 6: a "
-              "threshold fijo, a IGUAL presupuesto de alertas y a IGUAL precisión. "
-              "Las dos últimas son las comparables — con calibraciones distintas, el "
-              "threshold fijo mide agresividad, no detección. ~1 min."),
+         [("reports_dir", "final_comparison.json" if FASE == "produccion"
+                          else "exploracion_mes5.json")],
+         desc="Compara control / solo_gnn / gnn_mas_tabular sobre " +
+              ("el mes 6" if FASE == "produccion" else
+               "el MES 5 (el 6 sigue sellado)") +
+              ": a threshold fijo, a IGUAL presupuesto de alertas y a IGUAL "
+              "precisión. Las dos últimas son las comparables — con "
+              "calibraciones distintas, el threshold fijo mide agresividad, "
+              "no detección. ~1 min."),
 ]
+
+if FASE == "exploracion":
+    STEPS = [s for s in STEPS if s.name not in SOLO_PRODUCCION]
 
 BY_NAME = {s.name: s for s in STEPS}
 ROOT = Path(__file__).resolve().parents[1]

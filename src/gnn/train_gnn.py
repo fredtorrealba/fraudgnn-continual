@@ -40,10 +40,10 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from src.gnn.models import build_model
-from src.gnn.sampling import fanouts, loader_opts, make_neighbor_loader
+from src.gnn.models import TXN, build_model
+from src.gnn.sampling import make_hetero_loader, proporcion_fraude
 from src.utils.common import (ensure_dirs, get_device, get_logger,
-                              get_run_state, load_config, resolve, set_seed,
+                              load_config, resolve, set_seed,
                               update_state)
 from src.utils.metrics import full_report
 
@@ -94,7 +94,7 @@ def _atomic_torch_save(obj, path: Path):
 
 def _rng_state(**loaders) -> dict:
     """Estado de TODOS los generadores: torch, numpy, random y el de cada
-    neighbor sampler (SimpleNeighborLoader lleva su propio np.Generator, que
+    neighbor sampler (el muestreo temporal es determinista, pero el orden de
     avanza época a época; sin esto la reanudación cambiaría el muestreo)."""
     st = {"torch": torch.get_rng_state(),
           "numpy": np.random.get_state(),
@@ -138,15 +138,16 @@ def ruta_modelo_operativo(cfg) -> tuple[Path, str]:
     return models_dir / sel["checkpoint"], f"{sel['selected']} seed {sel['seed']}"
 
 
-def make_loader(data, mask, cfg, shuffle=True):
-    return make_neighbor_loader(
-        data,
-        num_neighbors=fanouts(cfg),            # recortados a las capas del modelo
-        input_nodes=mask,
-        batch_size=cfg["gnn"]["batch_size"],
-        shuffle=shuffle,
-        **loader_opts(cfg),
-    )
+def make_loader(data, mask, cfg, shuffle=True, balancear=False):
+    """
+    Loader heterogéneo con muestreo temporal.
+
+    `balancear=True` solo en ENTRENAMIENTO: repite fraudes reales como semilla
+    hasta que el lote lleve ~50% de cada clase. En validación y test jamás, o
+    las métricas dejarían de reflejar la distribución real.
+    """
+    return make_hetero_loader(data, cfg, mask, shuffle=shuffle,
+                              balancear=balancear)
 
 
 @torch.no_grad()
@@ -156,8 +157,9 @@ def evaluate(model, loader, device):
     ys, ss = [], []
     for batch in loader:
         batch = batch.to(device)
-        logits = model(batch.x, batch.edge_index)[: batch.batch_size]
-        ys.append(batch.y[: batch.batch_size].cpu().numpy())
+        n = batch[TXN].batch_size
+        logits = model(batch.x_dict, batch.edge_index_dict, batch)[:n]
+        ys.append(batch[TXN].y[:n].cpu().numpy())
         ss.append(torch.sigmoid(logits).cpu().numpy())
     return np.concatenate(ys), np.concatenate(ss)
 
@@ -187,31 +189,45 @@ def train(model_name: str, seed: int, cfg: dict | None = None,
 
     data = torch.load(resolve(cfg, "graph_dir") / "graph.pt", weights_only=False)
     # in_dim real puede diferir del nominal — el modelo se adapta al grafo
-    cfg["gnn"]["in_dim"] = data.x.shape[1]
+    cfg["gnn"]["in_dim"] = data[TXN].x.shape[1]
 
-    # pos_weight = N_negativos / N_positivos DEL SET QUE ENTRENA AHORA
-    y_tr = data.y[data.train_mask]
-    pos_weight = float((y_tr == 0).sum() / max(1, (y_tr == 1).sum()))
+    y_tr = data[TXN].y[data[TXN].train_mask]
+    balancear = bool(cfg["gnn"].get("balanceo_semillas", False))
+    if balancear:
+        # Con los lotes ya balanceados por muestreo, aplicar además el
+        # pos_weight completo corregiría el desbalance DOS VECES y la red
+        # sobrepredeciría fraude. 1.0 = sin corrección extra.
+        pos_weight = float(cfg["gnn"].get("pos_weight_con_balanceo", 1.0))
+    else:
+        pos_weight = float((y_tr == 0).sum() / max(1, (y_tr == 1).sum()))
     hd = cfg["gnn"]["hidden_dims"]
-    log.info("[%s seed=%d] %d capa(s) %d->%s->%d->1 | fanouts %s | batch %d | "
-             "pos_weight %.2f%s", model_name, seed, len(hd), cfg["gnn"]["in_dim"],
+    log.info("[%s seed=%d] %d capa(s) %d->%s->%d->1 | batch %d | pos_weight %.2f "
+             "| semillas %s | aggr %s%s",
+             model_name, seed, len(hd), cfg["gnn"]["in_dim"],
              "->".join(map(str, hd)), cfg["gnn"]["mlp_head_dim"],
-             fanouts(cfg), cfg["gnn"]["batch_size"], pos_weight,
+             cfg["gnn"]["batch_size"], pos_weight,
+             "BALANCEADAS" if balancear else "al azar",
+             cfg["gnn"].get("aggr", "mean"),
              "  [SIN ARISTAS]" if cfg["gnn"].get("sin_aristas") else "")
 
-
-    model = build_model(model_name, cfg).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg["gnn"]["lr"])
+    model = build_model(model_name, cfg, data.metadata()).to(device)
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=cfg["gnn"]["lr"],
+        weight_decay=float(cfg["gnn"].get("weight_decay", 0.0)))
     criterion = torch.nn.BCEWithLogitsLoss(
         pos_weight=torch.tensor(pos_weight, device=device))
 
-    train_loader = make_loader(data, data.train_mask, cfg, shuffle=True)
-    # El tamaño real del primer batch es la prueba de que la ablación se aplicó:
-    # sin aristas son exactamente batch_size nodos; con aristas, muchos más.
+    train_loader = make_loader(data, data[TXN].train_mask, cfg, shuffle=True,
+                               balancear=balancear)
+    # El primer batch es la prueba de que todo se aplicó: cuántos nodos de cada
+    # tipo bajó el sampler, y qué proporción de fraude tienen las semillas
+    # (debe rondar 0.50 con balanceo, ~0.035 sin él).
     _b = next(iter(train_loader))
-    log.info("[%s seed=%d] batch real: %d nodos, %d aristas", key.split("_")[0],
-             seed, _b.x.shape[0], _b.edge_index.shape[1])
-    val_loader = make_loader(data, data.val_mask, cfg, shuffle=False)
+    log.info("[%s seed=%d] batch real: %s | fraude en semillas %.3f",
+             model_name, seed,
+             " ".join(f"{nt}={_b[nt].num_nodes}" for nt in _b.node_types),
+             proporcion_fraude(_b))
+    val_loader = make_loader(data, data[TXN].val_mask, cfg, shuffle=False)
 
     best_auc, best_state, bad_epochs, best_epoch = 0.0, None, 0, 0
     start_epoch, resumed, minutes_before = 1, False, 0.0
@@ -251,11 +267,12 @@ def train(model_name: str, seed: int, cfg: dict | None = None,
         for i, batch in enumerate(train_loader, 1):
             batch = batch.to(device)
             optimizer.zero_grad()
-            logits = model(batch.x, batch.edge_index)[: batch.batch_size]
-            loss = criterion(logits, batch.y[: batch.batch_size])
+            n = batch[TXN].batch_size
+            logits = model(batch.x_dict, batch.edge_index_dict, batch)[:n]
+            loss = criterion(logits, batch[TXN].y[:n])
             loss.backward()
             optimizer.step()
-            total_loss += loss.item() * batch.batch_size
+            total_loss += loss.item() * n
 
             if log_every and (i % log_every == 0 or i == n_batches):
                 transcurrido = (time.time() - t_epoch) / 60
@@ -271,7 +288,7 @@ def train(model_name: str, seed: int, cfg: dict | None = None,
         rep = full_report(y_val, s_val, cfg["gnn"]["threshold"])
         auc = rep.get("auc_roc", 0.0)
         log.info("Época %02d | loss %.4f | val AUC %.4f | val recall %.4f "
-                 "| %.1f min", epoch, total_loss / int(data.train_mask.sum()),
+                 "| %.1f min", epoch, total_loss / max(1, int(data[TXN].train_mask.sum())),
                  auc, rep["recall"], (time.time() - t_epoch) / 60)
 
         if auc > best_auc:

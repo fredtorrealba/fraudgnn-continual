@@ -43,15 +43,20 @@ pip install -q torch-geometric
 if pip install -q pyg-lib torch-sparse -f "$WHL"; then
     echo "   sampler nativo instalado"
 else
-    echo "   !! sin ruedas para torch $TORCH + $CUDA — se usará el fallback en Python (lento)"
-    echo "      Combinaciones disponibles: https://data.pyg.org/whl/"
+    # NO es opcional. El fallback casero en numpy solo servía para grafos
+    # homogéneos; con HeteroData, make_hetero_loader() aborta. Mejor fallar
+    # aquí que a mitad de la primera época.
+    echo "   !! FATAL: sin ruedas para torch $TORCH + $CUDA."
+    echo "      El grafo heterogéneo NECESITA pyg-lib o torch-sparse: no hay"
+    echo "      fallback. Combinaciones disponibles: https://data.pyg.org/whl/"
+    exit 1
 fi
 
 echo "== [4/4] Verificación =="
 python - <<'PYCHECK'
 import torch, sys
 sys.path.insert(0, ".")
-from src.gnn.sampling import _has_pyg_sampler
+from src.gnn.sampling import _tiene_sampler_nativo
 from src.utils.common import get_device
 
 print(f"  torch            : {torch.__version__}")
@@ -70,17 +75,21 @@ if torch.cuda.is_available():
     #                        solo en tensores de atención)
     import yaml
     with open("config/config.yaml") as fh:
-        capas = len(yaml.safe_load(fh)["gnn"]["hidden_dims"])
-    necesita = {1: 2, 2: 6, 3: 20}.get(capas, 20)
-    print(f"  capas (config)   : {capas}  -> necesita ~{necesita} GB con batch 1024")
+        _g = yaml.safe_load(fh)["gnn"]
+    capas, bs = len(_g["hidden_dims"]), int(_g["batch_size"])
+    # Medido con batch 1024 sobre el grafo HOMOGÉNEO. El bipartito muestrea
+    # menos por semilla (1 entidad x 10 transacciones), así que es una cota
+    # ALTA. Se escala con el batch, que es como crece el subgrafo.
+    necesita = {1: 2, 2: 6, 3: 20}.get(capas, 20) * bs / 1024
+    print(f"  capas (config)   : {capas} | batch {bs} -> cota alta ~{necesita:.1f} GB")
     if vram < necesita:
-        print(f"  !! {vram:.1f} GB puede no bastar para {capas} capas: baja")
-        print("     gnn.batch_size a 512 ANTES de la primera corrida, y déjalo")
-        print("     fijo para las 6 seeds.")
+        print(f"  !! {vram:.1f} GB puede no bastar: baja gnn.batch_size ANTES")
+        print("     de la primera corrida y déjalo fijo para las 6 seeds.")
     else:
-        print("  VRAM suficiente para batch_size 1024 sin tocar la config.")
+        print(f"  VRAM suficiente para batch_size {bs} sin tocar la config.")
 print(f"  dispositivo      : {get_device().type}")
-print(f"  sampler nativo   : {'SÍ' if _has_pyg_sampler() else 'NO (fallback, lento)'}")
+_sampler = _tiene_sampler_nativo()
+print(f"  sampler nativo   : {'SÍ' if _sampler else 'NO -- BLOQUEANTE'}")
 if torch.cuda.is_available():
     # Que torch vea la GPU no implica que XGBoost la vea: son runtimes CUDA
     # distintos. Se comprueba entrenando 2 árboles sobre datos de juguete.
@@ -110,6 +119,9 @@ if torch.cuda.is_available():
 
 if not torch.cuda.is_available():
     print("\n  !! Sin CUDA: revisa que el pod tenga GPU asignada (nvidia-smi).")
+    sys.exit(1)
+if not _sampler:
+    print("\n  !! Sin pyg-lib/torch-sparse el grafo heterogéneo NO corre.")
     sys.exit(1)
 PYCHECK
 

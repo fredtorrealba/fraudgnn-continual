@@ -1,54 +1,94 @@
 """
-Las dos redes GNN del proyecto. Misma arquitectura base
-(432 -> 256 -> 128 -> 64 + cabeza MLP), difieren SOLO en la agregación:
+Las dos GNN del proyecto, sobre GRAFO HETEROGÉNEO.
 
-- GraphSAGE (principal): agregación MEAN de vecinos sampleados. Costo por
-  nodo fijo e independiente del tamaño del grafo, inductivo (infiere sobre
-  nodos nunca vistos) -> la elección para producción.
-- GAT (alternativa): pesos de atención APRENDIDOS por vecino. Más expresiva,
-  más costosa.
+    transacción  <--->  [uid] [card] [email] [device] [net]
 
-3 capas = el nodo "ve" hasta 3 saltos. Más capas -> over-smoothing.
-Output: 1 logit -> sigmoid = P(fraude). El threshold vive fuera del modelo.
+Cada capa `HeteroConv` aplica una convolución POR TIPO DE ARISTA y suma los
+resultados en el nodo destino. Con dos capas:
 
-Nota de continual learning: las capas se exponen como conv1/conv2/conv3/
-classifier para que el fine-tuning pueda asignar LR diferenciado por grupo
-(capa 1 congelada, capa 2 casi congelada, capa 3 LR bajo, clasificador LR
-normal).
+    capa 1   las transacciones vecinas  ->  el nodo de entidad
+             (la entidad aprende un vector que resume "este cliente")
+    capa 2   los nodos de entidad       ->  la transacción raíz
+
+Los nodos de entidad NO tienen features propias: entran como ceros y su
+contenido sale enteramente de agregar sus transacciones. Eso hace el modelo
+INDUCTIVO — una entidad vista por primera vez en el mes 6 funciona igual.
+
+ARQUITECTURAS
+- GraphSAGE: agregación explícita (`mean`/`max`/`std`), coste fijo por nodo.
+- GATv2: pesos de atención APRENDIDOS por vecino. Se usa GATv2Conv y no GATConv
+  porque la atención de GAT es estática —el ranking de vecinos no depende del
+  nodo que pregunta— y GATv2 lo corrige (Brody et al., ICLR 2022).
+
+LA AGREGACIÓN IMPORTA
+`aggr=["mean","max","std"]` en vez de solo la media. La media destruye la
+dispersión del vecindario, y la dispersión es lo ÚNICO que no está ya en el
+dataset: C1-C14 son conteos, D1-D15 deltas y V1-V339 agregados de historial —
+ninguna trae varianza. La salida sigue teniendo `hidden_dims[-1]` dimensiones;
+solo crecen los parámetros de la capa.
+
+LA SALIDA PARA XGBOOST
+`encode()` devuelve la representación de 256; `embed()` la de `mlp_head_dim`
+(32), que es la capa oculta del clasificador y la que consume el sistema
+híbrido. Con `solo_vecinos=True` se descuenta el término de raíz para que
+XGBoost no reciba dos veces las features propias de la transacción.
 """
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch_geometric.nn import GATConv, SAGEConv
+from torch_geometric.nn import GATv2Conv, HeteroConv, SAGEConv
+
+TXN = "transaction"
 
 
-class _BaseGNN(nn.Module):
+class _BaseHeteroGNN(nn.Module):
     """
-    Esqueleto compartido: N convoluciones + MLP head.
+    Esqueleto compartido: N capas HeteroConv + cabeza MLP.
 
-    N = len(hidden_dims), así que la PROFUNDIDAD es configurable desde
-    config.yaml sin tocar código:
-        hidden_dims: [256, 128, 64]  -> 3 capas = 3 saltos
-        hidden_dims: [256, 128]      -> 2 capas
-        hidden_dims: [256]           -> 1 capa
-
-    Importa porque cada capa es un SALTO en el grafo, y la señal no se reparte
-    por igual: medida sobre este dataset, la separación fraude/legítima es de
-    3.9x a 1 salto, 0.7x a 2 y 0.3x a 3 — a partir del segundo salto se agrega
-    ruido (over-smoothing). Los `fanouts` deben tener tantos elementos como
-    capas; `src.gnn.sampling.fanouts()` se encarga de recortarlos.
+    `metadata` es la tupla (node_types, edge_types) del HeteroData, así que el
+    modelo se adapta solo a las entidades que el grafo traiga. Si una entidad se
+    omite por falta de columnas (ver build_graph), aquí no hay que tocar nada.
     """
 
-    def __init__(self, in_dim: int, hidden_dims: list[int], mlp_dim: int,
-                 dropout: float):
+    def __init__(self, metadata, in_dim: int, hidden_dims: list[int],
+                 mlp_dim: int, dropout: float, aggr, **kw):
         super().__init__()
         if not hidden_dims:
             raise ValueError("hidden_dims no puede estar vacío")
+        if len(hidden_dims) < 2:
+            # En el grafo BIPARTITO llegar de una transacción a otra cuesta DOS
+            # saltos: transacción -> entidad -> transacción. Los nodos de
+            # entidad entran como CEROS, así que con una sola capa la
+            # transacción agrega ceros y el vecindario NO influye en absoluto —
+            # verificado: la diferencia entre correr con y sin aristas es
+            # exactamente 0.000000. Sería una MLP disfrazada de GNN.
+            raise ValueError(
+                f"hidden_dims tiene {len(hidden_dims)} capa y el grafo "
+                "heterogéneo necesita AL MENOS 2: transacción -> entidad -> "
+                "transacción. Con una sola, los nodos de entidad siguen siendo "
+                "ceros cuando llegan a la transacción y el grafo no aporta "
+                "nada. Usa p. ej. hidden_dims: [64, 64].")
+        self.node_types, self.edge_types = metadata
         self.dropout = dropout
+        self.aggr = list(aggr) if isinstance(aggr, (list, tuple)) else aggr
+        self.in_dim = in_dim
+        self.extra = kw
+
         dims = [in_dim, *hidden_dims]
-        self.convs = nn.ModuleList(
-            self._make_conv(dims[i], dims[i + 1]) for i in range(len(hidden_dims)))
-        self.bns = nn.ModuleList(nn.BatchNorm1d(h) for h in hidden_dims)
+        self.convs = nn.ModuleList()
+        self.bns = nn.ModuleList()
+        for i in range(len(hidden_dims)):
+            # (-1, -1) deja que PyG infiera las dimensiones de origen y destino
+            # por tipo de arista: los nodos de entidad entran sin features y su
+            # tamaño lo fija la capa anterior.
+            conv = HeteroConv({et: self._make_conv(dims[i], dims[i + 1])
+                               for et in self.edge_types}, aggr="sum")
+            self.convs.append(conv)
+            # BatchNorm solo en las transacciones: son los únicos nodos con
+            # semántica estable entre lotes. Los de entidad cambian de
+            # composición en cada muestreo.
+            self.bns.append(nn.BatchNorm1d(hidden_dims[i]))
+
         self.classifier = nn.Sequential(
             nn.Linear(hidden_dims[-1], mlp_dim), nn.ReLU(),
             nn.Dropout(dropout), nn.Linear(mlp_dim, 1),
@@ -58,103 +98,154 @@ class _BaseGNN(nn.Module):
     def n_capas(self) -> int:
         return len(self.convs)
 
+    @property
+    def dim_embedding(self) -> int:
+        """El vector que consume XGBoost: la capa oculta del clasificador."""
+        return self.classifier[0].out_features
+
     def _make_conv(self, in_c, out_c):  # pragma: no cover - abstracta
         raise NotImplementedError
 
-    def encode(self, x, edge_index, con_vecinos: bool = False):
+    def _dict_inicial(self, x_dict, edge_index_dict, batch) -> dict:
         """
-        Representación del nodo TRAS las convoluciones y ANTES del clasificador.
+        Los nodos de entidad no traen features: entran como ceros.
 
-        Es el vector que resume "yo + mi vecindario": `hidden_dims[-1]`
-        dimensiones (256 con una capa). El sistema híbrido puede consumirlo
-        entero en vez del escalar que devuelve `forward`, que lo colapsa a un
-        único número y descarta 255 de esas 256 dimensiones.
+        No es un relleno perezoso, es la decisión que hace el modelo INDUCTIVO.
+        Si cada entidad tuviera su propio embedding aprendido, el modelo sería
+        transductivo y no sabría qué hacer con una tarjeta que aparece por
+        primera vez en el mes 6. Así su contenido sale ENTERAMENTE de agregar
+        sus transacciones, y una entidad nueva funciona igual que una conocida.
 
-        Con `con_vecinos=True` devuelve además el TÉRMINO DE VECINOS de la
-        primera capa. SAGEConv calcula:
-
-            out = lin_l(mean(x_j))  +  lin_r(x_i)
-                  └─ los vecinos ─┘    └─ uno mismo ─┘
-
-        y XGBoost YA tiene `x_i` entre sus 431 columnas, así que la mitad del
-        embedding le llega repetida. El término de vecinos se despeja exacto
-        como `out - lin_r(x_i)`, sin reimplementar la convolución.
-
-        Solo tiene sentido en la PRIMERA capa: a partir de la segunda, `x` ya
-        es una mezcla de uno mismo y del vecindario, y la separación se pierde.
-        Con `hidden_dims: [256]` —la configuración medida— primera capa y única
-        coinciden.
+        El número de nodos de cada tipo se toma del batch si lo trae; si no, se
+        deduce del mayor índice que aparece en las aristas.
         """
+        ref = x_dict[TXN]
+        out = dict(x_dict)
+        for nt in self.node_types:
+            if nt in out and out[nt] is not None and out[nt].numel():
+                continue
+            n = 0
+            if batch is not None and nt in getattr(batch, "node_types", []):
+                n = int(batch[nt].num_nodes or 0)
+            if not n:                      # sin batch: deducir de las aristas
+                for et, ei in edge_index_dict.items():
+                    if ei.numel() == 0:
+                        continue
+                    if et[0] == nt:
+                        n = max(n, int(ei[0].max()) + 1)
+                    if et[2] == nt:
+                        n = max(n, int(ei[1].max()) + 1)
+            out[nt] = torch.zeros(n, self.in_dim, device=ref.device, dtype=ref.dtype)
+        return out
+
+    def encode(self, x_dict, edge_index_dict, batch=None, solo_vecinos: bool = False):
+        """
+        Representación de las transacciones tras las convoluciones.
+
+        Con `solo_vecinos=True` devuelve además el término que NO viene del
+        propio nodo. En SAGEConv la salida es `lin_l(agregado) + lin_r(x_i)`;
+        como XGBoost ya tiene `x_i` entre sus columnas tabulares, entregarle
+        también `lin_r(x_i)` sería repetirle lo que ya sabe. Se despeja exacto
+        restando, sin reimplementar la convolución.
+        """
+        x = self._dict_inicial(x_dict, edge_index_dict, batch)
         vecinos = None
         for i, (conv, bn) in enumerate(zip(self.convs, self.bns)):
-            h = conv(x, edge_index)
-            if con_vecinos and i == 0:
-                lin_r = getattr(conv, "lin_r", None)
-                # GAT no tiene término de raíz separado: su convolución ya es
-                # atención sobre los vecinos, así que se devuelve tal cual.
-                vecinos = h - lin_r(x) if lin_r is not None else h
-            x = F.dropout(F.relu(bn(h)), p=self.dropout, training=self.training)
-        return (x, vecinos) if con_vecinos else x
+            h = conv(x, edge_index_dict)
+            if solo_vecinos and i == 0 and TXN in h:
+                vecinos = self._termino_vecinos(h[TXN], x[TXN])
+            nuevo = {}
+            for nt, v in h.items():
+                if nt == TXN:
+                    v = bn(v)
+                nuevo[nt] = F.dropout(F.relu(v), p=self.dropout,
+                                      training=self.training)
+            # los tipos sin aristas entrantes en esta capa conservan su valor
+            for nt, v in x.items():
+                nuevo.setdefault(nt, v)
+            x = nuevo
+        return (x[TXN], vecinos) if solo_vecinos else x[TXN]
 
-    def forward(self, x, edge_index):
-        return self.classifier(self.encode(x, edge_index)).squeeze(-1)  # logits
+    def _termino_vecinos(self, h_txn, x_txn):
+        """
+        La parte de la representación que viene SOLO del vecindario.
 
-    @property
-    def dim_embedding(self) -> int:
-        return self.classifier[0].in_features
+        XGBoost ya tiene las 431 features propias entre sus columnas tabulares:
+        entregarle también la proyección de esas mismas features sería repetirle
+        lo que ya sabe y gastar capacidad del embedding en ello. Cada
+        arquitectura lo despeja a su manera (ver las subclases).
+        """
+        raise NotImplementedError
 
-    @torch.no_grad()
-    def predict_proba(self, x, edge_index):
-        self.eval()
-        return torch.sigmoid(self.forward(x, edge_index))
+    def embed(self, x_dict, edge_index_dict, batch=None, solo_vecinos: bool = False):
+        """El vector de `mlp_head_dim` dimensiones que consume XGBoost."""
+        r = self.encode(x_dict, edge_index_dict, batch, solo_vecinos)
+        h, vec = r if solo_vecinos else (r, None)
+        proyecta = nn.Sequential(self.classifier[0], self.classifier[1])
+        return (proyecta(vec if vec is not None else h), proyecta(h)) \
+            if solo_vecinos else proyecta(h)
+
+    def forward(self, x_dict, edge_index_dict, batch=None):
+        return self.classifier(self.encode(x_dict, edge_index_dict, batch)).squeeze(-1)
 
     def param_groups(self, lrs: dict) -> list[dict]:
         """
-        Grupos de parámetros con LR diferenciado para el fine-tuning:
-        lrs = {"layer1": 0.0, "layer2": 1e-5, "layer3": 1e-4, "classifier": 1e-3}
-
-        Con menos de 3 capas se usan los ÚLTIMOS N valores de la lista, para
-        conservar el gradiente de plasticidad que persigue el diseño: la capa
-        más profunda es la más libre de moverse y la primera la más congelada.
-        Con 1 capa, esa capa recibe `layer3` (la más plástica) — congelarla
-        dejaría solo el clasificador entrenando.
-        BatchNorm de cada capa acompaña a su convolución.
+        LR diferenciado para el fine-tuning del continual learning: el drift
+        mueve la FRONTERA, no la estructura. Con menos de 3 capas se usan los
+        ÚLTIMOS N valores, para que la capa más profunda siga siendo la más
+        libre y la primera la más congelada.
         """
         escala = [lrs["layer1"], lrs["layer2"], lrs["layer3"]][-self.n_capas:]
-        grupos = [
-            {"params": list(c.parameters()) + list(b.parameters()), "lr": lr}
-            for c, b, lr in zip(self.convs, self.bns, escala)
-        ]
-        grupos.append({"params": self.classifier.parameters(),
-                       "lr": lrs["classifier"]})
+        grupos = [{"params": list(c.parameters()) + list(b.parameters()), "lr": lr}
+                  for c, b, lr in zip(self.convs, self.bns, escala)]
+        grupos.append({"params": self.classifier.parameters(), "lr": lrs["classifier"]})
         return grupos
 
 
-class FraudGraphSAGE(_BaseGNN):
-    """RED 1 (principal): agregación MEAN, inductiva, costo fijo."""
+class FraudGraphSAGE(_BaseHeteroGNN):
+    """Agregación explícita: mean / max / std, o la combinación de las tres."""
 
     def _make_conv(self, in_c, out_c):
-        return SAGEConv(in_c, out_c, aggr="mean")
+        return SAGEConv((-1, -1), out_c, aggr=self.aggr)
+
+    def _termino_vecinos(self, h_txn, x_txn):
+        """
+        SAGEConv calcula `lin_l(agregado) + lin_r(x_i)`, así que el término de
+        vecinos se despeja restando — exacto, sin reimplementar la convolución.
+        """
+        for et, sub in self.convs[0].convs.items():
+            if et[2] == TXN:                       # aristas que ENTRAN a transacción
+                lin_r = getattr(sub, "lin_r", None)
+                if lin_r is not None:
+                    return h_txn - lin_r(x_txn)
+        return h_txn
 
 
-class FraudGAT(_BaseGNN):
-    """RED 2 (alternativa): atención por vecino aprendida."""
-
-    def __init__(self, in_dim, hidden_dims, mlp_dim, dropout, heads: int = 4):
-        self.heads = heads
-        super().__init__(in_dim, hidden_dims, mlp_dim, dropout)
+class FraudGATv2(_BaseHeteroGNN):
+    """Atención aprendida por vecino. `aggr` no aplica: la atención la sustituye."""
 
     def _make_conv(self, in_c, out_c):
-        # concat=False -> promedio de cabezas, respeta las dims de hidden_dims
-        return GATConv(in_c, out_c, heads=self.heads, concat=False)
+        return GATv2Conv((-1, -1), out_c, heads=self.extra.get("heads", 4),
+                         concat=False, add_self_loops=False)
+
+    def _termino_vecinos(self, h_txn, x_txn):
+        """
+        Con `add_self_loops=False` el nodo NO se atiende a sí mismo: la salida
+        de GATv2 es ya una suma ponderada de vecinos, sin término de raíz que
+        descontar. (`lin_r` existe en GATv2Conv pero interviene en el cálculo
+        de los coeficientes de atención, no se suma a la salida.)
+        """
+        return h_txn
 
 
-def build_model(name: str, cfg: dict):
+def build_model(name: str, cfg: dict, metadata):
     g = cfg["gnn"]
-    common = dict(in_dim=g["in_dim"], hidden_dims=g["hidden_dims"],
-                  mlp_dim=g["mlp_head_dim"], dropout=g["dropout"])
-    if name.lower() in ("graphsage", "sage"):
+    common = dict(metadata=metadata, in_dim=g["in_dim"],
+                  hidden_dims=g["hidden_dims"], mlp_dim=g["mlp_head_dim"],
+                  dropout=g["dropout"], aggr=g.get("aggr", "mean"))
+    n = name.lower()
+    if n in ("graphsage", "sage"):
         return FraudGraphSAGE(**common)
-    if name.lower() == "gat":
-        return FraudGAT(**common, heads=g["gat_heads"])
-    raise ValueError(f"Modelo desconocido: {name}")
+    if n in ("gatv2", "gat"):
+        return FraudGATv2(**common, heads=g.get("gat_heads", 4))
+    raise ValueError(f"Modelo desconocido: {name}. Usa graphsage o gatv2.")

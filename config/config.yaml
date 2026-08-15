@@ -16,7 +16,12 @@ compute:
   # Con -1 se lanzarían 96 hilos para 7 núcleos: el kernel quema la cuota en
   # milisegundos y CONGELA el proceso el resto de cada ventana de 100 ms
   # (cgroup throttling). Poner aquí el número real lo evita.
-  n_jobs: 11
+  # Pod RTX 4000 Ada: 16 vCPU / 53 GB / 20 GB VRAM. 14 deja 2 vCPU al
+  # SO y al proceso que alimenta la GPU. Manda en las etapas de CPU:
+  # el kNN de SMOTE (594.273 x 95) y las partes de XGBoost que no van
+  # en GPU. Durante `gnn` no compite con num_workers: el DataLoader
+  # fija set_num_threads(1) dentro de cada worker (verificado).
+  n_jobs: 14
 
 paths:
   raw_dir: "data/raw"              # train_transaction.csv + train_identity.csv (IEEE-CIS)
@@ -55,13 +60,44 @@ data:
   test_weeks: 4                    # el mes 6 se trata como 4 semanas de operación
 
 graph:
-  # Nodos = transacciones, aristas = entidades compartidas
-  edge_entities:                   # columnas que definen "misma entidad"
-    card: ["card1", "card2", "card3", "card5", "addr1"]  # huella de tarjeta
-    email: ["P_emaildomain"]
-    device: ["DeviceInfo", "id_30", "id_31"]             # huella de dispositivo
-  window_days: 30                  # ventana temporal para conectar
-  max_edges_per_node: 50           # tope anti-hub
+  # GRAFO HETEROGÉNEO. Antes las transacciones se conectaban ENTRE SÍ cuando
+  # compartían entidad (10,99 M aristas). Ahora hay nodos de ENTIDAD y las
+  # aristas son bipartitas transacción <-> entidad (~2,5 M).
+  #
+  # Por qué cambia algo: el nodo de entidad tiene su PROPIO vector aprendido.
+  # Antes el vecindario se resumía con una media fija; ahora "esta tarjeta"
+  # es una representación que la red entrena y comparte entre sus
+  # transacciones. Los nodos de entidad NO llevan features propias — su
+  # contenido sale de agregar sus transacciones, lo que los hace inductivos:
+  # una entidad que aparece por primera vez en el mes 6 funciona igual.
+  entidades:
+    # `cols`  columnas que forman la clave. Si CUALQUIERA es nula -> no hay
+    #         nodo ni arista. Nunca se rellena con el texto "nan": hacerlo
+    #         convertía el patrón de ausencia en parte de la identidad y
+    #         partía a un mismo cliente en grupos distintos.
+    # `usa_d1` añade (día - D1) a la clave. D1 es "días desde el primer uso
+    #         de la tarjeta", así que día-D1 es CONSTANTE por cliente: es lo
+    #         que distingue clientes que colisionan en el mismo card1.
+    uid:    {cols: ["card1", "addr1"], usa_d1: true}      # el cliente real
+    card:   {cols: ["card1", "card2", "card3", "card5"]}  # la tarjeta
+    email:  {cols: ["P_emaildomain", "card1"]}            # card1 evita el hub de gmail
+    device: {cols: ["DeviceInfo", "id_30", "id_31", "id_33"]}   # cobertura ~24%
+    net:    {cols: ["id_13", "id_17", "id_19", "id_20"]}        # cobertura ~24%
+  # Entidades con más transacciones que esto se PODAN. Su vector sería la
+  # media del dataset entero y se repartiría a todos sus vecinos, borrando
+  # diferencias en vez de crearlas. Distinto de un tope por nodo: limita el
+  # tamaño de la ENTIDAD.
+  max_entity_degree: 500
+  vecinos_por_entidad: 10          # cuántas transacciones trae cada entidad
+  # Features que la GNN necesita para poder aprender lo que dan las columnas
+  # C (conteos) y D (tiempos), y que no tenía:
+  #   __hora_dia, __pos_temporal   el CUÁNDO (TransactionDT se excluye por ser
+  #                                identificador, así que la red no veía la hora)
+  #   __grado_<entidad>            CUÁNTAS transacciones tiene su entidad, antes
+  #                                de que el muestreo cape a 10
+  # Sin esto, quitarle las C y D al tabular es pedirle a la GNN que adivine algo
+  # que nunca ve.
+  features_derivadas: true
 
 gnn:
   in_dim: 431                      # features por transacción (valor real del grafo)
@@ -76,21 +112,37 @@ gnn:
   # Coste por batch de 256 nodos semilla: 3.4K nodos con 1 capa, 12.3K con 2,
   # 23.7K con 3 — o sea que 1 capa entrena ~7x más barato.
   #
-  hidden_dims: [256]               # 1 capa   431 -> 256
-  # hidden_dims: [256, 256]        # 2 capas  431 -> 256 -> 256
-  # hidden_dims: [256, 256, 256]   # 3 capas  431 -> 256 -> 256 -> 256
+  # MÍNIMO DOS CAPAS. En el grafo bipartito, llegar de una transacción a otra
+  # cuesta dos saltos: transacción -> entidad -> transacción. Con una sola capa
+  # los nodos de entidad siguen siendo ceros cuando alcanzan a la transacción y
+  # el vecindario NO influye — medido: diferencia con y sin aristas = 0.000000.
+  # El modelo lanza un error si se pone menos de 2, para que no pase en silencio.
+  #
+  #   [64, 64]        2 saltos bipartitos = 1 salto entre transacciones
+  #   [64, 64, 64]    3 capas; el tercero ya mezcla entidades distintas
+  #
+  # 64 y no 256: con embeddings densos no hace falta tanta anchura, y entrena
+  # mucho más rápido. La salida hacia XGBoost la fija `mlp_head_dim`, no esto.
+  hidden_dims: [64, 64]
   #
   # Las alternativas NO estrechan la salida a propósito: el embedding que
   # recibe la cabeza es `hidden_dims[-1]`, así que la pirámide clásica
   # [256,128,64] daría un vector de 64 — más estrecho que el de una sola capa.
   #
   mlp_head_dim: 32                 # cabeza clasificadora: última capa -> 32 -> 1
-  dropout: 0.3
+  dropout: 0.2
   fanouts: [15, 10, 5]             # vecinos por salto; se usan los primeros N
-  batch_size: 1024
+  # Lotes pequeños dan gradientes más ruidosos, que ayudan a escapar de
+  # mínimos locales. Con balanceo de semillas, 256 son 128 fraudes + 128
+  # normales por lote.
+  batch_size: 256
   lr: 0.001
-  epochs: 30
-  patience: 5                      # early stopping sobre AUC de validación
+  # Regularización L2: penaliza pesos grandes para que la red no memorice
+  # los fraudes concretos del entrenamiento. No se estaba aplicando en el
+  # bucle principal, solo dentro de la búsqueda de Optuna.
+  weight_decay: 0.0005
+  epochs: 50
+  patience: 10             # early stopping sobre PR-AUC de validación                      # early stopping sobre AUC de validación
   # Épocas del paso `refit`. Vacío = usar el pico de la corrida ganadora, que
   # compare_gnns anota en selected_model.json. Poner un número aquí permite
   # relanzar SOLO el refit con otra cantidad, sin repetir las 6 corridas.
@@ -106,10 +158,49 @@ gnn:
   # se convierte en una MLP con la misma capacidad). Responde si el grafo aporta
   # algo: si el AUC no baja, la GNN nunca lo estaba usando. No modifica graph.pt.
   sin_aristas: false
-  num_workers: 8                   # 0 = todo en el proceso principal
+  # 12 de los 16 vCPU muestreando; los 4 restantes, para el proceso
+  # principal y la GPU. El muestreo de vecinos es el cuello de botella
+  # de `gnn` y `oof` (las dos etapas caras), no las multiplicaciones.
+  num_workers: 12                  # 0 = todo en el proceso principal
   pin_memory: true                 # copia CPU->GPU más rápida (cientos de MB/batch)
-  seeds: [42, 123, 2026]           # 3 corridas para la comparación GraphSAGE vs GAT
+  seeds: [42, 123, 2026]           # 3 corridas por arquitectura
   gat_heads: 4
+  # GATv2 en vez de GAT: la atención de GAT es estática (el ranking de vecinos
+  # no depende del nodo que pregunta). GATv2 lo corrige y es estrictamente más
+  # expresivo — Brody et al., ICLR 2022.
+  arquitecturas: ["graphsage", "gatv2"]
+  # AGREGACIÓN de vecinos. La media destruye la dispersión, y la dispersión es
+  # lo ÚNICO que no está ya en las columnas del dataset: C1-C14 son conteos,
+  # D1-D15 deltas temporales y V1-V339 agregados de historial — ninguna trae
+  # varianza. Con ["mean","max","std"] la red recibe el centro, el extremo y la
+  # irregularidad del vecindario.
+  #   una tarjeta con 15 compras de 20€ y una de 800€
+  #     mean -> 78€    (el pico desaparece)
+  #     max  -> 800€   (el pico sobrevive)
+  #     std  -> 195€   (y se ve que es irregular)
+  #   sum: distingue "tengo pocos vecinos" de "tengo muchos". OJO: NO recupera
+  #        el conteo real, porque el muestreo ya capó a `vecinos_por_entidad`
+  #        (una entidad con 3 transacciones y otra con 300 traen 3 y 10). El
+  #        conteo de verdad lo da la feature __grado_<entidad>, contada sobre el
+  #        grafo completo. `sum` solo añade "cuántos de los 10 huecos se
+  #        llenaron", que es información parcial pero gratis.
+  aggr: ["mean", "max", "std", "sum"]
+  # DESBALANCE por muestreo, no por pérdida: cada lote lleva 50% fraudes,
+  # repitiendo fraudes REALES como semilla. No se inventa ningún nodo ni arista
+  # (un nodo sintético no tendría vecinos), y cada repetición ve un vecindario
+  # distinto, así que funciona como aumento de datos.
+  # Arregla algo que pos_weight no toca: el BatchNorm calcula sus estadísticas
+  # CON EL LOTE, y con 988 normales contra 36 fraudes esas estadísticas son las
+  # de una compra normal.
+  balanceo_semillas: true
+  # OJO: con los lotes balanceados hay que BAJAR pos_weight o el desbalance se
+  # corrige dos veces y la red sobrepredice fraude. 1.0 = sin corrección extra.
+  pos_weight_con_balanceo: 1.0
+  # Búsqueda de hiperparámetros para la GNN. Hasta ahora XGBoost recibía 30
+  # trials y la GNN cero: la comparación no era justa en esfuerzo de ajuste.
+  # No es paridad de cómputo (un trial de XGBoost cuesta 13 s y uno de GNN
+  # ~5 min) pero sí de protocolo, que es lo que se defiende.
+  optuna_trials: 30
   threshold: 0.5                   # umbral de alerta P(fraude) >= 0.5
   kpi_auc: 0.93                    # KPI OE2: AUC-ROC > 0.93
 
@@ -127,6 +218,80 @@ xgboost:
     # no se ve afectada. La GNN no puede usarlo (un nodo sintético no tiene
     # aristas) y sigue con pos_weight en la loss.
   optuna_trials: 30                # búsqueda bayesiana de hiperparámetros
+
+  # ── ABLACIONES SOBRE LAS COLUMNAS Y LA CAPACIDAD ───────────────────────────
+  # Se aplican a TODAS las cabezas por igual. Esa es la condición para que la
+  # comparación siga midiendo lo que dice medir: si `control` corre con menos
+  # columnas o menos capacidad que `gnn_mas_tabular`, la diferencia entre ellas
+  # deja de ser "el aporte del grafo" y pasa a ser "quién recibió mejor trato".
+  #
+  # excluir_prefijos: quita familias enteras de columnas. La interesante es
+  #   ["V", "C", "D"]: son los agregados relacionales que Vesta precalculó
+  #   (conteos por entidad, deltas temporales, rankings sobre historiales), y
+  #   son la explicación de por qué el grafo no aportaba nada. Quitarlas prueba
+  #   esa hipótesis DIRECTAMENTE: si el grafo empieza a aportar sin ellas, la
+  #   redundancia queda demostrada y es un resultado positivo.
+  #   431 columnas -> ~92 al excluir V, C y D.
+  excluir_prefijos: ["V", "C", "D"]
+
+  # capacidad_limitada: fuerza un modelo pequeño y salta Optuna. Responde
+  #   "¿aporta más el grafo cuando el tabular no puede exprimir 431 columnas?".
+  capacidad_limitada:
+    activo: false
+    max_depth: 3
+    n_estimators: 100
+    colsample_bytree: 1.0
+
+  # ── CÓMO SE AJUSTA CADA CABEZA ─────────────────────────────────────────────
+  # Las tres cabezas reciben entradas MUY distintas:
+  #     control          431 columnas, mayormente categóricas y dispersas
+  #     solo_gnn          32 columnas, densas y continuas
+  #     gnn_mas_tabular  463 columnas, mezcla de las dos cosas
+  # Un colsample o una profundidad que le va bien a 431 columnas dispersas
+  # puede estar penalizando a 32 densas. Hay dos protocolos válidos:
+  #
+  #   "compartido"   Optuna corre UNA vez sobre la variante más pequeña y las
+  #                  tres heredan. La diferencia entre cabezas es atribuible
+  #                  SOLO a las columnas, y cualquier ventaja de las grandes es
+  #                  una cota inferior conservadora. Es el más estricto.
+  #
+  #   "por_cabeza"   Optuna corre para CADA cabeza con el MISMO número de
+  #                  trials y el mismo sampler. Cada una rinde a su máximo, que
+  #                  es más justo cuando las entradas son tan distintas. A
+  #                  cambio, la diferencia entre cabezas incluye algo de suerte
+  #                  en la búsqueda: hay que declararlo en la memoria.
+  #                  Es el protocolo habitual en la literatura.
+  #
+  # Lo que NO vale es fijar a mano hiperparámetros peores para una cabeza que
+  # para otra: eso no mide las columnas, mide quién recibió mejor trato.
+  optuna_modo: "por_cabeza"
+
+  # Ajustes finos POR CABEZA, encima de lo que salga de Optuna. Vacíos por
+  # defecto. Si pones algo aquí, el log te avisa: es un valor elegido a mano y
+  # necesita justificación en la memoria.
+  # Estos valores SIEMBRAN la búsqueda de Optuna de esa cabeza: se evalúan como
+  # primer trial, así que la búsqueda parte de una configuración conocida y solo
+  # puede mejorarla. No la sustituyen — fijar hiperparámetros a mano cuando la
+  # otra cabeza recibe 30 trials sería PERJUDICAR a esta, porque una búsqueda
+  # bayesiana casi siempre gana a una elección manual.
+  #
+  # Los de abajo están pensados para entradas con embeddings densos: árboles
+  # menos profundos, aprendizaje lento y más árboles, que es lo que suele ir
+  # mejor con features continuas que con 431 columnas categóricas dispersas.
+  por_cabeza:
+    control: {}
+    solo_gnn:
+      max_depth: 6
+      n_estimators: 500
+      learning_rate: 0.03
+      colsample_bytree: 0.8
+      subsample: 0.8
+    gnn_mas_tabular:
+      max_depth: 6
+      n_estimators: 500
+      learning_rate: 0.03
+      colsample_bytree: 0.8
+      subsample: 0.8
   # Dónde entrena XGBoost: "auto" usa la GPU si hay CUDA, si no CPU.
   # En una VM con GPU esto baja la búsqueda de 30 trials de ~35 min a minutos.
   # Fuerza "cpu" si quieres el baseline reproducible en cualquier máquina.
@@ -137,10 +302,18 @@ hybrid:
   # Sistema híbrido: GNN + columnas del grafo + cabeza XGBoost.
   # La cabeza recibe 431 features originales + 8 estructurales + gnn_score.
   oof_folds: 4                     # trozos para el gnn_score honesto
-  variants: [431, 439, 440]        # 431 solo / +estructurales / +gnn_score
-  optuna_on_variant: 431           # se afina sobre la MÁS PEQUEÑA a propósito:
-                                   # así la ventaja de 440 es una cota inferior
-                                   # conservadora, no atacable por hiperparámetros
+  # TRES CABEZAS, con nombre en vez de número: el número dependía de `in_dim`
+  # y cambiaba solo al tocar el dataset.
+  #   control          las N features tabulares         ¿cuánto vale lo tabular solo?
+  #   solo_gnn         SOLO la salida de la GNN         ¿basta el grafo por sí mismo?
+  #   gnn_mas_tabular  tabular + salida de la GNN       ¿APORTA el grafo sobre lo tabular?
+  # La pregunta del capstone la responde `control` vs `gnn_mas_tabular`, con
+  # idéntica ventana de entrenamiento. `solo_gnn` acota el techo del grafo aislado.
+  variantes: ["control", "solo_gnn", "gnn_mas_tabular"]
+  optuna_on_variant: "control"     # se afina sobre la MÁS PEQUEÑA a propósito:
+                                   # así la ventaja de las otras es una cota
+                                   # inferior conservadora, no atacable por
+                                   # hiperparámetros
   # Umbral por VOLUMEN de alertas, no fijo. La GNN entrena con pos_weight ~27
   # (scores inflados) y la cabeza devuelve probabilidades calibradas ~3%: con
   # 0.5 el híbrido no alertaría casi nada y ningún ciclo de CL desplegaría.
@@ -151,12 +324,11 @@ hybrid:
   # Coste: el parquet del OOF pasa de ~4 MB a ~500 MB y XGBoost entrena sobre
   # 695 columnas. Ponlo en false para volver al comportamiento anterior.
   usar_embedding: true
-  # QUÉ embedding recibe la cabeza:
-  #   completo  lin_l(mean(x_j)) + lin_r(x_i)   "yo + mi vecindario"
-  #   vecinos   lin_l(mean(x_j))                SOLO el vecindario
-  # `completo` le entrega a XGBoost una transformación de x_i, que YA tiene
-  # entre sus 431 columnas: la mitad del embedding llega repetida. Medido con
-  # `completo`: PR-AUC 0.5792 frente a 0.6212 de la variante de 431 columnas.
+  # OBSOLETO desde que cada variante elige su embedding:
+  #   solo_gnn         usa emb_*   (completo: es lo único que recibe)
+  #   gnn_mas_tabular  usa embv_*  (vecinos: las propias ya van en el tabular)
+  # Ya no hay un modo global que pueda quedarse mal puesto. Se conserva la clave
+  # porque el continual learning la leerá cuando se reactive.
   embedding_modo: "vecinos"
   alert_budget_pct: 2.0            # % del mes que se marca para revisión
   cl_head:
@@ -214,7 +386,6 @@ continual_learning:
       epochs: 12
 
 comparison:
-  # OE4: GNN+CL vs XGBoost congelado sobre el mes 6, mismo threshold
-  kpi_recall_gap: 0.20             # recall >= 20% superior sobre patrones emergentes
-  avg_fraud_amount_usd: 120        # para impacto económico (ajustable al dataset real)
+  # El desglose de métricas (por mes, mes 5, mes 6) no necesita configuración:
+  # los presupuestos y precisiones objetivo están en final_comparison.py.
 

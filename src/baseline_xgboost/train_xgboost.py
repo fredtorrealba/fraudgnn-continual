@@ -18,7 +18,6 @@ import json
 import sys
 from pathlib import Path
 
-import numpy as np
 import optuna
 import pandas as pd
 import xgboost as xgb

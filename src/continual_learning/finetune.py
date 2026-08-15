@@ -19,6 +19,20 @@ Diseño:
 - El entrenamiento usa el GRAFO LOCAL: cada nodo semilla entrena sobre su
   subgrafo sampleado (NeighborLoader 15-10-5), nunca el grafo completo.
 """
+# ─────────────────────────────────────────────────────────────────────────────
+# DESACTIVADO en la fase de comparación de enfoques.
+#
+# Este módulo se escribió para el grafo HOMOGÉNEO (transacción<->transacción) y
+# no está portado al heterogéneo. No se borra porque el diseño del continual
+# learning —gatillo por novedad, buffer de replay, set de control disjunto,
+# dial estabilidad-plasticidad y doble validación— sigue siendo válido y se
+# reactivará cuando haya un enfoque ganador.
+#
+# Para reactivarlo hay que portar: el loader (make_hetero_loader), el acceso a
+# los nodos (data["transaction"].x / .y / .train_mask) y la firma de
+# build_model, que ahora recibe `metadata`.
+# ─────────────────────────────────────────────────────────────────────────────
+
 import copy
 import sys
 import time
@@ -29,7 +43,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from src.continual_learning.mixture import mezcla_40_60
-from src.gnn.sampling import fanouts, loader_opts, make_neighbor_loader
+from src.gnn.sampling import make_hetero_loader  # noqa: F401  (pendiente de portar)
 from src.utils.common import get_device, get_logger, load_config
 
 log = get_logger("cl.finetune")

@@ -24,6 +24,20 @@ Uso:
   python -m src.continual_learning.deep_retrain            # lee el pendiente
   python -m src.continual_learning.deep_retrain --epochs 15
 """
+# ─────────────────────────────────────────────────────────────────────────────
+# DESACTIVADO en la fase de comparación de enfoques.
+#
+# Este módulo se escribió para el grafo HOMOGÉNEO (transacción<->transacción) y
+# no está portado al heterogéneo. No se borra porque el diseño del continual
+# learning —gatillo por novedad, buffer de replay, set de control disjunto,
+# dial estabilidad-plasticidad y doble validación— sigue siendo válido y se
+# reactivará cuando haya un enfoque ganador.
+#
+# Para reactivarlo hay que portar: el loader (make_hetero_loader), el acceso a
+# los nodos (data["transaction"].x / .y / .train_mask) y la firma de
+# build_model, que ahora recibe `metadata`.
+# ─────────────────────────────────────────────────────────────────────────────
+
 import argparse
 import json
 import sys
@@ -38,7 +52,7 @@ from src.continual_learning.control_set import ControlSet
 from src.continual_learning.replay_buffer import ReplayBuffer
 from src.continual_learning.validate import score_nodes
 from src.gnn.models import build_model
-from src.gnn.sampling import fanouts, loader_opts, make_neighbor_loader
+from src.gnn.sampling import make_hetero_loader  # noqa: F401  (pendiente de portar)
 from src.utils.common import get_logger, load_config, resolve, set_seed
 from src.utils.metrics import recall_at_threshold
 

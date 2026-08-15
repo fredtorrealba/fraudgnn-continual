@@ -45,7 +45,7 @@ import pandas as pd
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from src.gnn.models import build_model
+from src.gnn.models import TXN, build_model
 from src.gnn.train_gnn import make_loader
 from src.continual_learning.validate import embed_and_score_nodes
 from src.utils.common import (ensure_dirs, get_device, get_logger, load_config,
@@ -66,8 +66,8 @@ def ruta_informe(cfg, window: str) -> Path:
 
 def _mascara(data, window: str) -> torch.Tensor:
     if window == "train":
-        return data.train_mask
-    return data.train_mask | data.val_mask
+        return data[TXN].train_mask
+    return data[TXN].train_mask | data[TXN].val_mask
 
 
 def _receta(cfg, models_dir: Path, window: str) -> tuple[str, int, int]:
@@ -95,8 +95,8 @@ def _receta(cfg, models_dir: Path, window: str) -> tuple[str, int, int]:
 
 def _folds(data, nodos: np.ndarray, k: int, seed: int) -> np.ndarray:
     """Asignación de fold estratificada por (mes, clase)."""
-    meses = data.month.numpy()[nodos]
-    clases = data.y.numpy()[nodos].astype(int)
+    meses = data[TXN].month.numpy()[nodos]
+    clases = data[TXN].y.numpy()[nodos].astype(int)
     fold = np.empty(len(nodos), dtype=np.int8)
     rng = np.random.default_rng(seed)
     for m in np.unique(meses):
@@ -110,25 +110,27 @@ def _folds(data, nodos: np.ndarray, k: int, seed: int) -> np.ndarray:
 def _entrenar(nombre, seed, epocas, data, mask_train, cfg, device):
     """Una red del OOF: desde cero, épocas fijas, sin early stopping."""
     set_seed(seed)
-    model = build_model(nombre, cfg).to(device)
-    y_tr = data.y[mask_train]
+    model = build_model(nombre, cfg, data.metadata()).to(device)
+    y_tr = data[TXN].y[mask_train]
     pos_weight = float((y_tr == 0).sum() / max(1, (y_tr == 1).sum()))
     opt = torch.optim.Adam(model.parameters(), lr=cfg["gnn"]["lr"])
     crit = torch.nn.BCEWithLogitsLoss(
         pos_weight=torch.tensor(pos_weight, device=device))
-    loader = make_loader(data, mask_train, cfg, shuffle=True)
+    loader = make_loader(data, mask_train, cfg, shuffle=True,
+                         balancear=bool(cfg["gnn"].get("balanceo_semillas", False)))
     for ep in range(1, epocas + 1):
         model.train()
         total, n = 0.0, 0
         for batch in loader:
             batch = batch.to(device)
             opt.zero_grad()
-            logits = model(batch.x, batch.edge_index)[: batch.batch_size]
-            loss = crit(logits, batch.y[: batch.batch_size])
+            n_b = batch[TXN].batch_size
+            logits = model(batch.x_dict, batch.edge_index_dict, batch)[:n_b]
+            loss = crit(logits, batch[TXN].y[:n_b])
             loss.backward()
             opt.step()
-            total += loss.item() * batch.batch_size
-            n += batch.batch_size
+            total += loss.item() * n_b
+            n += n_b
         if ep == 1 or ep == epocas:
             log.info("    época %02d/%02d | loss %.4f", ep, epocas, total / max(n, 1))
     return model
@@ -175,7 +177,7 @@ def main():
     k = int((cfg.get("hybrid") or {}).get("oof_folds", 4))
 
     data = torch.load(resolve(cfg, "graph_dir") / "graph.pt", weights_only=False)
-    cfg["gnn"]["in_dim"] = data.x.shape[1]
+    cfg["gnn"]["in_dim"] = data[TXN].x.shape[1]
     device = get_device()
 
     # La suposición de la que cuelga todo el sistema híbrido: el índice de nodo
@@ -183,7 +185,8 @@ def main():
     # a las transacciones equivocadas en silencio.
     df = pd.read_parquet(resolve(cfg, "processed_dir") / "full.parquet",
                          columns=["TransactionID"])
-    assert np.array_equal(data.transaction_id.numpy(), df["TransactionID"].values), \
+    assert np.array_equal(data[TXN].transaction_id.numpy(),
+                          df["TransactionID"].values), \
         "node_idx no coincide con la fila de full.parquet: reconstruye el grafo"
 
     nombre, seed, epocas = _receta(cfg, models_dir, args.window)
@@ -200,26 +203,27 @@ def main():
     # compite contra 431 columnas; el embedding ensancha ese canal x256.
     # Ambos salen de las MISMAS K redes out-of-fold, así que el embedding es
     # tan honesto como el score: ninguna red vio la transacción que describe.
-    emb = None
+    emb = embv = None
     t0 = time.time()
     for f in range(k):
         fuera = fold == f
         log.info("  fold %d/%d: entrena con %d, puntúa %d",
                  f + 1, k, int((~fuera).sum()), int(fuera.sum()))
-        mask_tr = torch.zeros(data.num_nodes, dtype=torch.bool)
+        mask_tr = torch.zeros(data[TXN].num_nodes, dtype=torch.bool)
         mask_tr[torch.tensor(nodos[~fuera], dtype=torch.long)] = True
         model = _entrenar(nombre, seed, epocas, data, mask_tr, cfg, device)
-        h, s_fold = embed_and_score_nodes(model, data, nodos[fuera], cfg)
+        h, hv, s_fold = embed_and_score_nodes(model, data, nodos[fuera], cfg)
         scores[fuera] = s_fold
         if emb is None:
             emb = np.zeros((len(nodos), h.shape[1]), dtype=np.float32)
-        emb[fuera] = h
-        del model, h
+            embv = np.zeros((len(nodos), h.shape[1]), dtype=np.float32)
+        emb[fuera], embv[fuera] = h, hv
+        del model, h, hv
     minutos = round((time.time() - t0) / 60, 1)
 
     # El diagnóstico se calcula AQUÍ, antes de añadir los nodos de fuera de la
     # ventana: mide si `gnn_score` delata el fold, y esos nodos no tienen fold.
-    diag = _diagnostico(scores, fold, data.month.numpy()[nodos])
+    diag = _diagnostico(scores, fold, data[TXN].month.numpy()[nodos])
 
     # --- meses POSTERIORES a la ventana: el modelo REAL, no OOF -------------
     # Sin esto, el paso `hybrid` valida sobre el mes 5 con gnn_score y embedding
@@ -253,17 +257,19 @@ def main():
         ck = torch.load(ruta_real, weights_only=False)
         cfg_real = dict(cfg)
         cfg_real["gnn"] = {**cfg["gnn"], "in_dim": ck["in_dim"]}
-        real = build_model(ck["model_name"], cfg_real)
+        real = build_model(ck["model_name"], cfg_real, data.metadata())
         real.load_state_dict(ck["state_dict"])
         log.info("Meses fuera de la ventana (%d nodos): los puntúa %s, que "
                  "nunca los vio", len(fuera_ventana), etiqueta)
-        h_out, s_out = embed_and_score_nodes(real, data, fuera_ventana, cfg)
+        h_out, hv_out, s_out = embed_and_score_nodes(real, data, fuera_ventana, cfg)
         del real
         nodos = np.concatenate([nodos, fuera_ventana])
         scores = np.concatenate([scores, s_out])
         emb = np.vstack([emb, h_out])
+        embv = np.vstack([embv, hv_out])
         orden = np.argsort(nodos)
-        nodos, scores, emb = nodos[orden], scores[orden], emb[orden]
+        nodos, scores = nodos[orden], scores[orden]
+        emb, embv = emb[orden], embv[orden]
 
     # Escala de los embeddings dentro y fuera de la ventana. Los de dentro los
     # producen las K redes out-of-fold y los de fuera el modelo real: son redes
@@ -286,11 +292,16 @@ def main():
                         "una y serviría con otra: interpreta con cuidado los "
                         "resultados de la variante del embedding.", r)
 
+    # DOS familias de columnas, porque cada cabeza necesita una:
+    #   emb_*   completo — para `solo_gnn`, que no recibe nada más
+    #   embv_*  solo vecinos — para `gnn_mas_tabular`, que ya trae las features
+    #           propias en su bloque tabular y las repetiría
     salida = {"node_idx": nodos, "gnn_score": scores}
     salida.update({f"emb_{i}": emb[:, i] for i in range(emb.shape[1])})
+    salida.update({f"embv_{i}": embv[:, i] for i in range(embv.shape[1])})
     pd.DataFrame(salida).to_parquet(ruta_parquet(cfg, args.window), index=False)
-    log.info("Guardado: %d filas | gnn_score + embedding de %d dimensiones",
-             len(nodos), emb.shape[1])
+    log.info("Guardado: %d filas | gnn_score + embedding completo y de "
+             "vecinos, %d dimensiones cada uno", len(nodos), emb.shape[1])
 
     informe = {"window": args.window, "folds": k, "modelo": nombre, "seed": seed,
                "epocas": epocas, "n_nodos": int(int(mask.sum())),

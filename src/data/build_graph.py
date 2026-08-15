@@ -1,23 +1,44 @@
 """
-Paso 2 — Construcción del grafo homogéneo (PyTorch Geometric).
+Paso 3 — GRAFO HETEROGÉNEO de transacciones y entidades.
 
-Diseño (según la definición del proyecto):
-- NODOS = transacciones (cada una con sus 432 features + isFraud).
-- ARISTAS = entidad compartida entre dos transacciones:
-    * misma tarjeta   -> huella card1+card2+card3+card5+addr1
-    * mismo email     -> P_emaildomain (se ignoran dominios masivos tipo gmail
-                         combinándolo con card1 para no crear hubs falsos)
-    * mismo dispositivo -> DeviceInfo + id_30 + id_31
-- Reglas anti-explosión:
-    * ventana temporal de 30 días entre transacciones conectadas
-    * tope de 50 aristas por nodo (se conectan las más cercanas en el tiempo)
+QUÉ CAMBIÓ Y POR QUÉ
+Antes las transacciones se conectaban ENTRE SÍ cuando compartían una entidad
+(10,99 M aristas). Ahora la entidad es un NODO y las aristas son bipartitas:
 
-Salida: data/graph/graph.pt  (torch_geometric.data.Data con x, edge_index, y,
-masks de split y metadatos de tiempo).
+    transacción  <--->  [uid] [card] [email] [device] [net]
+
+Tres consecuencias:
+
+1. El nodo de entidad tiene su PROPIO vector aprendido. Antes el vecindario se
+   resumía con una media fija; ahora "esta tarjeta" es una representación que la
+   red entrena y comparte entre todas sus transacciones.
+2. Las aristas bajan a ~2,5 M: cada transacción tiene como mucho una arista por
+   tipo de entidad, en vez de hasta 50 vecinos directos.
+3. Es INDUCTIVO: los nodos de entidad no llevan features propias, su contenido
+   sale de agregar sus transacciones. Una entidad que aparece por primera vez en
+   el mes 6 funciona igual que una vista en el mes 1.
+
+LA REGLA DE NULOS
+Si CUALQUIER columna de la clave es nula, no hay nodo ni arista. Antes se
+rellenaba con el texto "nan" y se concatenaba, así que un cliente con `addr1` y
+el MISMO cliente sin `addr1` (~11% de las filas) caían en grupos distintos: el
+patrón de ausencia se había vuelto parte de la identidad.
+
+`device` y `net` solo cubren ~24% de las filas porque la tabla `identity` se une
+con LEFT JOIN. No es un fallo: esas transacciones simplemente no tienen esa
+arista, y la cobertura real se reporta en graph_meta.json.
+
+CAUSALIDAD
+Aquí NO se filtra por tiempo. La causalidad la impone el muestreo con
+`temporal_strategy="last"` (ver gnn/sampling.py), que solo baja vecinos con
+`transaction_dt` ANTERIOR al del nodo raíz. Eso arregla de raíz la fuga del
+diseño anterior, donde el grafo se hacía no dirigido y un nodo podía ver el
+futuro.
+
+Salidas: data/graph/graph.pt (HeteroData) + data/graph/graph_meta.json
 """
 import json
 import sys
-from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -30,133 +51,207 @@ from src.utils.common import ensure_dirs, get_logger, load_config, resolve
 log = get_logger("build_graph")
 
 
-def entity_keys(df: pd.DataFrame, cfg: dict) -> dict:
-    """Construye la clave de entidad por cada tipo de arista."""
-    def joined(cols):
-        return df[cols].fillna("nan").astype(str).agg("|".join, axis=1)
-
-    keys = {}
-    # Tarjeta: concatenación de la huella completa
-    card_cols = [f"raw__{c}" for c in cfg["graph"]["edge_entities"]["card"]]
-    keys["card"] = joined(card_cols)
-
-    # Email: dominio + card1 (evita hub gigante en gmail.com)
-    keys["email"] = joined(["raw__P_emaildomain", "raw__card1"]).where(
-        ~df["raw__P_emaildomain"].isna(), np.nan)
-
-    # Dispositivo: DeviceInfo + versiones de SO/navegador
-    dev_cols = [f"raw__{c}" for c in cfg["graph"]["edge_entities"]["device"]]
-    keys["device"] = joined(dev_cols).where(~df["raw__DeviceInfo"].isna(), np.nan)
-    return keys
-
-
-def build_edges(df: pd.DataFrame, cfg: dict) -> np.ndarray:
+def clave_entidad(df: pd.DataFrame, spec: dict) -> pd.Series:
     """
-    Para cada entidad compartida conecta transacciones dentro de la ventana
-    temporal, respetando el tope de aristas por nodo.
+    Clave de una entidad, o NaN si le falta algún componente.
+
+    `usa_d1` añade (día - D1) a la clave. D1 es "días desde el primer uso de la
+    tarjeta", así que restarlo del día de la transacción da una CONSTANTE por
+    cliente: el día en que esa tarjeta empezó a usarse. Es lo que distingue a
+    clientes que colisionan en el mismo `card1`, y es el truco que encontraron
+    los ganadores de la competición de Kaggle sobre este dataset.
     """
-    window_s = cfg["graph"]["window_days"] * 86400
-    max_deg = cfg["graph"]["max_edges_per_node"]
-    dts = df["TransactionDT"].values
+    cols = [f"raw__{c}" for c in spec["cols"]]
+    faltan = [c for c in cols if c not in df.columns]
+    if faltan:
+        log.warning("Columnas ausentes, la entidad se omite: %s", faltan)
+        return pd.Series(np.nan, index=df.index, dtype=object)
 
-    degree = np.zeros(len(df), dtype=np.int32)
-    # dict en vez de set: conserva QUÉ entidad creó cada arista. El grafo se
-    # sigue usando como homogéneo, pero guardar el tipo permite analizar la
-    # contribución de cada relación (y deja abierta la vía heterogénea).
-    edges: dict[tuple[int, int], int] = {}
-    keys = entity_keys(df, cfg)
-    tipos = {name: i for i, name in enumerate(keys)}
+    # nulo en CUALQUIER componente -> sin clave. Nunca se rellena con "nan".
+    valido = df[cols].notna().all(axis=1)
+    partes = [df[c].astype(str) for c in cols]
 
-    for etype, key_series in keys.items():
-        groups = defaultdict(list)
-        for idx, k in enumerate(key_series.values):
-            if isinstance(k, str) and "nan" not in k.split("|")[0:1]:
-                groups[k].append(idx)
+    if spec.get("usa_d1"):
+        if "D1" not in df.columns:
+            log.warning("Falta D1: la entidad de cliente cae a la clave sin él")
+        else:
+            dia = (df["TransactionDT"] // 86400).astype("float64")
+            inicio = dia - df["D1"].astype("float64")
+            valido &= df["D1"].notna()
+            partes.append(inicio.astype("Int64").astype(str))
 
-        n_edges_type = 0
-        for _, idxs in groups.items():
-            if len(idxs) < 2:
-                continue
-            idxs.sort(key=lambda i: dts[i])  # ordenados en el tiempo
-            # Cada nodo se conecta hacia atrás con sus vecinos temporales más
-            # cercanos de la misma entidad (dentro de la ventana y del tope).
-            for pos in range(1, len(idxs)):
-                i = idxs[pos]
-                for prev_pos in range(pos - 1, -1, -1):
-                    j = idxs[prev_pos]
-                    if dts[i] - dts[j] > window_s:
-                        break
-                    if degree[i] >= max_deg or degree[j] >= max_deg:
-                        continue
-                    e = (j, i) if j < i else (i, j)
-                    if e not in edges:
-                        edges[e] = tipos[etype]
-                        degree[i] += 1
-                        degree[j] += 1
-                        n_edges_type += 1
-        log.info("Aristas tipo %-7s: %d", etype, n_edges_type)
-
-    if not edges:
-        return (np.zeros((2, 0), dtype=np.int64),
-                np.zeros((0,), dtype=np.int8))
-    arr = np.array(list(edges), dtype=np.int64).T
-    etypes = np.fromiter(edges.values(), dtype=np.int8, count=len(edges))
-    # Grafo no dirigido -> duplicar en ambos sentidos.
-    # ascontiguousarray NO es cosmético: .T y [::-1] devuelven vistas en orden
-    # Fortran, torch.tensor() PRESERVA esos strides, y el sampler nativo
-    # (pyg_lib.ops.index_sort) falla con "Input should be contiguous".
-    edge_index = np.ascontiguousarray(np.concatenate([arr, arr[::-1]], axis=1))
-    edge_type = np.ascontiguousarray(np.concatenate([etypes, etypes]))
-    return edge_index, edge_type
+    clave = partes[0].str.cat(partes[1:], sep="|") if len(partes) > 1 else partes[0]
+    return clave.where(valido, np.nan)
 
 
 def main():
     cfg = load_config()
     ensure_dirs(cfg)
-    proc_dir, graph_dir = resolve(cfg, "processed_dir"), resolve(cfg, "graph_dir")
+    proc, graph_dir = resolve(cfg, "processed_dir"), resolve(cfg, "graph_dir")
 
-    df = pd.read_parquet(proc_dir / "full.parquet")
-    with open(proc_dir / "feature_cols.json") as f:
-        meta = json.load(f)
-    feature_cols = meta["feature_cols"]
+    df = pd.read_parquet(proc / "full.parquet")
+    with open(proc / "feature_cols.json") as f:
+        feature_cols = json.load(f)["feature_cols"]
 
-    log.info("Construyendo aristas para %d nodos...", len(df))
-    edge_index, edge_type = build_edges(df, cfg)
-    log.info("Total aristas (dirigidas x2): %d", edge_index.shape[1])
+    # MISMA ABLACIÓN QUE LAS CABEZAS XGBOOST. Si se excluyen V/C/D del modelo
+    # tabular pero la GNN las sigue viendo, el embedding las promedia y se las
+    # devuelve a XGBoost por la puerta de atrás: la variante con grafo tendría
+    # esas columnas —disfrazadas— y el control no. Ganaría por copiarlas, no
+    # por descubrir nada, y la ablación no mediría lo que dice medir.
+    from src.hybrid.head import filtrar_prefijos
+    prefijos = (cfg.get("xgboost") or {}).get("excluir_prefijos") or []
+    if prefijos:
+        antes = len(feature_cols)
+        feature_cols = filtrar_prefijos(feature_cols, prefijos)
+        log.info("ABLACIÓN %s: la GNN también pierde esas columnas -> %d "
+                 "features por nodo en vez de %d", prefijos, len(feature_cols), antes)
 
-    from torch_geometric.data import Data
-    data = Data(
-        x=torch.tensor(df[feature_cols].values, dtype=torch.float32),
-        edge_index=torch.tensor(edge_index, dtype=torch.long),
-        y=torch.tensor(df["isFraud"].values, dtype=torch.float32),
-    )
-    data.transaction_id = torch.tensor(df["TransactionID"].values, dtype=torch.long)
-    data.transaction_dt = torch.tensor(df["TransactionDT"].values, dtype=torch.long)
-    data.month = torch.tensor(df["month"].values, dtype=torch.long)
-    data.week_in_month = torch.tensor(df["week_in_month"].values, dtype=torch.long)
-    # Cada nodo lleva: features (x) + etiqueta (y) + fraud_score.
-    # El score parte en NaN y lo va llenando el modelo al operar.
-    data.edge_type = torch.tensor(edge_type, dtype=torch.int8)
-    data.fraud_score = torch.full((data.num_nodes,), float("nan"))
-    for split in ["train", "val", "test"]:
-        setattr(data, f"{split}_mask",
-                torch.tensor((df["split"] == split).values, dtype=torch.bool))
+    # --- dos features que la GNN necesita y no tenía -----------------------
+    # Sin ellas no puede aprender lo que daban las columnas C y D, por mucho que
+    # se las quitemos al tabular:
+    #   · el TIEMPO no estaba entre las features (TransactionDT se excluye por
+    #     ser identificador). La red elegía vecinos por fecha pero no sabía
+    #     CUÁNDO ocurrió nada, así que no podía calcular deltas.
+    #   · el TAMAÑO de la entidad tampoco: el muestreo capa a 10 vecinos, así
+    #     que una tarjeta con 3 compras y otra con 300 le llegaban iguales.
+    # Se añaden normalizadas para no descuadrar la escala del resto.
+    if cfg["graph"].get("features_derivadas", True):
+        dt = df["TransactionDT"].astype("float64")
+        hora = (dt % 86400) / 86400.0                    # hora del día en [0,1]
+        dia = (dt - dt.min()) / max(dt.max() - dt.min(), 1)   # posición temporal
+        derivadas = pd.DataFrame({"__hora_dia": hora, "__pos_temporal": dia},
+                                 index=df.index)
+        df = pd.concat([df, derivadas], axis=1)
+        feature_cols = feature_cols + ["__hora_dia", "__pos_temporal"]
+        log.info("Features temporales añadidas: __hora_dia, __pos_temporal")
+
+
+    from torch_geometric.data import HeteroData
+    data = HeteroData()
+
+    # --- nodos transacción: los ÚNICOS con features propias ------------------
+    data["transaction"].x = torch.tensor(df[feature_cols].values, dtype=torch.float32)
+    data["transaction"].y = torch.tensor(df["isFraud"].values, dtype=torch.float32)
+    # time_attr del muestreo temporal: debe ser int64 y estar en el nodo
+    data["transaction"].time = torch.tensor(df["TransactionDT"].values, dtype=torch.long)
+    data["transaction"].transaction_id = torch.tensor(df["TransactionID"].values,
+                                                      dtype=torch.long)
+    data["transaction"].month = torch.tensor(df["month"].values, dtype=torch.long)
+    data["transaction"].week_in_month = torch.tensor(df["week_in_month"].values,
+                                                     dtype=torch.long)
+    for split in ("train", "val", "test"):
+        data["transaction"][f"{split}_mask"] = torch.tensor(
+            (df["split"] == split).values, dtype=torch.bool)
+
+    n_txn = len(df)
+    tope = int(cfg["graph"].get("max_entity_degree", 500))
+    meta = {"n_transacciones": n_txn, "max_entity_degree": tope, "entidades": {}}
+
+    log.info("Grafo heterogéneo sobre %d transacciones | poda de entidad > %d",
+             n_txn, tope)
+    grados_extra: dict[str, np.ndarray] = {}
+
+    for nombre, spec in cfg["graph"]["entidades"].items():
+        claves = clave_entidad(df, spec)
+        presentes = claves.notna()
+        if not presentes.any():
+            log.warning("Entidad '%s': ninguna fila la tiene, se omite", nombre)
+            continue
+
+        codigos, unicas = pd.factorize(claves[presentes], sort=False)
+        tam = np.bincount(codigos, minlength=len(unicas))
+
+        # PODA: una entidad con miles de transacciones tendría como vector la
+        # media del dataset entero, y ese vector se repartiría a todos sus
+        # vecinos borrando las diferencias en vez de crearlas (over-smoothing
+        # por hub). Además explota la memoria al muestrear.
+        gigantes = tam > tope
+        n_podadas = int(gigantes.sum())
+        vivas = ~gigantes[codigos]
+
+        filas = np.where(presentes.values)[0][vivas]
+        ent_idx = codigos[vivas]
+        # renumerar tras la poda para no dejar huecos
+        remap, ent_idx = np.unique(ent_idx, return_inverse=True)
+
+        et = ("transaction", f"en_{nombre}", nombre)
+        rev = (nombre, f"tiene_{nombre}", "transaction")
+        src = torch.tensor(filas, dtype=torch.long)
+        dst = torch.tensor(ent_idx, dtype=torch.long)
+        data[et].edge_index = torch.stack([src, dst])
+        data[rev].edge_index = torch.stack([dst, src])
+        data[nombre].num_nodes = int(len(remap))
+
+        # GRADO de la entidad como feature del nodo: cuántas transacciones
+        # tiene la entidad a la que pertenece esta transacción, ANTES de capar
+        # a 10 en el muestreo. Es lo que le permite a la red aprender lo que
+        # daban las columnas C (conteos por entidad).
+        if cfg["graph"].get("features_derivadas", True):
+            grado = np.bincount(ent_idx, minlength=len(remap))[ent_idx]
+            col = np.zeros(n_txn, dtype=np.float32)
+            col[filas] = np.log1p(grado)          # log: los hubs no dominan
+            grados_extra[f"__grado_{nombre}"] = col
+
+        cob = len(filas) / n_txn
+        meta["entidades"][nombre] = {
+            "columnas": spec["cols"], "usa_d1": bool(spec.get("usa_d1")),
+            "n_nodos": int(len(remap)), "n_aristas": int(len(filas)),
+            "cobertura": round(cob, 4),
+            "podadas_por_grado": n_podadas,
+            "txn_por_entidad_media": round(len(filas) / max(len(remap), 1), 1),
+            "degenerada": bool(len(filas) / max(len(remap), 1) < 2),
+        }
+        media = len(filas) / max(len(remap), 1)
+        log.info("  %-7s %7d nodos | %7d aristas | cobertura %5.1f%% | "
+                 "%4.1f txn/entidad | %d podadas",
+                 nombre, len(remap), len(filas), 100 * cob, media, n_podadas)
+        # Una entidad con ~1 transacción por grupo NO CONECTA NADA: cada
+        # transacción cuelga de su propio nodo y el paso de mensajes no
+        # transporta información de nadie. Suele significar que la clave es
+        # demasiado específica (p.ej. añadir card1 a algo que ya era casi único).
+        if media < 2:
+            log.warning("    '%s' es DEGENERADA (%.1f txn/entidad): la clave es "
+                        "demasiado específica y no conecta transacciones entre "
+                        "sí. Revisa sus columnas o quítala de config.", nombre, media)
+        # El extremo contrario: pocos grupos enormes conectan medio grafo con el
+        # otro medio, y su vector acaba siendo la media del dataset.
+        elif media > tope / 2:
+            log.warning("    '%s' es muy GRUESA (%.1f txn/entidad): puede que la "
+                        "poda por grado esté haciendo casi todo el trabajo.",
+                        nombre, media)
+
+    if grados_extra:
+        extra = np.stack([grados_extra[k] for k in sorted(grados_extra)], axis=1)
+        data["transaction"].x = torch.cat(
+            [data["transaction"].x, torch.tensor(extra, dtype=torch.float32)], dim=1)
+        feature_cols = feature_cols + sorted(grados_extra)
+        log.info("Grados de entidad añadidos como features: %s",
+                 sorted(grados_extra))
+
+    meta["feature_cols_gnn"] = feature_cols
+    meta["n_features_gnn"] = len(feature_cols)
+
+    # --- las aristas deben ir ORDENADAS por tiempo del origen ---------------
+    # `temporal_strategy="last"` (gnn/sampling.py) exige que, para cada nodo
+    # destino, sus aristas entrantes estén ordenadas por el tiempo del origen.
+    # Si no lo están, "los N más recientes" devuelve cualquier cosa.
+    for nombre in list(meta["entidades"]):
+        rev = (nombre, f"tiene_{nombre}", "transaction")
+        ei = data[rev].edge_index
+        t = data["transaction"].time[ei[1]]
+        orden = torch.argsort(ei[0] * (int(t.max()) + 1) + t)
+        data[rev].edge_index = ei[:, orden]
 
     torch.save(data, graph_dir / "graph.pt")
-    log.info("Grafo: %d nodos, %d aristas, %d features",
-             data.num_nodes, data.edge_index.shape[1], data.x.shape[1])
+    meta["n_aristas_total"] = int(sum(v["n_aristas"] for v in meta["entidades"].values()))
+    with open(graph_dir / "graph_meta.json", "w") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
 
-    # Columnas estructurales para el modelo tabular del sistema híbrido.
-    # Se calculan aquí porque dependen de las mismas claves de entidad, pero
-    # van a parquet y no al grafo: quien las consume (XGBoost) no carga torch.
-    from src.hybrid.features import construir, ruta
-    feats = construir(df, cfg)
-    feats.to_parquet(ruta(cfg), index=False)
-    log.info("Columnas estructurales -> %s (%d filas x %d)",
-             ruta(cfg).name, len(feats), feats.shape[1])
-    if data.x.shape[1] != cfg["gnn"]["in_dim"]:
-        log.warning("in_dim real (%d) != config (%d). Actualiza gnn.in_dim en "
-                    "config.yaml antes de entrenar.", data.x.shape[1], cfg["gnn"]["in_dim"])
+    log.info("Guardado: %d tipos de entidad, %d aristas (x2 con las inversas)",
+             len(meta["entidades"]), meta["n_aristas_total"])
+    if data["transaction"].x.shape[1] != cfg["gnn"]["in_dim"]:
+        log.warning("in_dim real (%d) != config (%d): actualiza gnn.in_dim",
+                    data["transaction"].x.shape[1], cfg["gnn"]["in_dim"])
 
 
 if __name__ == "__main__":
