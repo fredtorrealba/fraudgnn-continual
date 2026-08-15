@@ -67,7 +67,14 @@ def add_temporal_columns(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     spm = cfg["data"]["seconds_per_month"]
     # assign() en vez de dos asignaciones sueltas: insertar columnas una a una
     # en un DataFrame de 400+ columnas lo fragmenta y dispara PerformanceWarning.
+    dt = df["TransactionDT"].astype("float64")
     return df.assign(
+        # El reloj. Va AQUÍ y no en build_graph porque no tiene nada de grafo, y
+        # porque calculado allí no llegaba al parquet: la GNN sabía la hora y las
+        # cabezas tabulares no. Esa información entraba en `gnn_mas_tabular`
+        # dentro del embedding, así que parte del "aporte del grafo" era el reloj.
+        __hora_dia=(dt % 86400) / 86400.0,
+        __pos_temporal=(dt - dt.min()) / max(dt.max() - dt.min(), 1),
         month=(df["TransactionDT"] // spm).astype(int) + 1,
         # Semana relativa dentro del mes (simula el "futuro que llega" en test)
         week_in_month=(((df["TransactionDT"] % spm) // (spm // 4)) + 1)

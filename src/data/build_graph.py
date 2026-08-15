@@ -115,15 +115,7 @@ def main():
     #   · el TAMAÑO de la entidad tampoco: el muestreo capa a 10 vecinos, así
     #     que una tarjeta con 3 compras y otra con 300 le llegaban iguales.
     # Se añaden normalizadas para no descuadrar la escala del resto.
-    if cfg["graph"].get("features_derivadas", True):
-        dt = df["TransactionDT"].astype("float64")
-        hora = (dt % 86400) / 86400.0                    # hora del día en [0,1]
-        dia = (dt - dt.min()) / max(dt.max() - dt.min(), 1)   # posición temporal
-        derivadas = pd.DataFrame({"__hora_dia": hora, "__pos_temporal": dia},
-                                 index=df.index)
-        df = pd.concat([df, derivadas], axis=1)
-        feature_cols = feature_cols + ["__hora_dia", "__pos_temporal"]
-        log.info("Features temporales añadidas: __hora_dia, __pos_temporal")
+    # Las temporales ya vienen en feature_cols desde `preprocess`.
 
 
     from torch_geometric.data import HeteroData
