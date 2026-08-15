@@ -208,13 +208,21 @@ def train(model_name: str, seed: int, cfg: dict | None = None,
     else:
         pos_weight = float((y_tr == 0).sum() / max(1, (y_tr == 1).sum()))
     hd = cfg["gnn"]["hidden_dims"]
+    # GATv2 NO usa `aggr`: la atención sustituye a la agregación fija. Imprimirlo
+    # para las dos hacía creer que ambas usaban mean+max+std+sum, cuando GATv2
+    # aprende un peso por vecino. Y hay una diferencia que importa: los pesos de
+    # atención son positivos y suman 1, así que su salida siempre cae ENTRE los
+    # valores de los vecinos. La desviación típica no cae entre ellos —mide
+    # cuánto se separan— así que GATv2 no puede expresarla y GraphSAGE con `std`
+    # sí. No son dos versiones de lo mismo.
+    agreg = (f"aggr {cfg['gnn'].get('aggr', 'mean')}" if model_name == "graphsage"
+             else f"atención ({cfg['gnn'].get('gat_heads', 4)} cabezas), sin aggr")
     log.info("[%s seed=%d] %d capa(s) %d->%s->%d->1 | batch %d | pos_weight %.2f "
-             "| semillas %s | aggr %s%s",
+             "| semillas %s | %s%s",
              model_name, seed, len(hd), cfg["gnn"]["in_dim"],
              "->".join(map(str, hd)), cfg["gnn"]["mlp_head_dim"],
              cfg["gnn"]["batch_size"], pos_weight,
-             "BALANCEADAS" if balancear else "al azar",
-             cfg["gnn"].get("aggr", "mean"),
+             "BALANCEADAS" if balancear else "al azar", agreg,
              "  [SIN ARISTAS]" if cfg["gnn"].get("sin_aristas") else "")
 
     model = build_model(model_name, cfg, data.metadata()).to(device)
