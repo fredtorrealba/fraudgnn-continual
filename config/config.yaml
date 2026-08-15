@@ -205,11 +205,15 @@ gnn:
   # 12 de los 16 vCPU muestreando; los 4 restantes, para el proceso
   # principal y la GPU. El muestreo de vecinos es el cuello de botella
   # de `gnn` y `oof` (las dos etapas caras), no las multiplicaciones.
-  # 4 y no 12: medido con /proc, los 12 workers estaban DORMIDOS en las 20
-  # muestras. Llenan su cola y esperan, porque el cuello está en el proceso
-  # principal. Subirlos no aporta nada y cada uno copia el grafo.
-  num_workers: 4                   # 0 = todo en el proceso principal
-  prefetch_factor: 4               # lotes que cada worker deja listos
+  # 8. La medición que decía "los workers duermen" se hizo con batch 256, donde
+  # cada lote muestreaba ~45.000 nodos. Con batch 2048 son ~358.000 por lote:
+  # ocho veces más trabajo, y con 4 workers la GPU se quedaba sin datos —
+  # oscilaba entre 88% y 30% en vez de mantenerse.
+  # Con paralelo_optuna=2 son 2 x 8 = 16 workers sobre 16 vCPU; no están al
+  # 100% cada uno, así que la sobresuscripción es nominal.
+  num_workers: 8                   # 0 = todo en el proceso principal
+  # 8 x 8 = 64 lotes en cola por proceso: colchón de sobra para los baches.
+  prefetch_factor: 8               # lotes que cada worker deja listos
   pin_memory: true                 # copia CPU->GPU más rápida (cientos de MB/batch)
   seeds: [42, 123, 2026]           # 3 corridas por arquitectura
   gat_heads: 4
@@ -252,7 +256,13 @@ gnn:
   # A 30 trials x 2 arquitecturas la etapa `gnn` sola pasaba de 40 horas.
   # Sigue siendo búsqueda bayesiana con el mismo sampler; decláralo en la
   # memoria junto a los 30 trials que sí reciben las cabezas XGBoost.
-  optuna_trials: 12
+  # 30, los MISMOS que reciben las tres cabezas XGBoost. Estuvo en 12 mientras
+  # cada trial costaba 44 min; con batch 2048 y los estudios en paralelo bajó a
+  # ~6 min y ya no hay razón para la asimetría. Importa para la defensa: con 12
+  # se podría objetar que la GNN salió peor por haberla buscado menos.
+  # Además el MedianPruner necesita 5 trials de arranque: con 12 solo 7 eran
+  # podables, con 30 son 25 y la poda trabaja de verdad.
+  optuna_trials: 30
 
   # ── PARALELISMO de la etapa `gnn` ─────────────────────────────────────────
   # Las 8 tareas son independientes: 2 estudios de Optuna + 6 corridas que solo
