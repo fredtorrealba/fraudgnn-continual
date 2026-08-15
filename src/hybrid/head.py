@@ -84,11 +84,12 @@ def columnas(variante: str, cols_base: list[str],
              cols_embv: list[str] | None = None) -> list[str]:
     cols_emb, cols_embv = list(cols_emb or []), list(cols_embv or [])
     if variante == "control":
-        # PROVISIONAL — quita esta línea (deja `return list(cols_base)`) para
-        # que `control` reciba también el reloj. Mientras no lo tenga, parte del
-        # "aporte del grafo" será en realidad __hora_dia.
-        return [c for c in cols_base
-                if c not in ("__hora_dia", "__delta_anterior")]
+        # `control` recibe TAMBIÉN __hora_dia y __delta_anterior. El reloj no es
+        # información del grafo —sale de TransactionDT— así que dárselo solo a
+        # las cabezas con GNN inflaba la resta: de las 34 columnas de diferencia,
+        # 2 no tenían nada que ver con el vecindario. Con esto la diferencia son
+        # EXACTAMENTE los 32 del embedding, que es lo que el capstone mide.
+        return list(cols_base)
     if variante == "solo_gnn":
         # El COMPLETO: es lo único que recibe, necesita saber de sí misma
         if not cols_emb:
@@ -127,7 +128,16 @@ def cargar_tabla(cfg, oof_window: str | None) -> tuple[pd.DataFrame, list[str]]:
         cols_base = json.load(f)["feature_cols"]
 
     if oof_window:
-        oof = pd.read_parquet(proc / f"gnn_oof_{oof_window}.parquet")
+        # `embed` (una red) o `gnn_oof_*` (el esquema antiguo de K redes). Se
+        # prefiere el primero: el del OOF mezclaba los ejes de varias redes en
+        # las mismas 32 columnas y hundía las cabezas.
+        ruta = proc / "gnn_embed.parquet"
+        if not ruta.exists():
+            ruta = proc / f"gnn_oof_{oof_window}.parquet"
+            log.warning("Usando el parquet del OOF (%s): sus 32 columnas vienen "
+                        "de K redes distintas y NO son comparables entre sí. "
+                        "Corre la etapa `embed`.", ruta.name)
+        oof = pd.read_parquet(ruta)
         # EL CONTRATO: `node_idx` es el índice de FILA de full.parquet, que a su
         # vez es el índice de nodo del grafo. La unión de abajo es posicional,
         # no un join por clave, así que si `build_graph` reordenara nodos todo
@@ -150,6 +160,10 @@ def cargar_tabla(cfg, oof_window: str | None) -> tuple[pd.DataFrame, list[str]]:
         if "gnn_score" in oof.columns:
             df["gnn_score"] = np.nan
             df.loc[oof["node_idx"].values, "gnn_score"] = oof["gnn_score"].values
+        # Con `embed`, las filas que entrenaron la GNN quedan SIN embedding a
+        # propósito: llevarían uno memorizado. No son un fallo mientras las
+        # cabezas no las usen —sus ventanas son otras—, así que se informa sin
+        # alarmar.
         faltan = int(df[emb[0]].isna().sum()) if emb else 0
         log.info("embedding (%s): %d filas, %d dims%s", oof_window, len(oof),
                  len(emb),

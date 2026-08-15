@@ -76,13 +76,11 @@ class Step:
 # src/continual_learning/ se conserva intacto y se reactiva cuando haya ganador.
 CL_ACTIVO = False
 
-# FASE. En `exploracion` las etapas 6, 6a y 6b (`refit`/`oof_refit`/
-# `heads_refit`) no se corren: cuestan ~38 min y su único fin es medir el mes 6,
-# que en esta fase debe seguir sellado. El veredicto sale del MES 5 y `final`
-# lo detecta solo (no hay cabezas `_prod`). Al pasar a `produccion` se corren
-# las tres y el mes 6 se abre UNA vez.
-FASE = "exploracion"          # "exploracion" | "produccion"
-SOLO_PRODUCCION = ("refit", "oof_refit", "heads_refit")
+# La segunda pasada (`refit`/`oof_refit`/`heads_refit`) SE ELIMINÓ. Existía
+# porque la GNN y las cabezas compartían los meses 1-4: había que reentrenarlo
+# todo incorporando el mes 5. Con `ventanas` cada bloque tiene un trabajo y no
+# hay nada que reentrenar — el bloque `examen` nunca se toca hasta el informe.
+FASE = "exploracion"          # se conserva por los nombres de los informes
 
 STEPS = [
     Step("download", "[0] Descarga del dataset IEEE-CIS",
@@ -117,39 +115,21 @@ STEPS = [
               "neighbor sampling 15-10-5 (nunca ve el grafo entero). Elige la mejor "
               "por AUC walk-forward semanal. EL PASO CARO: 2-4 h con GPU. "
               "Reanudable por corrida Y por época."),
-    Step("oof", "[5a] Embedding honesto por validación cruzada (meses 1-4)",
-         "src.hybrid.oof", [("processed_dir", "gnn_oof_train.parquet"),
-                            ("reports_dir", "oof_train.json")],
-         args=["--window", "train"],
-         desc="Entrena K redes dejando un trozo fuera cada vez y saca el "
-              "embedding del excluido. Sin esto, la GNN puntuaría meses que "
-              "MEMORIZÓ y XGBoost aprendería a copiarla. ~16 min."),
+    Step("embed", "[5a] Embedding de UNA red sobre lo que no entrenó",
+         "src.hybrid.embed", [("processed_dir", "gnn_embed.parquet"),
+                              ("reports_dir", "embed.json")],
+         desc="Sustituye al OOF. Aquel entrenaba K redes y cada una describía "
+              "el trozo que no vio: honesto, pero las K aprendían ejes "
+              "DISTINTOS y las 32 columnas mezclaban idiomas (medido: la cabeza "
+              "mixta cortó en 2 árboles contra 517 del control). Con ventanas "
+              "separadas basta UNA red. ~2 min."),
     Step("heads", "[5b] Las tres cabezas XGBoost (meses 1-4)",
          "src.hybrid.train_head",
          [("models_dir", "hybrid_head_control.json"),
           ("reports_dir", "heads_variantes.json")],
-         args=["--window", "train"],
          desc="control / solo_gnn / gnn_mas_tabular con los mismos "
               "hiperparámetros y la misma ventana, para que la diferencia sea "
               "atribuible solo a las columnas. Optuna corre UNA vez. ~15 min."),
-    Step("refit", "[6] La GNN ganadora reentrenada con meses 1-5",
-         "src.gnn.refit", [("models_dir", "refit_model.pt"),
-                           ("reports_dir", "refit.json")],
-         desc="Pesos NUEVOS desde cero: el mes 5 se gastó en decidir y ahora "
-              "se incorpora. ~5 min."),
-    Step("oof_refit", "[6a] Embedding honesto sobre meses 1-5",
-         "src.hybrid.oof", [("processed_dir", "gnn_oof_trainval.parquet"),
-                            ("reports_dir", "oof_trainval.json")],
-         args=["--window", "trainval"],
-         desc="Lo mismo que `oof` en la ventana del refit. ~20 min."),
-    Step("heads_refit", "[6b] Las tres cabezas de producción (meses 1-5)",
-         "src.hybrid.train_head",
-         [("models_dir", "hybrid_head_control_prod.json"),
-          ("reports_dir", "heads_refit.json")],
-         args=["--window", "trainval"],
-         desc="Las tres DESDE CERO con meses 1-5. No hay warm start ni "
-              "checkpoints reutilizados: solo se heredan los hiperparámetros. "
-              "~12 min."),
     Step("final",
          "[7] Métricas de las 3 cabezas: por mes y " +
          ("mes 5 y mes 6" if FASE == "produccion" else "MES 5"),
@@ -164,9 +144,6 @@ STEPS = [
               "calibraciones distintas, el threshold fijo mide agresividad, "
               "no detección. ~1 min."),
 ]
-
-if FASE == "exploracion":
-    STEPS = [s for s in STEPS if s.name not in SOLO_PRODUCCION]
 
 BY_NAME = {s.name: s for s in STEPS}
 ROOT = Path(__file__).resolve().parents[1]

@@ -9,7 +9,7 @@
 # comprobar que la GPU y el sampler nativo funcionan ANTES de gastar horas.
 #
 # Reduce solo lo que no cambia los caminos de código:
-#   epochs 2 · seeds [42] · optuna_trials 2 · oof_folds 2
+#   epochs 2 · seeds [42] · optuna_trials 2
 #
 # El sandbox va a /tmp: no toca models/, reports/ ni data/ del proyecto.
 # =============================================================================
@@ -33,18 +33,24 @@ c["gnn"]["seeds"] = [42]
 c["gnn"]["patience"] = 2
 c["gnn"]["optuna_trials"] = 2
 c["xgboost"]["optuna_trials"] = 2
-c["hybrid"]["oof_folds"] = 2
+# `oof_folds` ya no se usa: la etapa `oof` la sustituyó `embed`, que entrena
+# UNA sola red. Las ventanas NO se tocan: el sintético tiene los mismos 6 meses
+# y 4 semanas que el dataset real, así que ejercita el mismo reparto que
+# producción. Si no cuadraran, `verificar()` aborta diciendo por qué.
 p.write_text(yaml.safe_dump(c, sort_keys=False, allow_unicode=True))
 print(f"  epochs={c['gnn']['epochs']} seeds={c['gnn']['seeds']} "
       f"optuna={c['gnn']['optuna_trials']}/{c['xgboost']['optuna_trials']} "
-      f"folds={c['hybrid']['oof_folds']}")
+      f"trials_xgb={c['xgboost']['optuna_trials']}")
 print(f"  INTACTOS -> device={c['xgboost']['device']} "
       f"num_workers={c['gnn']['num_workers']} n_jobs={c['compute']['n_jobs']} "
       f"batch={c['gnn']['batch_size']}")
 PY
 
 echo "== [3/4] Datos sintéticos =="
-python3 scripts/make_synthetic_demo.py --n 12000
+# 40.000 y no 12.000: con las ventanas, el bloque `examen` es 1/24 del total.
+# Con 12.000 se quedaba en ~17 fraudes y el PR-AUC era puro ruido; con 40.000
+# son ~57, suficiente para que todas las etapas ejerciten sus caminos.
+python3 scripts/make_synthetic_demo.py --n 40000
 
 echo "== [4/4] Pipeline completo =="
 t0=$(date +%s)

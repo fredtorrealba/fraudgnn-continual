@@ -42,6 +42,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from src.gnn.models import TXN, build_model
 from src.gnn.sampling import cerrar_loader, make_hetero_loader, proporcion_fraude
+from src.utils.ventanas import mascaras_grafo
 from src.utils.common import (ensure_dirs, get_device, get_logger,
                               load_config, resolve, set_seed,
                               update_state)
@@ -191,7 +192,13 @@ def train(model_name: str, seed: int, cfg: dict | None = None,
     # in_dim real puede diferir del nominal — el modelo se adapta al grafo
     cfg["gnn"]["in_dim"] = data[TXN].x.shape[1]
 
-    y_tr = data[TXN].y[data[TXN].train_mask]
+    # VENTANAS: la GNN entrena y se mide en SUS bloques, no en los splits por
+    # mes. Separarlo de las cabezas es lo que permite quitar el OOF: la red no
+    # ve las filas con las que entrenarán las cabezas, así que puede describirlas
+    # ella sola y sin trampa.
+    _v = mascaras_grafo(cfg, data)
+    m_tr, m_va = _v["gnn_entrena"], _v["gnn_valida"]
+    y_tr = data[TXN].y[m_tr]
     balancear = bool(cfg["gnn"].get("balanceo_semillas", False))
     if balancear:
         # Con los lotes ya balanceados por muestreo, aplicar además el
@@ -217,7 +224,7 @@ def train(model_name: str, seed: int, cfg: dict | None = None,
     criterion = torch.nn.BCEWithLogitsLoss(
         pos_weight=torch.tensor(pos_weight, device=device))
 
-    train_loader = make_loader(data, data[TXN].train_mask, cfg, shuffle=True,
+    train_loader = make_loader(data, m_tr, cfg, shuffle=True,
                                balancear=balancear)
     # El primer batch es la prueba de que todo se aplicó: cuántos nodos de cada
     # tipo bajó el sampler, y qué proporción de fraude tienen las semillas
@@ -227,7 +234,7 @@ def train(model_name: str, seed: int, cfg: dict | None = None,
              model_name, seed,
              " ".join(f"{nt}={_b[nt].num_nodes}" for nt in _b.node_types),
              proporcion_fraude(_b))
-    val_loader = make_loader(data, data[TXN].val_mask, cfg, shuffle=False)
+    val_loader = make_loader(data, m_va, cfg, shuffle=False)
 
     best_auc, best_state, bad_epochs, best_epoch = 0.0, None, 0, 0
     start_epoch, resumed, minutes_before = 1, False, 0.0
@@ -288,7 +295,7 @@ def train(model_name: str, seed: int, cfg: dict | None = None,
         rep = full_report(y_val, s_val, cfg["gnn"]["threshold"])
         auc = rep.get("auc_roc", 0.0)
         log.info("Época %02d | loss %.4f | val AUC %.4f | val recall %.4f "
-                 "| %.1f min", epoch, total_loss / max(1, int(data[TXN].train_mask.sum())),
+                 "| %.1f min", epoch, total_loss / max(1, int(m_tr.sum())),
                  auc, rep["recall"], (time.time() - t_epoch) / 60)
 
         if auc > best_auc:

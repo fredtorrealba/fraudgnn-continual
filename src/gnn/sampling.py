@@ -63,10 +63,28 @@ def fanouts_hetero(data, cfg: dict) -> dict:
 
         transacción -> [entidad] -> otra transacción de la misma entidad
 
-    Por eso los dos sentidos llevan valores distintos:
-      · transaction -> entidad : 1. Una transacción pertenece como mucho a UNA
-        entidad de cada tipo, así que pedir más no trae nada.
-      · entidad -> transaction : `graph.vecinos_por_entidad` (10 por defecto).
+    OJO CON LA DIRECCIÓN. `NeighborLoader` muestrea HACIA ATRÁS: para calcular
+    un nodo baja sus vecinos de ENTRADA. Así que el fanout de un tipo de arista
+    (origen, rel, destino) dice cuántos ORÍGENES se traen al expandir un
+    DESTINO — al revés de lo que sugiere leer el nombre.
+
+        ('transaction','en',entidad)      destino = entidad
+            se usa al expandir una ENTIDAD y trae TRANSACCIONES
+            -> aquí van los `vecinos_por_entidad`
+
+        (entidad,'tiene','transaction')   destino = transacción
+            se usa al expandir una TRANSACCIÓN y trae ENTIDADES
+            -> aquí va 1: una transacción pertenece a UNA entidad de cada tipo
+
+    ESTUVO AL REVÉS y anulaba el grafo entero: se pedían 10 entidades por
+    transacción (y solo hay 1) y UNA transacción por entidad, así que el
+    vecindario era de un nodo. En el log real, con 2048 semillas salían 2049
+    nodos de transacción — un vecino en total. Y con `time_attr` activo, cero.
+    La GNN llevaba TODAS las corridas heterogéneas entrenando como una MLP.
+
+    Verificado con NeighborLoader aislado, semilla t=900 sobre 10 transacciones:
+        invertido  -> [600, 900]                    1 vecino
+        correcto   -> [0, 100, ..., 900]            los 9, y solo pasado
 
     Con 5 tipos de entidad y 10 por entidad, el vecindario de una transacción es
     de hasta 50 transacciones, todas anteriores a ella.
@@ -77,7 +95,8 @@ def fanouts_hetero(data, cfg: dict) -> dict:
     por_entidad = int(cfg["graph"].get("vecinos_por_entidad", 10))
     out = {}
     for et in data.edge_types:
-        cuantos = 1 if et[0] == TXN else por_entidad
+        # et[0] == TXN  ->  ('transaction','en',entidad)  ->  expande ENTIDAD
+        cuantos = por_entidad if et[0] == TXN else 1
         out[et] = [cuantos] * n_capas
     return out
 

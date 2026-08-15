@@ -45,6 +45,7 @@ from src.hybrid.head import (VARIANTES, cargar_tabla, cols_embedding, columnas,
 from src.utils.common import (ensure_dirs, get_logger, load_config, n_jobs,
                               resolve, set_seed)
 from src.utils.metrics import full_report
+from src.utils.ventanas import verificar
 
 log = get_logger("hybrid.head")
 
@@ -116,158 +117,133 @@ def main():
         log.warning("Hay overrides por cabeza (%s). La diferencia entre cabezas "
                     "YA NO es atribuible solo a las columnas: decláralo en la "
                     "memoria.", con_override)
-    split = df["split"].values
     y_all = df["isFraud"].values.astype(int)
 
-    if args.window == "train":
-        filas_tr = np.where(split == "train")[0]
-        filas_va = np.where(split == "val")[0]
-    else:
-        filas_tr = np.where(np.isin(split, ["train", "val"]))[0]
-        filas_va = None
+    # VENTANAS. Las cabezas entrenan en `cabezas_entrenan` y validan en
+    # `cabezas_validan`, bloques distintos de los que entrenaron la GNN. Por eso
+    # el embedding que reciben es honesto (la red no memorizó esas filas) y sale
+    # todo de UNA red, no de K con ejes distintos.
+    _v = verificar(cfg, df["month"].values, df["week_in_month"].values)
+    filas_tr = np.where(_v["cabezas_entrenan"])[0]
+    filas_va = np.where(_v["cabezas_validan"])[0]
     y_tr = y_all[filas_tr]
 
-    log.info("%s: entrena %d filas (%.2f%% fraude)%s | %d tabulares + %d del embedding",
-             args.window, len(filas_tr), 100 * y_tr.mean(),
-             f" | valida {len(filas_va)}" if filas_va is not None else "",
+    # El embedding NO puede faltar en las filas que se usan: si falta, es que
+    # `embed` no cubrió estas ventanas y el modelo entrenaría con NaN.
+    if cols_emb:
+        for etq, idx in (("entrenamiento", filas_tr), ("validación", filas_va)):
+            nan = int(df.iloc[idx][cols_emb[0]].isna().sum())
+            if nan:
+                raise SystemExit(
+                    f"{nan:,} filas de {etq} no tienen embedding. Revisa que "
+                    f"`ventanas.cabezas_*` no se solape con "
+                    f"`ventanas.gnn_entrena` y vuelve a correr `embed`.")
+
+    log.info("cabezas: entrenan %d filas (%.2f%% fraude) | validan %d (%.2f%%) "
+             "| %d tabulares + %d del embedding",
+             len(filas_tr), 100 * y_tr.mean(),
+             len(filas_va), 100 * y_all[filas_va].mean(),
              len(cols_base), len(cols_emb))
 
-    # ---------- ventana train: Optuna una vez + las tres variantes ----------
-    if args.window == "train":
-        y_va = y_all[filas_va]
-        n_trials = int(cfg["xgboost"]["optuna_trials"])
-        modo = str(cfg["xgboost"].get("optuna_modo", "compartido"))
+    # ---------- Optuna una vez + las tres variantes ----------
+    y_va = y_all[filas_va]
+    n_trials = int(cfg["xgboost"]["optuna_trials"])
+    modo = str(cfg["xgboost"].get("optuna_modo", "compartido"))
 
-        def buscar(variante):
-            """Optuna sobre una cabeza concreta. Mismo sampler y mismos trials
-            para todas: es lo que hace comparables los resultados."""
-            Xt = matriz(df, filas_tr, variante, cols_base, cols_emb, cols_embv)
-            Xv = matriz(df, filas_va, variante, cols_base, cols_emb, cols_embv)
-            Xr, yr = apply_smote(Xt, y_tr, cfg)
-            est = optuna.create_study(direction="maximize",
-                                      sampler=optuna.samplers.TPESampler(seed=42))
-            # Si hay una configuración propuesta para esta cabeza, se evalúa
-            # como PRIMER trial. Así la búsqueda arranca de algo conocido y solo
-            # puede mejorarlo: si tu configuración es la mejor, gana ella.
-            semilla = (cfg["xgboost"].get("por_cabeza") or {}).get(variante) or {}
-            sembrado = {k: v for k, v in semilla.items()
-                        if k in _ESPACIO_OPTUNA}
-            if sembrado:
-                est.enqueue_trial(sembrado)
-                log.info("  '%s': se siembra la búsqueda con %s", variante, sembrado)
-            est.optimize(objective_factory(Xr.astype(np.float32), yr, Xv, y_va, cfg),
-                         n_trials=n_trials, show_progress_bar=True)
-            log.info("  '%s': mejor AUC val %.4f", variante, est.best_value)
-            del Xt, Xv, Xr
-            return dict(est.best_params), float(est.best_value)
+    def buscar(variante):
+        """Optuna sobre una cabeza concreta. Mismo sampler y mismos trials
+        para todas: es lo que hace comparables los resultados."""
+        Xt = matriz(df, filas_tr, variante, cols_base, cols_emb, cols_embv)
+        Xv = matriz(df, filas_va, variante, cols_base, cols_emb, cols_embv)
+        Xr, yr = apply_smote(Xt, y_tr, cfg)
+        est = optuna.create_study(direction="maximize",
+                                  sampler=optuna.samplers.TPESampler(seed=42))
+        # Si hay una configuración propuesta para esta cabeza, se evalúa
+        # como PRIMER trial. Así la búsqueda arranca de algo conocido y solo
+        # puede mejorarlo: si tu configuración es la mejor, gana ella.
+        semilla = (cfg["xgboost"].get("por_cabeza") or {}).get(variante) or {}
+        sembrado = {k: v for k, v in semilla.items()
+                    if k in _ESPACIO_OPTUNA}
+        if sembrado:
+            est.enqueue_trial(sembrado)
+            log.info("  '%s': se siembra la búsqueda con %s", variante, sembrado)
+        est.optimize(objective_factory(Xr.astype(np.float32), yr, Xv, y_va, cfg),
+                     n_trials=n_trials, show_progress_bar=True)
+        log.info("  '%s': mejor AUC val %.4f", variante, est.best_value)
+        del Xt, Xv, Xr
+        return dict(est.best_params), float(est.best_value)
 
-        best_por_variante, valores = {}, {}
-        if modo == "por_cabeza":
-            # Cada cabeza recibe su propia búsqueda con el MISMO presupuesto.
-            # Es más justo cuando las entradas son tan distintas (431 columnas
-            # dispersas contra 32 densas), a cambio de que la diferencia entre
-            # cabezas incluya algo de varianza de búsqueda.
-            log.info("Optuna POR CABEZA: %d trials para cada una de %s",
-                     n_trials, variantes)
-            for v in variantes:
-                best_por_variante[v], valores[v] = buscar(v)
-            best = best_por_variante[variantes[0]]
-        else:
-            v_opt = str(hcfg.get("optuna_on_variant", "control"))
-            log.info("Optuna COMPARTIDO: %d trials sobre '%s', las demás heredan",
-                     n_trials, v_opt)
-            best, valores[v_opt] = buscar(v_opt)
-            best_por_variante = {v: best for v in variantes}
-
-        resultados, t0 = {}, time.time()
+    best_por_variante, valores = {}, {}
+    if modo == "por_cabeza":
+        # Cada cabeza recibe su propia búsqueda con el MISMO presupuesto.
+        # Es más justo cuando las entradas son tan distintas (431 columnas
+        # dispersas contra 32 densas), a cambio de que la diferencia entre
+        # cabezas incluya algo de varianza de búsqueda.
+        log.info("Optuna POR CABEZA: %d trials para cada una de %s",
+                 n_trials, variantes)
         for v in variantes:
-            X_tr = matriz(df, filas_tr, v, cols_base, cols_emb, cols_embv)
-            X_va = matriz(df, filas_va, v, cols_base, cols_emb, cols_embv)
-            X_res, y_res = apply_smote(X_tr, y_tr, cfg)
-            m = _entrenar(X_res.astype(np.float32), y_res, X_va, y_va, cfg,
-                          best_por_variante[v], variante=v)
-            s_va = m.predict_proba(X_va)[:, 1]
-            # DOS puntos de operación. El fijo (0.5) queda como referencia
-            # histórica, pero NO compara: las tres cabezas tienen calibraciones
-            # distintas y a umbral fijo se mide agresividad, no detección. El
-            # mismo modelo de este proyecto pasó de F1 0.4356 a 0.5785 solo por
-            # corregir el punto de operación.
-            pct = float(hcfg.get("alert_budget_pct", 2.0))
-            thr = umbral_por_presupuesto(s_va, pct)
-            rep = full_report(y_va, s_va, thr)
-            rep["umbral"] = thr
-            rep["alertas_pct"] = round(100 * float((s_va >= thr).mean()), 2)
-            rep["a_umbral_fijo_0.5"] = full_report(y_va, s_va,
-                                                   cfg["gnn"]["threshold"])
-            rep["n_estimators"] = int(getattr(m, "best_iteration", 0) or 0) + 1
-            rep["n_columnas"] = len(columnas(v, cols_base, cols_emb, cols_embv))
-            resultados[v] = rep
-            guardar(m.get_booster(), cfg, nombre_modelo(v))
-            log.info("  %-16s %4d col | PR-AUC %.4f | ROC %.4f | recall %.4f "
-                     "@%.1f%% alertas | %d árboles",
-                     v, rep["n_columnas"], rep.get("pr_auc", float("nan")),
-                     rep.get("auc_roc", float("nan")), rep["recall"], pct,
-                     rep["n_estimators"])
-            del X_tr, X_va, X_res
+            best_por_variante[v], valores[v] = buscar(v)
+        best = best_por_variante[variantes[0]]
+    else:
+        v_opt = str(hcfg.get("optuna_on_variant", "control"))
+        log.info("Optuna COMPARTIDO: %d trials sobre '%s', las demás heredan",
+                 n_trials, v_opt)
+        best, valores[v_opt] = buscar(v_opt)
+        best_por_variante = {v: best for v in variantes}
 
-        with open(reports_dir / "heads_variantes.json", "w") as f:
-            json.dump({"best_params": best,
-                       "optuna_modo": modo,
-                       "best_por_variante": best_por_variante,
-                       "auc_optuna": valores,
-                       "variantes": resultados,
-                       "minutos": round((time.time() - t0) / 60, 1),
-                       "nota": ("optuna_modo='por_cabeza': cada cabeza "
-                                "recibió su propia búsqueda con el MISMO número "
-                                "de trials y el mismo sampler. "
-                                "optuna_modo='compartido': Optuna corrió una vez "
-                                "sobre la más pequeña y las demás heredaron, lo "
-                                "que hace de cualquier ventaja una cota inferior "
-                                "conservadora.")}, f, indent=2, ensure_ascii=False)
-        log.info("Variantes -> heads_variantes.json")
-        return resultados
-
-    # ---------- ventana trainval: las tres DESDE CERO con meses 1-5 ---------
-    with open(reports_dir / "heads_variantes.json") as f:
-        prev = json.load(f)
-    best_por_variante = prev.get("best_por_variante") or {}
-    best_global = prev["best_params"]
-    t0 = time.time()
-
-    informe = {"n_filas": int(len(filas_tr)), "variantes": {}}
+    resultados, t0 = {}, time.time()
     for v in variantes:
-        # n_estimators heredado del early stopping que ESA variante hizo sobre
-        # el mes 5: aquí ya no hay conjunto de validación con que pararse.
-        n_est = prev["variantes"].get(v, {}).get("n_estimators")
-        if not n_est:
-            log.warning("Sin n_estimators previo para '%s': se omite", v)
-            continue
-        log.info("Reentrenando '%s' DESDE CERO con meses 1-5 (%d árboles)", v, n_est)
-        X_res, y_res = apply_smote(matriz(df, filas_tr, v, cols_base, cols_emb, cols_embv),
-                                   y_tr, cfg)
-        m = _entrenar(X_res.astype(np.float32), y_res, None, None, cfg,
-                      best_por_variante.get(v, best_global),
-                      n_est=n_est, variante=v)
-        guardar(m.get_booster(), cfg, nombre_modelo(v, "_prod"))
-        informe["variantes"][v] = {"n_estimators": int(n_est),
-                                   "n_columnas": len(columnas(v, cols_base, cols_emb, cols_embv))}
-        del X_res
-
-        # umbral operativo por presupuesto de alertas, medido en el mes 5
-        filas_v5 = np.where(split == "val")[0]
-        s_v5 = m.predict_proba(matriz(df, filas_v5, v, cols_base, cols_emb, cols_embv))[:, 1]
+        X_tr = matriz(df, filas_tr, v, cols_base, cols_emb, cols_embv)
+        X_va = matriz(df, filas_va, v, cols_base, cols_emb, cols_embv)
+        X_res, y_res = apply_smote(X_tr, y_tr, cfg)
+        m = _entrenar(X_res.astype(np.float32), y_res, X_va, y_va, cfg,
+                      best_por_variante[v], variante=v)
+        s_va = m.predict_proba(X_va)[:, 1]
+        # DOS puntos de operación. El fijo (0.5) queda como referencia
+        # histórica, pero NO compara: las tres cabezas tienen calibraciones
+        # distintas y a umbral fijo se mide agresividad, no detección. El
+        # mismo modelo de este proyecto pasó de F1 0.4356 a 0.5785 solo por
+        # corregir el punto de operación.
         pct = float(hcfg.get("alert_budget_pct", 2.0))
-        thr = umbral_por_presupuesto(s_v5, pct)
-        informe["variantes"][v]["umbral"] = thr
-        informe["variantes"][v]["alertas_mes5_pct"] = round(
-            100 * float((s_v5 >= thr).mean()), 2)
+        thr = umbral_por_presupuesto(s_va, pct)
+        rep = full_report(y_va, s_va, thr)
+        rep["umbral"] = thr
+        rep["alertas_pct"] = round(100 * float((s_va >= thr).mean()), 2)
+        rep["a_umbral_fijo_0.5"] = full_report(y_va, s_va,
+                                               cfg["gnn"]["threshold"])
+        rep["n_estimators"] = int(getattr(m, "best_iteration", 0) or 0) + 1
+        rep["n_columnas"] = len(columnas(v, cols_base, cols_emb, cols_embv))
+        resultados[v] = rep
+        guardar(m.get_booster(), cfg, nombre_modelo(v))
+        log.info("  %-16s %4d col | PR-AUC %.4f | ROC %.4f | recall %.4f "
+                 "@%.1f%% alertas | %d árboles",
+                 v, rep["n_columnas"], rep.get("pr_auc", float("nan")),
+                 rep.get("auc_roc", float("nan")), rep["recall"], pct,
+                 rep["n_estimators"])
+        del X_tr, X_va, X_res
 
-    informe["minutos"] = round((time.time() - t0) / 60, 1)
-    with open(reports_dir / "heads_refit.json", "w") as f:
-        json.dump(informe, f, indent=2, ensure_ascii=False)
-    log.info("Cabezas de producción listas -> heads_refit.json")
-    return informe
+    with open(reports_dir / "heads_variantes.json", "w") as f:
+        json.dump({"best_params": best,
+                   "optuna_modo": modo,
+                   "best_por_variante": best_por_variante,
+                   "auc_optuna": valores,
+                   "variantes": resultados,
+                   "minutos": round((time.time() - t0) / 60, 1),
+                   "nota": ("optuna_modo='por_cabeza': cada cabeza "
+                            "recibió su propia búsqueda con el MISMO número "
+                            "de trials y el mismo sampler. "
+                            "optuna_modo='compartido': Optuna corrió una vez "
+                            "sobre la más pequeña y las demás heredaron, lo "
+                            "que hace de cualquier ventaja una cota inferior "
+                            "conservadora.")}, f, indent=2, ensure_ascii=False)
+    log.info("Variantes -> heads_variantes.json")
+    return resultados
 
+    # Ya no hay segunda pasada. El diseño de dos ventanas (`train` y luego
+    # `trainval` con el refit) venía de cuando la GNN y las cabezas
+    # compartían meses: había que reentrenar todo incorporando el mes 5.
+    # Con `ventanas`, cada bloque tiene un trabajo y las cabezas se entrenan
+    # UNA vez sobre `cabezas_entrenan`.
 
 if __name__ == "__main__":
     main()

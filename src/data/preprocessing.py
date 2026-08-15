@@ -165,22 +165,47 @@ def main():
     df = load_raw(raw_dir)
     df = add_temporal_columns(df, cfg)
 
-    train_months = set(cfg["data"]["train_months"])
-    train_mask = df["month"].isin(train_months)
+    # MESES EN JUEGO. Por defecto, los que usan las `ventanas`. Los demás se
+    # descartan aquí y no llegan a existir: así ninguna estadística, mapa de
+    # categorías ni mediana puede calcularse con ellos por descuido.
+    from src.utils.ventanas import verificar
+    v_all = verificar(cfg, df["month"].values, df["week_in_month"].values)
+    usados = np.logical_or.reduce(list(v_all.values()))
+    meses = cfg["data"].get("meses") or sorted(
+        np.unique(df["month"].values[usados]).tolist())
+    antes = len(df)
+    df = df[df["month"].isin(meses)].reset_index(drop=True)
+    log.info("Meses en juego %s: %d de %d transacciones (%d descartadas)",
+             meses, len(df), antes, antes - len(df))
+
+    # EL AJUSTE VA SOLO CON DATOS DE ENTRENAMIENTO. El codificador de
+    # categóricas y las medianas de imputación son PARTE DEL MODELO: ajustarlos
+    # con datos de validación o de examen es fuga.
+    #
+    # Antes se usaba `train_months` = meses 1-4. Con las ventanas, el bloque de
+    # examen es el mes 2 semana 4, así que su codificación se calculaba con
+    # estadísticas de los meses 3 y 4 — POSTERIORES a él. Fuga temporal que no
+    # rompe nada y falsea los resultados.
+    v = verificar(cfg, df["month"].values, df["week_in_month"].values)
+    train_mask = pd.Series(v["gnn_entrena"] | v["cabezas_entrenan"],
+                           index=df.index)
+    log.info("Codificadores e imputación ajustados con %d filas "
+             "(gnn_entrena + cabezas_entrenan), no con el dataset entero",
+             int(train_mask.sum()))
     df, feature_cols = encode_and_impute(df, train_mask, cfg)
 
-    # Asignación de split, en una sola pasada (np.select en vez de 4
-    # asignaciones sucesivas, que volverían a fragmentar el frame).
+    # `split` se conserva por compatibilidad con informes antiguos, pero quien
+    # manda son las `ventanas`: ningún módulo del pipeline lo usa ya.
     df["split"] = np.select(
-        [df["month"].isin(train_months),
+        [df["month"].isin(set(cfg["data"]["train_months"])),
          df["month"] == cfg["data"]["val_month"],
          df["month"] == cfg["data"]["test_month"]],
-        ["train", "val", "test"], default="other")
-    df = df[df["split"] != "other"].reset_index(drop=True)
+        ["train", "val", "test"], default="otro")
 
-    ratio = (df.loc[df.split == "train", "isFraud"] == 0).sum() / max(
-        1, (df.loc[df.split == "train", "isFraud"] == 1).sum())
-    log.info("Desbalance en TRAIN: %.1f legítimas por fraude (pos_weight)", ratio)
+    y_tr = df.loc[train_mask, "isFraud"]
+    ratio = (y_tr == 0).sum() / max(1, (y_tr == 1).sum())
+    log.info("Desbalance en las ventanas de entrenamiento: %.1f legítimas "
+             "por fraude (pos_weight)", ratio)
 
     df.to_parquet(out_dir / "full.parquet", index=False)
     with open(out_dir / "feature_cols.json", "w") as f:

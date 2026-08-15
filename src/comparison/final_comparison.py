@@ -30,7 +30,6 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from src.utils.omp import guard_omp
@@ -38,12 +37,13 @@ from src.utils.omp import guard_omp
 guard_omp()   # antes de importar xgboost (SIGSEGV en macOS si torch ya está)
 
 from src.hybrid.head import (cargar, cargar_tabla, cols_embedding,  # noqa: E402
-                             columnas, matriz, nombre_modelo,
+                             columnas, nombre_modelo,
                              umbral_por_presupuesto)
 from src.utils.common import (ensure_dirs, get_logger, load_config,  # noqa: E402
                               resolve)
 from sklearn.metrics import average_precision_score  # noqa: E402
 from src.utils.metrics import full_report  # noqa: E402
+from src.utils.ventanas import verificar  # noqa: E402
 
 log = get_logger("comparison")
 
@@ -177,24 +177,19 @@ def main():
     # producción se cae al modo exploración, que mide el MES 5 y no mira el 6.
     modelos_dir = resolve(cfg, "models_dir")
     variantes = [str(x) for x in hcfg.get("variantes", ())]
-    produccion = any((modelos_dir / nombre_modelo(v, "_prod")).exists()
-                     for v in variantes)
-    sufijo, ventana = ("_prod", "trainval") if produccion else ("", "train")
-    corte = "mes6" if produccion else "mes5"
+    sufijo, corte = "", "examen"     # el veredicto sale del bloque SELLADO
     log.info("=" * 62)
-    if produccion:
-        log.info("MODO PRODUCCIÓN — cabezas de meses 1-5, veredicto en el MES 6")
-    else:
-        log.info("MODO EXPLORACIÓN — cabezas de meses 1-4, veredicto en el MES 5")
-        log.info("  el mes 6 NO se evalúa: sigue sellado hasta que haya ganador")
-        log.info("  las cifras del mes 5 son de SELECCIÓN, no finales: ese mes")
-        log.info("  ya eligió arquitectura, nº de árboles y umbral")
+    log.info("Veredicto sobre la ventana `examen`, que no entrenó ni validó nada.")
+    log.info("  `cabezas_validan` se informa aparte: eligió nº de árboles y")
+    log.info("  umbral, así que sus cifras son de SELECCIÓN, no finales.")
 
-    df, cols_base = cargar_tabla(cfg, ventana)
+    df, cols_base = cargar_tabla(cfg, "train")
     cols_emb = cols_embedding(df, "completo")
     cols_embv = cols_embedding(df, "vecinos")
-    split = df["split"].values
-    mes = df["month"].values
+    # VENTANAS: el veredicto sale de `examen`, un bloque que no entrenó ni
+    # validó nada. `cabezas_validan` se informa aparte porque eligió el nº de
+    # árboles y el umbral: sus cifras son de SELECCIÓN, no finales.
+    _v = verificar(cfg, df["month"].values, df["week_in_month"].values)
     y_all = df["isFraud"].values.astype(int)
 
     # --- puntuar TODO el dataset con cada cabeza de producción -------------
@@ -238,54 +233,32 @@ def main():
         scores["gnn_sola"] = df["gnn_score"].fillna(0.0).values.astype(np.float64)
         log.info("'gnn_sola' añadida como referencia (el gnn_score del OOF)")
 
-    meses_txt = "meses 1-5" if produccion else "meses 1-4"
-    resultado = {"modo": "produccion" if produccion else "exploracion",
+    meses_txt = "la ventana cabezas_entrenan"
+    resultado = {"modo": "ventanas",
                  "corte_del_veredicto": corte,
                  "nota": (f"Las tres cabezas comparten ventana ({meses_txt}), "
                           "hiperparámetros y SMOTE: la diferencia es atribuible "
                           "solo a las columnas. 'gnn_sola' es la red decidiendo "
                           "por su cuenta, sin XGBoost: va como referencia, no "
                           "como competidora."),
-                 "por_mes": {}, "mes5": {}, "mes6": {}}
-    if not produccion:
-        resultado["aviso"] = (
-            "MODO EXPLORACIÓN. El mes 6 no se evaluó: sigue sellado. El "
-            "veredicto sale del mes 5, que es también el mes que eligió "
-            "arquitectura, nº de árboles y umbral — sus cifras son OPTIMISTAS "
-            "en términos absolutos. La COMPARACIÓN entre cabezas sí es válida: "
-            "las tres recibieron el mismo presupuesto de búsqueda sobre el "
-            "mismo mes, así que el sesgo las afecta por igual.")
+                 "cabezas_validan": {}, "examen": {}}
+    resultado["aviso"] = (
+        "El bloque `examen` no entrenó ni validó nada: su cifra es limpia. "
+        "El bloque `cabezas_validan` sí eligió el nº de árboles y el umbral, "
+        "así que sus cifras son OPTIMISTAS en términos absolutos — se informan "
+        "para diagnóstico, no como resultado. La COMPARACIÓN entre cabezas es "
+        "válida en ambos: las tres reciben las mismas filas, las mismas "
+        "ventanas y el mismo presupuesto de búsqueda.")
 
-    # --- métricas POR MES --------------------------------------------------
-    log.info("=" * 62)
-    log.info("MÉTRICAS POR MES  (los meses 1-5 son IN-SAMPLE: el modelo "
-             "entrenó con ellos)")
-    meses_test = set(np.unique(mes[split == "test"]).tolist())
-    for m in sorted(np.unique(mes)):
-        if not produccion and m in meses_test:
-            continue                      # el mes 6 sellado: ni se puntúa
-        sel = mes == m
-        y = y_all[sel]
-        if y.sum() == 0:
-            continue
-        en_train = bool(np.isin(split[sel], ["train", "val"]).any())
-        fila = {"n": int(sel.sum()), "n_fraud": int(y.sum()),
-                "in_sample": en_train, "modelos": {}}
-        for v, s in scores.items():
-            thr = umbral_por_presupuesto(s[sel], pct)
-            fila["modelos"][v] = _confusion(y, s[sel], thr)
-        resultado["por_mes"][int(m)] = fila
-        marca = "IN-SAMPLE" if en_train else "fuera de muestra"
-        log.info("  mes %d (%6d txn, %4d fraudes, %-16s) %s", m, sel.sum(),
-                 y.sum(), marca,
-                 " | ".join(f"{v} PR {fila['modelos'][v].get('pr_auc', 0):.4f}"
-                            for v in scores))
+    # Las métricas POR MES se eliminaron: con las `ventanas` el experimento vive
+    # en dos meses, y una tabla de dos filas donde los bloques de entrenamiento
+    # salen inflados por construcción no informa de nada. Lo que importa son las
+    # dos ventanas que no entrenaron: `cabezas_validan` (diagnóstico) y `examen`
+    # (el veredicto).
 
-    # --- mes 5 y mes 6 en detalle -----------------------------------------
-    cortes = (("mes5", "val"), ("mes6", "test")) if produccion \
-        else (("mes5", "val"),)
+    cortes = (("cabezas_validan", "cabezas_validan"), ("examen", "examen"))
     for etiqueta, clave in cortes:
-        sel = split == clave
+        sel = _v[clave]
         y = y_all[sel]
         if not sel.any():
             continue
@@ -360,9 +333,7 @@ def main():
             "nota": (f"Ambas con {meses_txt} y mismos hiperparámetros: la "
                      "diferencia es el aporte del grafo, sin confundirlo con "
                      "la ventana de entrenamiento."
-                     + ("" if produccion else " Medido en el mes 5, que "
-                        "también sirvió para seleccionar: sirve para ordenar "
-                        "las cabezas, no como cifra final.")),
+                     ),
         }
         log.info("=" * 62)
         log.info("APORTE DEL GRAFO (%s): %.4f - %.4f = %+.4f",
@@ -372,7 +343,7 @@ def main():
 
         # ¿Ese delta sobrevive al ruido del mes? Sin esto, un +0.004 y un
         # +0.04 se leen igual en el informe.
-        sel_v = split == ("test" if produccion else "val")
+        sel_v = _v["examen"]
         bs = bootstrap_delta(y_all[sel_v], scores["control"][sel_v],
                              scores["gnn_mas_tabular"][sel_v])
         resultado["atribucion"]["bootstrap"] = bs
@@ -397,8 +368,7 @@ def main():
                      e["embedding_totales"])
 
     # Fichero distinto: un informe de exploración NO debe pisar el definitivo.
-    salida = reports_dir / ("final_comparison.json" if produccion
-                            else "exploracion_mes5.json")
+    salida = reports_dir / "final_comparison.json"
     with open(salida, "w") as f:
         json.dump(resultado, f, indent=2, ensure_ascii=False)
     log.info("-> %s", salida)

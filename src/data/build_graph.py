@@ -51,6 +51,30 @@ from src.utils.common import ensure_dirs, get_logger, load_config, resolve
 log = get_logger("build_graph")
 
 
+def _previas_por_entidad(ent_idx: np.ndarray, tiempo: np.ndarray) -> np.ndarray:
+    """
+    Cuántas transacciones ANTERIORES tiene cada fila dentro de su entidad.
+
+    El conteo total (`bincount`) mira al futuro: una transacción de enero
+    llevaba el número de compras que su tarjeta acumularía hasta junio. Es una
+    fuga que no rompe nada y falsea el resultado, justo el tipo que hay que
+    cazar a mano.
+
+    Se ordena por (entidad, tiempo) y la posición dentro del grupo ES el número
+    de anteriores. Vectorizado: con 500.000 filas un bucle en Python tardaría
+    más que el resto de la etapa.
+    """
+    orden = np.lexsort((tiempo, ent_idx))       # primero por entidad, luego por tiempo
+    e = ent_idx[orden]
+    # inicio de cada grupo dentro del array ordenado
+    nuevo_grupo = np.r_[True, e[1:] != e[:-1]]
+    inicio = np.repeat(np.flatnonzero(nuevo_grupo), np.diff(
+        np.r_[np.flatnonzero(nuevo_grupo), len(e)]))
+    previas = np.empty(len(e), dtype=np.int64)
+    previas[orden] = np.arange(len(e)) - inicio
+    return previas
+
+
 def clave_entidad(df: pd.DataFrame, spec: dict) -> pd.Series:
     """
     Clave de una entidad, o NaN si le falta algún componente.
@@ -143,26 +167,58 @@ def main():
              n_txn, tope)
     grados_extra: dict[str, np.ndarray] = {}
 
+    # MESES DEL GRAFO. Por defecto, solo los que alguna ventana usa. Construir
+    # entidades y aristas sobre meses que nadie mira cuesta tiempo y memoria,
+    # pero sobre todo METE FUTURO: el `__grado_*` contaba las transacciones de
+    # la entidad en los SEIS meses, así que una fila del mes 1 llevaba un grado
+    # que incluía su actividad del mes 6. Los nodos de transacción se conservan
+    # todos (node_idx es el índice de fila de full.parquet, contrato implícito);
+    # lo que se limita son las ARISTAS y los grados.
+    meses_grafo = cfg["graph"].get("meses")
+    if not meses_grafo:
+        from src.utils.ventanas import verificar
+        v = verificar(cfg, df["month"].values, df["week_in_month"].values)
+        import numpy as _np
+        meses_grafo = sorted(_np.unique(
+            df["month"].values[_np.logical_or.reduce(list(v.values()))]).tolist())
+    en_juego = df["month"].isin(meses_grafo).values
+    log.info("Grafo sobre los meses %s: %d de %d transacciones "
+             "(el resto queda sin aristas)",
+             meses_grafo, int(en_juego.sum()), len(df))
+
     for nombre, spec in cfg["graph"]["entidades"].items():
         claves = clave_entidad(df, spec)
-        presentes = claves.notna()
+        presentes = claves.notna() & en_juego
         if not presentes.any():
             log.warning("Entidad '%s': ninguna fila la tiene, se omite", nombre)
             continue
 
         codigos, unicas = pd.factorize(claves[presentes], sort=False)
-        tam = np.bincount(codigos, minlength=len(unicas))
+        filas_pres = np.where(presentes.values)[0]
 
-        # PODA: una entidad con miles de transacciones tendría como vector la
-        # media del dataset entero, y ese vector se repartiría a todos sus
-        # vecinos borrando las diferencias en vez de crearlas (over-smoothing
-        # por hub). Además explota la memoria al muestrear.
-        gigantes = tam > tope
-        n_podadas = int(gigantes.sum())
-        vivas = ~gigantes[codigos]
+        # PODA CAUSAL. Una entidad con miles de transacciones tendría como vector
+        # la media del dataset entero, y ese vector se repartiría a todos sus
+        # vecinos borrando las diferencias en vez de crearlas (over-smoothing por
+        # hub). Además explota la memoria al muestrear.
+        #
+        # Pero el corte se aplica POR TRANSACCIÓN y en su momento, no a la
+        # entidad entera. Antes se sumaban todas sus filas del periodo y, si el
+        # total pasaba del tope, se borraba la entidad COMPLETA: una tarjeta con
+        # 12 compras en enero y 600 en febrero perdía también las de enero, que
+        # eran perfectamente normales. Futuro decidiendo el pasado.
+        #
+        # `previas` es el número de transacciones ANTERIORES de esa entidad, así
+        # que sirve para las dos cosas: cortar aquí y ser el `__grado_*` de más
+        # abajo. Se calcula una sola vez.
+        previas = _previas_por_entidad(
+            codigos, df["TransactionDT"].values[filas_pres])
+        vivas = previas <= tope
+        n_podadas = int((~vivas).sum())
+        n_ent_afectadas = int(len(np.unique(codigos[~vivas]))) if n_podadas else 0
 
-        filas = np.where(presentes.values)[0][vivas]
+        filas = filas_pres[vivas]
         ent_idx = codigos[vivas]
+        previas_vivas = previas[vivas]
         # renumerar tras la poda para no dejar huecos
         remap, ent_idx = np.unique(ent_idx, return_inverse=True)
 
@@ -179,24 +235,35 @@ def main():
         # a 10 en el muestreo. Es lo que le permite a la red aprender lo que
         # daban las columnas C (conteos por entidad).
         if cfg["graph"].get("features_derivadas", True):
-            grado = np.bincount(ent_idx, minlength=len(remap))[ent_idx]
+            # CAUSAL: cuántas transacciones ANTERIORES tiene la entidad, no
+            # cuántas tiene en total. El conteo total mira al futuro —una fila
+            # de enero llevaba el grado que su tarjeta alcanzaría en junio— y
+            # eso es una fuga que no rompe nada y falsea los resultados.
+            grado = previas_vivas          # ya calculado para la poda
             col = np.zeros(n_txn, dtype=np.float32)
             col[filas] = np.log1p(grado)          # log: los hubs no dominan
             grados_extra[f"__grado_{nombre}"] = col
 
-        cob = len(filas) / n_txn
+        # Contra las transacciones EN JUEGO, no contra las 582.429 del dataset:
+        # los meses fuera de las ventanas están excluidos por diseño y dividir
+        # por ellos hacía parecer que uid cubría un 34% cuando cubre el 89%.
+        cob = len(filas) / max(int(en_juego.sum()), 1)
         meta["entidades"][nombre] = {
             "columnas": spec["cols"], "usa_d1": bool(spec.get("usa_d1")),
             "n_nodos": int(len(remap)), "n_aristas": int(len(filas)),
             "cobertura": round(cob, 4),
-            "podadas_por_grado": n_podadas,
+            # Ahora se podan TRANSACCIONES (las que llegan pasado el tope),
+            # no entidades enteras. `entidades_afectadas` dice a cuántas.
+            "txn_podadas_por_grado": n_podadas,
+            "entidades_afectadas": n_ent_afectadas,
             "txn_por_entidad_media": round(len(filas) / max(len(remap), 1), 1),
             "degenerada": bool(len(filas) / max(len(remap), 1) < 2),
         }
         media = len(filas) / max(len(remap), 1)
         log.info("  %-7s %7d nodos | %7d aristas | cobertura %5.1f%% | "
-                 "%4.1f txn/entidad | %d podadas",
-                 nombre, len(remap), len(filas), 100 * cob, media, n_podadas)
+                 "%4.1f txn/entidad | %d txn podadas en %d entidades",
+                 nombre, len(remap), len(filas), 100 * cob, media,
+                 n_podadas, n_ent_afectadas)
         # Una entidad con ~1 transacción por grupo NO CONECTA NADA: cada
         # transacción cuelga de su propio nodo y el paso de mensajes no
         # transporta información de nadie. Suele significar que la clave es

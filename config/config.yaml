@@ -54,6 +54,12 @@ data:
   # División temporal estricta (walk-forward, sin data leakage)
   # TransactionDT es segundos desde un t0 de referencia -> mes = DT // (86400*30)
   seconds_per_month: 2592000       # 86400 * 30
+  # Meses que llegan a full.parquet. Vacío = los que usan las `ventanas`.
+  # Descartarlos aquí, y no más adelante, es lo que garantiza que ninguna
+  # estadística (mapa de categorías, mediana de imputación) pueda calcularse
+  # con meses que el experimento no usa.
+  meses: []
+
   train_months: [1, 2, 3, 4]       # entrenamiento original (~470K txn)
   val_month: 5                     # validación
   test_month: 6                    # test -> se divide en semanas ("futuro que llega")
@@ -87,6 +93,14 @@ graph:
   # media del dataset entero y se repartiría a todos sus vecinos, borrando
   # diferencias en vez de crearlas. Distinto de un tope por nodo: limita el
   # tamaño de la ENTIDAD.
+  # Meses sobre los que se construye el grafo. Vacío = los que usan las
+  # `ventanas`. Limitarlo no es solo velocidad: el `__grado_*` contaba las
+  # transacciones de la entidad en TODO el dataset, así que una fila de enero
+  # llevaba el grado que su tarjeta alcanzaría en junio — futuro metido en una
+  # feature. Los nodos de transacción se conservan todos (node_idx es el índice
+  # de fila de full.parquet); lo que se limita son las aristas y los grados.
+  meses: []                        # [] = deducido de `ventanas`
+
   max_entity_degree: 500
   vecinos_por_entidad: 10          # cuántas transacciones trae cada entidad
   # Features derivadas, para recuperar lo que daban las columnas C (conteos) y
@@ -120,6 +134,48 @@ graph:
   #
   # Este flag solo controla los __grado_*; las dos de preprocess van siempre.
   features_derivadas: true
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VENTANAS TEMPORALES — qué filas hace cada trabajo
+#
+# El diseño anterior entrenaba la GNN y las cabezas con los MISMOS meses 1-4, y
+# por eso hacía falta el OOF: la red memorizaba esos meses, así que K redes se
+# repartían el trabajo de describirlos. Pero cada una de esas K redes aprende sus
+# propios pesos, y la dimensión 7 de su embedding mide algo distinto en cada una.
+# XGBoost aprendía cortes sobre unos ejes y los aplicaba sobre otros.
+#     MEDIDO: gnn_mas_tabular cortó en 2 árboles (control: 517) y su PR-AUC
+#     cayó de 0.4803 a 0.1159. No es que el grafo no aporte: es que las
+#     columnas estaban revueltas.
+#
+# Aquí la GNN entrena en un bloque y las cabezas en OTRO. Una sola red describe
+# todo lo que las cabezas ven, nunca lo memorizó, y las 32 columnas significan lo
+# mismo en toda la tabla. El OOF desaparece.
+#
+# PILOTO (2 meses de los 6). Cada bloque UN trabajo, sin solaparse:
+#   gnn_entrena       ~65.500 txn    entrena las 6 redes
+#   gnn_valida        ~32.700 txn    elige cuál gana
+#   cabezas_entrenan  ~77.700 txn    entrena las 3 cabezas
+#   cabezas_validan   ~22.500 txn    nº de árboles y umbral
+#   examen            ~22.500 txn    el número final
+#
+# Cada bloque queda con ~1.374 fraudes -> IC95 ~±0.10. Con un solo mes serían
+# ~810 y ±0.13: el ruido tapaba cualquier diferencia pequeña.
+#
+# PARA ESCALAR al diseño completo, cambia solo esto (y quita `semanas`):
+#   gnn_entrena:      {mes: 1}   ... o una lista de meses
+#   cabezas_entrenan: [{mes: 3}, {mes: 4}]
+#   cabezas_validan:  {mes: 5}
+#   examen:           {mes: 6}
+#
+# Los meses 3-6 quedan INTACTOS en el piloto: el examen de verdad sigue siendo
+# el mes 6, y no se toca hasta la corrida completa.
+# ═══════════════════════════════════════════════════════════════════════════
+ventanas:
+  gnn_entrena:      {mes: 1, semanas: [1, 2]}
+  gnn_valida:       {mes: 1, semanas: [3]}
+  cabezas_entrenan: [{mes: 1, semanas: [4]}, {mes: 2, semanas: [1, 2]}]
+  cabezas_validan:  {mes: 2, semanas: [3]}
+  examen:           {mes: 2, semanas: [4]}
 
 gnn:
   # SOLO informativo: el ancho real lo lee cada entrenamiento del propio
@@ -391,22 +447,6 @@ hybrid:
                                    # así la ventaja de las otras es una cota
                                    # inferior conservadora, no atacable por
                                    # hiperparámetros
-  # Umbral por VOLUMEN de alertas, no fijo. La GNN entrena con pos_weight ~27
-  # (scores inflados) y la cabeza devuelve probabilidades calibradas ~3%: con
-  # 0.5 el híbrido no alertaría casi nada y ningún ciclo de CL desplegaría.
-  # La GNN entrega hoy UN escalar (gnn_score) contra 431 columnas tabulares.
-  # Con esto se entrena además una variante que recibe el EMBEDDING entero: el
-  # vector de la última capa (431+8+dim columnas; con hidden_dims [256] son
-  # 695). El número de variante se calcula solo a partir de hidden_dims.
-  # Coste: el parquet del OOF pasa de ~4 MB a ~500 MB y XGBoost entrena sobre
-  # 695 columnas. Ponlo en false para volver al comportamiento anterior.
-  usar_embedding: true
-  # OBSOLETO desde que cada variante elige su embedding:
-  #   solo_gnn         usa emb_*   (completo: es lo único que recibe)
-  #   gnn_mas_tabular  usa embv_*  (vecinos: las propias ya van en el tabular)
-  # Ya no hay un modo global que pueda quedarse mal puesto. Se conserva la clave
-  # porque el continual learning la leerá cuando se reactive.
-  embedding_modo: "vecinos"
   alert_budget_pct: 2.0            # % del mes que se marca para revisión
   cl_head:
     # Warm start de la cabeza en cada ciclo: la mezcla 40/60 son ~20 filas, así

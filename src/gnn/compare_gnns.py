@@ -38,6 +38,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from src.gnn.sampling import cerrar_loader  # noqa: E402
+from src.utils.ventanas import mascaras_grafo  # noqa: E402
 from src.utils.common import (ensure_dirs, get_device, get_logger, load_config,
                               load_state, resolve, state_path, update_state)
 
@@ -280,7 +281,9 @@ def buscar_hiperparametros(model_name: str, cfg) -> dict:
     n_trials = int(cfg["gnn"].get("optuna_trials", 30))
     data = torch.load(resolve(cfg, "graph_dir") / "graph.pt", weights_only=False)
     device = get_device()
-    y_val = data["transaction"].y[data["transaction"].val_mask].numpy()
+    _v = mascaras_grafo(cfg, data)
+    _m_tr, _m_va = _v["gnn_entrena"], _v["gnn_valida"]
+    y_val = data["transaction"].y[_m_va].numpy()
 
     def objetivo(trial):
         c = json.loads(json.dumps(cfg))          # copia profunda por trial
@@ -306,8 +309,8 @@ def buscar_hiperparametros(model_name: str, cfg) -> dict:
         opt = torch.optim.Adam(modelo.parameters(), lr=g["lr"], weight_decay=wd)
         crit = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pw, device=device))
 
-        tr = make_loader(data, data["transaction"].train_mask, c, True, balancear)
-        va = make_loader(data, data["transaction"].val_mask, c, False)
+        tr = make_loader(data, _m_tr, c, True, balancear)
+        va = make_loader(data, _m_va, c, False)
         # try/finally OBLIGATORIO: el pruner sale por excepción, y sin cerrar
         # los workers cada trial dejaría 12 procesos vivos hasta el final del
         # proceso. Con 30 trials x 2 arquitecturas son 720 procesos colgados.
@@ -412,7 +415,8 @@ def weekly_val_aucs(model_name: str, seed: int, cfg) -> list[float]:
     model.load_state_dict(ckpt["state_dict"])
     cfg = c                                   # el scorer usa el mismo cfg
 
-    val_nodes = torch.where(data["transaction"].val_mask)[0].numpy()
+    # La selección se mide en `gnn_valida`, que la red NO vio.
+    val_nodes = torch.where(mascaras_grafo(cfg, data)["gnn_valida"])[0].numpy()
     scores = score_nodes(model, data, val_nodes, cfg)
     y = data["transaction"].y.numpy()[val_nodes]
     weeks = data["transaction"].week_in_month.numpy()[val_nodes]
