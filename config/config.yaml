@@ -21,7 +21,7 @@ compute:
   # el kNN de SMOTE (594.273 x 95) y las partes de XGBoost que no van
   # en GPU. Durante `gnn` no compite con num_workers: el DataLoader
   # fija set_num_threads(1) dentro de cada worker (verificado).
-  n_jobs: 5                        # 6 vCPU menos 1 para el SO
+  n_jobs: 14                       # 16 vCPU menos 2 para el SO
 
 paths:
   raw_dir: "data/raw"              # train_transaction.csv + train_identity.csv (IEEE-CIS)
@@ -267,9 +267,9 @@ gnn:
   # oscilaba entre 88% y 30% en vez de mantenerse.
   # Con paralelo_optuna=2 son 2 x 8 = 16 workers sobre 16 vCPU; no están al
   # 100% cada uno, así que la sobresuscripción es nominal.
-  num_workers: 2                   # 0 = todo en el proceso principal
+  num_workers: 4                   # 0 = todo en el proceso principal
   # 8 x 8 = 64 lotes en cola por proceso: colchón de sobra para los baches.
-  prefetch_factor: 4               # 2 workers x 4 = 8 lotes en cola
+  prefetch_factor: 4               # 4 workers x 4 = 16 lotes en cola
   pin_memory: true                 # copia CPU->GPU más rápida (cientos de MB/batch)
   seeds: [42, 123, 2026]           # 3 corridas por arquitectura
   gat_heads: 4
@@ -333,7 +333,7 @@ gnn:
   #   2 = las dos arquitecturas de Optuna a la vez
   #   3-4 = además, varias semillas a la vez
   paralelo_optuna: 2               # tope: son 2 arquitecturas
-  paralelo_corridas: 3             # 6 corridas en 2 tandas llenas
+  paralelo_corridas: 6             # las 6 corridas en UNA tanda
   threshold: 0.5                   # umbral de alerta P(fraude) >= 0.5
   kpi_auc: 0.93                    # KPI OE2: AUC-ROC > 0.93
 

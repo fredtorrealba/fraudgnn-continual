@@ -33,6 +33,35 @@ se ha retirado; si falta el sampler, se aborta con instrucciones.
 import numpy as np
 import torch
 
+# ── CÓMO SE COMPARTEN LOS TENSORES ENTRE PROCESOS ──────────────────────────
+# Por defecto PyTorch los pasa con DESCRIPTORES de fichero. Un descriptor solo
+# vale dentro del proceso que lo abrió, y pasarlo a otro necesita un mecanismo
+# del sistema que exige que la cadena de procesos siga en pie.
+#
+# Aquí hay DOS saltos, porque `compare_gnns` paraleliza los estudios de Optuna:
+#
+#     padre  ->  proceso de Optuna (spawn)  ->  worker del DataLoader
+#
+# En ese segundo salto la cadena se rompe: el nieto recibe un número que en su
+# contexto no apunta a nada, y falla al usarlo:
+#
+#   RuntimeError: unable to resize file <filename not specified> to the right
+#   size: Invalid argument (22)      ->  "DataLoader worker exited unexpectedly"
+#
+# NO es falta de espacio en /dev/shm: se comprobó, había 29 GB con 823 MB en uso.
+# Es un descriptor que no vale en el proceso que lo recibe.
+#
+# `file_system` comparte por NOMBRE de fichero en vez de por descriptor, y un
+# nombre sí vale en cualquier proceso. Contrapartida: si algo muere de golpe
+# puede dejar ficheros temporales sueltos.
+#
+# Apareció al paralelizar Optuna. Antes los estudios corrían en serie y los
+# workers eran hijos directos: no había nieto y no había problema.
+try:
+    torch.multiprocessing.set_sharing_strategy("file_system")
+except Exception:
+    pass
+
 TXN = "transaction"
 
 
