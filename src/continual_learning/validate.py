@@ -84,14 +84,11 @@ def embed_and_score_nodes(model, data, node_idx, cfg):
     #   oof.py     4 folds de ~102.000 nodos + ~171.000 fuera de ventana
     #              -> con 0 workers, la etapa muestrea en UN solo núcleo
     # Con la constante a 0 el segundo caso desperdiciaba 15 de los 16 vCPU.
-    grandes = len(uniq) >= 20_000
-    n_w = int(cfg["gnn"].get("num_workers", 0)) if grandes else 0
+    # Los workers los decide make_hetero_loader por tamaño; aquí solo el batch.
     # Inferencia: sin gradientes que retener, cabe un batch mucho mayor que en
     # entrenamiento. Solo afecta a la velocidad, nunca al resultado.
-    bs = 2048 if grandes else 512
-    cfg_infer = {**cfg, "gnn": {**cfg["gnn"], "num_workers": n_w}}
-    loader = make_hetero_loader(data, cfg_infer, mask, shuffle=False,
-                                batch_size=bs)
+    bs = 2048 if len(uniq) >= 20_000 else 512
+    loader = make_hetero_loader(data, cfg, mask, shuffle=False, batch_size=bs)
 
     pos = np.full(data["transaction"].num_nodes, -1, dtype=np.int64)
     pos[uniq] = np.arange(len(uniq))

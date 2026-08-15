@@ -102,6 +102,34 @@ def semillas_balanceadas(data, mask, cfg, generador=None) -> torch.Tensor:
     return torch.cat([normal, fraude[torch.tensor(reps, dtype=torch.long)]])
 
 
+def cerrar_loader(loader) -> None:
+    """
+    Mata los workers de un loader EN CUANTO deja de usarse.
+
+    Con `persistent_workers=True` los procesos siguen vivos hasta que el
+    intérprete termina. Nadie los cerraba, así que se acumulaban: cada trial de
+    Optuna dejaba 12 procesos colgados y el proceso tardaba minutos en morir
+    joinéandolos todos, DESPUÉS de haber escrito su último log.
+
+    Medido en el smoke (2 trials x 2 arquitecturas = 4 loaders):
+        último log de `gnn` 05:11:29  ->  la etapa acabó 05:23:31   12 min
+        último log de `oof` 05:23:42  ->  la etapa acabó 05:25:43    2 min
+
+    En la corrida real son 30 trials x 2 arquitecturas = 60 loaders, o sea 720
+    procesos acumulados. Por eso esto no es cosmético.
+
+    Va con try/except porque `_shutdown_workers` es API privada de PyTorch: si
+    cambia de nombre, se pierde la limpieza pero no se rompe el entrenamiento.
+    """
+    try:
+        it = getattr(loader, "_iterator", None)
+        if it is not None:
+            it._shutdown_workers()
+            loader._iterator = None
+    except Exception:
+        pass
+
+
 def make_hetero_loader(data, cfg, mask, shuffle=True, batch_size=None,
                        balancear=False, seed=42):
     """
@@ -133,10 +161,28 @@ def make_hetero_loader(data, cfg, mask, shuffle=True, batch_size=None,
     semillas = semillas_balanceadas(data, mask, cfg,
                                     np.random.default_rng(seed)) if balancear else mask
 
+    # Los workers se escalan con el TAMAÑO, no se copian del config a ciegas.
+    # Levantar 12 procesos cuesta ~60 s cuando el padre ya tiene contexto CUDA y
+    # el grafo en memoria: cada fork lo hereda. Eso se paga por CADA loader, y
+    # `oof` crea uno por fold y Optuna uno por trial. Medido en el smoke:
+    # entrenar un fold de 4.000 nodos tardaba 2 s el primero y 61 s el segundo,
+    # todo en el arranque de los workers, no en muestrear.
+    # Con 410.000 nodos (la corrida real) el reparto sí compensa y se usan los 12.
+    # Dos casos con costes opuestos, y `shuffle` los distingue sin más pistas:
+    #   shuffle=True   ENTRENAR. El loader se crea una vez y se recorre en cada
+    #                  época (persistent_workers), así que el arranque se
+    #                  amortiza y los workers compensan siempre.
+    #   shuffle=False  PUNTUAR. Se crea y se usa UNA vez: arrancar 12 procesos
+    #                  ES el coste. Medido: un fold del OOF pasó de 61 s a 2 s
+    #                  al quitarlos.
+    # El umbral de tamaño sigue para conjuntos grandes de inferencia, donde
+    # muestrear sí domina sobre el arranque.
+    n_semillas = int(semillas.sum()) if semillas.dtype == torch.bool else len(semillas)
+    n_w = int(opts["num_workers"]) if (shuffle or n_semillas >= 20_000) else 0
     extra = {}
-    if opts["num_workers"]:
+    if n_w:
         # persistent_workers evita respawnear procesos en CADA época
-        extra = {"num_workers": int(opts["num_workers"]), "persistent_workers": True}
+        extra = {"num_workers": n_w, "persistent_workers": True}
 
     return NeighborLoader(
         data,

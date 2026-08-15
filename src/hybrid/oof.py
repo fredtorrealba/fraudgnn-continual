@@ -46,6 +46,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from src.gnn.models import TXN, build_model
+from src.gnn.sampling import cerrar_loader
 from src.gnn.train_gnn import make_loader
 from src.continual_learning.validate import embed_and_score_nodes
 from src.utils.common import (ensure_dirs, get_device, get_logger, load_config,
@@ -133,6 +134,8 @@ def _entrenar(nombre, seed, epocas, data, mask_train, cfg, device):
             n += n_b
         if ep == 1 or ep == epocas:
             log.info("    época %02d/%02d | loss %.4f", ep, epocas, total / max(n, 1))
+    # Sin esto, cada fold deja 12 procesos vivos hasta el final de la etapa.
+    cerrar_loader(loader)
     return model
 
 
@@ -211,8 +214,15 @@ def main():
                  f + 1, k, int((~fuera).sum()), int(fuera.sum()))
         mask_tr = torch.zeros(data[TXN].num_nodes, dtype=torch.bool)
         mask_tr[torch.tensor(nodos[~fuera], dtype=torch.long)] = True
+        t_f = time.time()
         model = _entrenar(nombre, seed, epocas, data, mask_tr, cfg, device)
+        t_ent = time.time() - t_f
+        log.info("    entrenado en %.1f s — puntuando %d nodos...",
+                 t_ent, int(fuera.sum()))
+        t_p = time.time()
         h, hv, s_fold = embed_and_score_nodes(model, data, nodos[fuera], cfg)
+        log.info("    fold %d/%d LISTO — entrenar %.1f s | puntuar %.1f s",
+                 f + 1, k, t_ent, time.time() - t_p)
         scores[fuera] = s_fold
         if emb is None:
             emb = np.zeros((len(nodos), h.shape[1]), dtype=np.float32)
@@ -261,7 +271,9 @@ def main():
         real.load_state_dict(ck["state_dict"])
         log.info("Meses fuera de la ventana (%d nodos): los puntúa %s, que "
                  "nunca los vio", len(fuera_ventana), etiqueta)
+        t_o = time.time()
         h_out, hv_out, s_out = embed_and_score_nodes(real, data, fuera_ventana, cfg)
+        log.info("  meses fuera de ventana LISTO — %.1f s", time.time() - t_o)
         del real
         nodos = np.concatenate([nodos, fuera_ventana])
         scores = np.concatenate([scores, s_out])

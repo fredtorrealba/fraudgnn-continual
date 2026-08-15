@@ -36,6 +36,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from src.gnn.sampling import cerrar_loader  # noqa: E402
 from src.utils.common import (ensure_dirs, get_device, get_logger, load_config,
                               load_state, resolve, state_path, update_state)
 
@@ -204,24 +205,31 @@ def buscar_hiperparametros(model_name: str, cfg) -> dict:
 
         tr = make_loader(data, data["transaction"].train_mask, c, True, balancear)
         va = make_loader(data, data["transaction"].val_mask, c, False)
-        mejor = 0.0
-        for ep in range(1, epocas + 1):
-            modelo.train()
-            for batch in tr:
-                batch = batch.to(device)
-                n = batch["transaction"].batch_size
-                opt.zero_grad()
-                loss = crit(modelo(batch.x_dict, batch.edge_index_dict, batch)[:n],
-                            batch["transaction"].y[:n])
-                loss.backward()
-                opt.step()
-            yv, sv = evaluate(modelo, va, device)
-            mejor = max(mejor, float(average_precision_score(yv, sv)))
-            trial.report(mejor, ep)
-            if trial.should_prune():
-                raise optuna.TrialPruned()
-        del modelo
-        return mejor
+        # try/finally OBLIGATORIO: el pruner sale por excepción, y sin cerrar
+        # los workers cada trial dejaría 12 procesos vivos hasta el final del
+        # proceso. Con 30 trials x 2 arquitecturas son 720 procesos colgados.
+        try:
+            mejor = 0.0
+            for ep in range(1, epocas + 1):
+                modelo.train()
+                for batch in tr:
+                    batch = batch.to(device)
+                    n = batch["transaction"].batch_size
+                    opt.zero_grad()
+                    loss = crit(modelo(batch.x_dict, batch.edge_index_dict, batch)[:n],
+                                batch["transaction"].y[:n])
+                    loss.backward()
+                    opt.step()
+                yv, sv = evaluate(modelo, va, device)
+                mejor = max(mejor, float(average_precision_score(yv, sv)))
+                trial.report(mejor, ep)
+                if trial.should_prune():
+                    raise optuna.TrialPruned()
+            return mejor
+        finally:
+            cerrar_loader(tr)
+            cerrar_loader(va)
+            del modelo
 
     log.info("[%s] Optuna: %d trials (PR-AUC sobre el mes 5)", model_name, n_trials)
     estudio = optuna.create_study(

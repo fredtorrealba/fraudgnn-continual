@@ -41,7 +41,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from src.gnn.models import TXN, build_model
-from src.gnn.sampling import make_hetero_loader, proporcion_fraude
+from src.gnn.sampling import cerrar_loader, make_hetero_loader, proporcion_fraude
 from src.utils.common import (ensure_dirs, get_device, get_logger,
                               load_config, resolve, set_seed,
                               update_state)
@@ -347,6 +347,12 @@ def train(model_name: str, seed: int, cfg: dict | None = None,
     update_state(cfg, key, status="done", model=model_name, seed=seed,
                  auc_roc=final_rep["auc_roc"], best_auc=best_auc,
                  minutes=final_rep["train_minutes"], resumed=resumed)
+    # Los workers se cierran ANTES de devolver: `compare_gnns` llama a esto en
+    # bucle (2 arquitecturas x 3 seeds) y si no, los 12 procesos de cada corrida
+    # siguen vivos hasta el final de la etapa. Era el minuto largo de silencio
+    # entre el último log y "gnn listo en N min".
+    cerrar_loader(train_loader)
+    cerrar_loader(val_loader)
     log.info("[%s] LISTA — AUC %.4f | recall %.4f | %.1f min -> %s",
              key, final_rep["auc_roc"], final_rep["recall"],
              final_rep["train_minutes"], ckpt_path.name)
