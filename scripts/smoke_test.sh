@@ -33,6 +33,9 @@ c["gnn"]["seeds"] = [42]
 c["gnn"]["patience"] = 2
 c["gnn"]["optuna_trials"] = 2
 c["xgboost"]["optuna_trials"] = 2
+# El presupuesto por tiempo MANDA sobre optuna_trials: si se deja en 60, el
+# smoke se pondría a buscar una hora por arquitectura en vez de hacer 2 trials.
+c["gnn"]["optuna_presupuesto_min"] = 0
 # `oof_folds` ya no se usa: la etapa `oof` la sustituyó `embed`, que entrena
 # UNA sola red. Las ventanas NO se tocan: el sintético tiene los mismos 6 meses
 # y 4 semanas que el dataset real, así que ejercita el mismo reparto que

@@ -166,6 +166,30 @@ def _buscar_una(args):
     return arq, buscar_hiperparametros(arq, cfg)
 
 
+def _morir_con_el_padre():
+    """
+    Inicializador de cada hijo: que el kernel lo mate cuando muera el padre.
+
+    Sin esto, un Ctrl-C o un OOM en el padre deja a los hijos VIVOS, adoptados
+    por init (`PPID 1`) y agarrando la VRAM hasta que alguien los mate a mano.
+    El 15/08 había dos de 14 horas ocupando 1,5 GB de los 20 de la tarjeta, y
+    la corrida siguiente arrancaba con ese hueco sin que nada lo dijera.
+
+    `PR_SET_PDEATHSIG` (prctl 1) es lo único que aguanta un SIGKILL del padre:
+    un `atexit` o un handler de señales no llegan a ejecutarse en ese caso.
+    Es de Linux; en macOS no existe y se ignora — allí no se entrena.
+    """
+    import platform
+    import signal
+    if platform.system() != "Linux":
+        return
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").prctl(1, signal.SIGTERM)
+    except Exception:                     # noqa: BLE001 - nunca debe tumbar al hijo
+        pass
+
+
 def _en_paralelo(fn, tareas: list, n: int):
     """Ejecuta `fn` sobre `tareas` con `n` procesos. Devuelve los resultados."""
     import multiprocessing as mp
@@ -173,7 +197,8 @@ def _en_paralelo(fn, tareas: list, n: int):
 
     ctx = mp.get_context("spawn")
     salida = []
-    with ProcessPoolExecutor(max_workers=n, mp_context=ctx) as ex:
+    with ProcessPoolExecutor(max_workers=n, mp_context=ctx,
+                             initializer=_morir_con_el_padre) as ex:
         futuros = {ex.submit(fn, t): t for t in tareas}
         for fut in as_completed(futuros):
             # Si un proceso hijo revienta, la excepción sale AQUÍ y no en
@@ -282,6 +307,19 @@ def buscar_hiperparametros(model_name: str, cfg) -> dict:
         return prev["mejores_params"]
 
     n_trials = int(cfg["gnn"].get("optuna_trials", 30))
+    # PRESUPUESTO POR TIEMPO (D1). Con `ancho` y `capas` en el espacio, un trial
+    # cuesta 20 veces más que otro: `ancho 64, capas 2` tarda 1,7 min y
+    # `256/3` tarda 29. Repartir por NÚMERO de trials reparte el cómputo muy
+    # desigual — medido el 15/08, "30 trials cada una" fueron 2 h para
+    # graphsage y 11 h para gatv2, cinco veces más máquina por la misma
+    # etiqueta. Con minutos, las dos reciben lo mismo de verdad, y "ambas
+    # recibieron el mismo cómputo" es además más defendible que "ambas
+    # recibieron 30 trials".
+    presupuesto = cfg["gnn"].get("optuna_presupuesto_min")
+    presupuesto = float(presupuesto) if presupuesto else None
+    # Tope POR TRIAL (D2). El `timeout` de arriba no corta un trial ya
+    # empezado: sin esto, uno solo se comió 29 minutos del presupuesto.
+    tope_trial = float(cfg["gnn"].get("optuna_tope_trial_min", 0) or 0)
     data = torch.load(resolve(cfg, "graph_dir") / "graph.pt", weights_only=False)
     device = get_device()
     _v = mascaras_grafo(cfg, data)
@@ -339,6 +377,11 @@ def buscar_hiperparametros(model_name: str, cfg) -> dict:
         try:
             mejor, t_trial = 0.0, time.time()
             for ep in range(1, epocas + 1):
+                if tope_trial and (time.time() - t_trial) / 60 > tope_trial:
+                    log.info("  [%s] trial %d CORTADO por tiempo en la época %d "
+                             "(%.1f min > %.0f)", model_name, trial.number, ep,
+                             (time.time() - t_trial) / 60, tope_trial)
+                    raise optuna.TrialPruned()
                 t_ep = time.time()
                 modelo.train()
                 for batch in tr:
@@ -369,17 +412,69 @@ def buscar_hiperparametros(model_name: str, cfg) -> dict:
                      model_name, trial.number, mejor,
                      (time.time() - t_trial) / 60)
             return mejor
+        except torch.cuda.OutOfMemoryError:
+            # B2. Una configuración que no cabe es un trial malo, no un fallo
+            # del pipeline: se poda y la búsqueda sigue. Antes, un OOM en el
+            # trial 29 tumbaba el proceso y se perdían los 29 anteriores —
+            # que además vivían solo en memoria (ver el storage de abajo).
+            # El pico es del ANCHO x CAPAS, así que Optuna aprende solo a
+            # evitar esa zona: no hace falta tocarle el espacio de búsqueda.
+            log.warning("  [%s] trial %d SIN MEMORIA en la GPU — se poda y se "
+                        "sigue", model_name, trial.number)
+            raise optuna.TrialPruned()
         finally:
             cerrar_loader(tr)
             cerrar_loader(va)
             del modelo
+            # El caché del allocator NO se libera solo al morir el trial: los
+            # bloques quedan reservados y el siguiente arranca con menos sitio.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-    log.info("[%s] Optuna: %d trials (PR-AUC sobre gnn_valida)", model_name, n_trials)
+    # SEMILLA DISTINTA POR ARQUITECTURA (B4). Con la misma, los dos estudios
+    # sortean los MISMOS hiperparámetros en el mismo orden: cuando a una le toca
+    # la red grande, a la otra también, y los picos de VRAM coinciden en vez de
+    # turnarse. Se desacoplan sin perder nada — cada una recibe el mismo espacio
+    # y el mismo presupuesto, que es lo que hace comparable el resultado.
+    _arqs = sorted(cfg["gnn"].get("arquitecturas", MODELS))
+    semilla_tpe = 42 + (_arqs.index(model_name) if model_name in _arqs else 0)
+
+    # ESTUDIO PERSISTIDO (B1). Sin `storage` el estudio vive solo en memoria y
+    # el JSON se escribe al FINAL: un accidente en el trial 29 se llevaba los 29
+    # anteriores. Con SQLite cada trial se escribe al terminar y `load_if_exists`
+    # deja retomar donde se quedó.
+    #
+    # UN ARCHIVO POR ARQUITECTURA, no uno compartido. Con `paralelo_optuna: 2`
+    # los dos procesos crean el esquema a la vez y el segundo muere con
+    # "table studies already exists" — lo cazó el smoke al aplicar esto. Además
+    # SQLite serializa las escrituras, así que un solo archivo pondría a los dos
+    # estudios a pelearse por el lock en cada trial. Separados no se tocan.
+    db = resolve(cfg, "reports_dir") / f"optuna_{model_name}.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
     estudio = optuna.create_study(
         direction="maximize",
-        sampler=optuna.samplers.TPESampler(seed=42),   # mismo sampler que XGBoost
+        study_name=f"gnn_{model_name}",
+        storage=f"sqlite:///{db}",
+        load_if_exists=True,
+        sampler=optuna.samplers.TPESampler(seed=semilla_tpe),
         pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=2))
-    estudio.optimize(objetivo, n_trials=n_trials, show_progress_bar=True)
+
+    hechos = len([t for t in estudio.trials
+                  if t.state.name in ("COMPLETE", "PRUNED")])
+    if hechos:
+        log.info("[%s] el estudio ya tenía %d trials hechos — se retoman",
+                 model_name, hechos)
+
+    if presupuesto:
+        log.info("[%s] Optuna: %.0f min de presupuesto, tope %.0f min/trial "
+                 "(PR-AUC sobre gnn_valida)", model_name, presupuesto, tope_trial)
+        estudio.optimize(objetivo, timeout=presupuesto * 60,
+                         show_progress_bar=True)
+    else:
+        log.info("[%s] Optuna: %d trials (PR-AUC sobre gnn_valida)",
+                 model_name, n_trials)
+        estudio.optimize(objetivo, n_trials=max(0, n_trials - hechos),
+                         show_progress_bar=True)
 
     best = dict(estudio.best_params)
     with open(cache, "w") as f:

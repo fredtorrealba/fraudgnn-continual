@@ -320,6 +320,22 @@ gnn:
   # podables, con 30 son 25 y la poda trabaja de verdad.
   optuna_trials: 30
 
+  # PRESUPUESTO POR TIEMPO. Si está puesto, MANDA sobre optuna_trials.
+  #
+  # "30 trials cada una" suena justo y no lo es: con `ancho` y `capas` en el
+  # espacio, un trial cuesta entre 1,7 y 29 minutos. Medido el 15/08, los mismos
+  # 30 trials fueron 2 h para graphsage y 11 h para gatv2 — cinco veces más
+  # máquina por la misma etiqueta, y el pipeline entero esperando a la lenta.
+  #
+  # Con minutos las dos reciben lo mismo de verdad. GraphSAGE meterá más trials
+  # que GATv2, y eso ES el resultado: una arquitectura que necesita media hora
+  # por configuración es peor candidata, y así se ve en vez de esconderse.
+  # Ponlo a 0 o coméntalo para volver al presupuesto por número de trials.
+  optuna_presupuesto_min: 60
+  # Ningún trial puede pasar de aquí. El `timeout` de arriba no corta un trial
+  # ya empezado: sin este tope, el trial 3 de gatv2 se comió 29 minutos él solo.
+  optuna_tope_trial_min: 10
+
   # ── PARALELISMO de la etapa `gnn` ─────────────────────────────────────────
   # Las 8 tareas son independientes: 2 estudios de Optuna + 6 corridas que solo
   # cambian de semilla. En serie la máquina quedaba al 13% de CPU y 11% de GPU.
@@ -333,7 +349,11 @@ gnn:
   #   2 = las dos arquitecturas de Optuna a la vez
   #   3-4 = además, varias semillas a la vez
   paralelo_optuna: 2               # tope: son 2 arquitecturas
-  paralelo_corridas: 6             # las 6 corridas en UNA tanda
+  # 2, no 6: las corridas heredan los hiperparámetros ganadores, y con `capas 3`
+  # cada proceso pide ~8 GB de VRAM. 6 x 8 = 48 GB sobre una tarjeta de 20 es
+  # OOM seguro. Con 2 son 16 GB — que es lo que hizo Optuna toda la noche del
+  # 15/08 al 78%. Por CPU sí cabrían 6 (1,2 núcleos por proceso); manda la VRAM.
+  paralelo_corridas: 2
   threshold: 0.5                   # umbral de alerta P(fraude) >= 0.5
   kpi_auc: 0.93                    # KPI OE2: AUC-ROC > 0.93
 
