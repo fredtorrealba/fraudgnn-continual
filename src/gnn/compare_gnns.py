@@ -375,13 +375,32 @@ def buscar_hiperparametros(model_name: str, cfg) -> dict:
         # los workers cada trial dejaría 12 procesos vivos hasta el final del
         # proceso. Con 30 trials x 2 arquitecturas son 720 procesos colgados.
         try:
-            mejor, t_trial = 0.0, time.time()
+            # `tope` es la copia LOCAL del tope: al indultar a un trial se
+            # pone a 0 y no debe afectar a los siguientes.
+            mejor, t_trial, tope = 0.0, time.time(), tope_trial
             for ep in range(1, epocas + 1):
-                if tope_trial and (time.time() - t_trial) / 60 > tope_trial:
-                    log.info("  [%s] trial %d CORTADO por tiempo en la época %d "
-                             "(%.1f min > %.0f)", model_name, trial.number, ep,
-                             (time.time() - t_trial) / 60, tope_trial)
-                    raise optuna.TrialPruned()
+                if tope and (time.time() - t_trial) / 60 > tope:
+                    # El reloj NO puede matar al que va ganando. Un trial podado
+                    # queda PRUNED, y Optuna elige el mejor solo entre los
+                    # COMPLETE: sin esta salvedad, una red lenta pero superior
+                    # se descartaría por tardar y no habría forma de saberlo.
+                    # `t.value` es None en los podados, así que esto compara
+                    # contra los que sí terminaron.
+                    campeon = max((t.value for t in trial.study.trials
+                                   if t.value is not None), default=0.0)
+                    if mejor > campeon:
+                        log.info("  [%s] trial %d pasa de %.0f min pero VA EN "
+                                 "CABEZA (%.4f > %.4f) — se le deja terminar",
+                                 model_name, trial.number, tope, mejor,
+                                 campeon)
+                        tope = 0.0              # indultado, solo este trial
+                    else:
+                        log.info("  [%s] trial %d CORTADO por tiempo en la época "
+                                 "%d (%.1f min > %.0f, va %.4f contra %.4f)",
+                                 model_name, trial.number, ep,
+                                 (time.time() - t_trial) / 60, tope,
+                                 mejor, campeon)
+                        raise optuna.TrialPruned()
                 t_ep = time.time()
                 modelo.train()
                 for batch in tr:

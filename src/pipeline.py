@@ -56,9 +56,27 @@ class Step:
     args: list[str] = field(default_factory=list)
     desc: str = ""                  # resumen de qué hace, ver --steps
     acepta_force: bool = False      # el módulo entiende --force por su cuenta
+    # Salidas cuyo NOMBRE depende del config (una por arquitectura, por ejemplo)
+    # y no se pueden escribir como constantes. Cuentan igual que `outputs`:
+    # marcan el paso como hecho y `--force` las borra.
+    outputs_dyn: object = None      # (cfg) -> list[Path]
+    # Archivos que `--force` debe borrar pero que NO marcan el paso como hecho.
+    # El caso es el .db de Optuna: si se borra el JSON y se deja el .db, la
+    # búsqueda "nueva" RETOMA la vieja desde el storage y no se entera nadie.
+    limpiar_dyn: object = None      # (cfg) -> list[Path]
 
     def output_paths(self, cfg) -> list[Path]:
-        return [resolve(cfg, key) / name for key, name in self.outputs]
+        p = [resolve(cfg, key) / name for key, name in self.outputs]
+        if self.outputs_dyn:
+            p += list(self.outputs_dyn(cfg))
+        return p
+
+    def limpiar_paths(self, cfg) -> list[Path]:
+        """Todo lo que `--force` debe borrar: las salidas más los auxiliares."""
+        p = self.output_paths(cfg)
+        if self.limpiar_dyn:
+            p += list(self.limpiar_dyn(cfg))
+        return p
 
     def missing(self, cfg) -> list[Path]:
         return [p for p in self.output_paths(cfg) if not p.exists()]
@@ -109,6 +127,25 @@ STEPS = [
     Step("gnn", "[3] GraphSAGE vs GATv2: Optuna + 3 seeds + selección",
          "src.gnn.compare_gnns",
          [("models_dir", "selected_model.json")],
+         # La búsqueda de Optuna es la mitad cara de esta etapa y hasta ahora no
+         # figuraba como salida: `--status` no la veía y `--force` no la borraba,
+         # así que una corrida "forzada" reutilizaba en silencio hiperparámetros
+         # de una búsqueda anterior. Ahora cuenta como el resto.
+         #
+         # Cuándo NO debe repetirse: si el espacio de búsqueda y el grafo son los
+         # mismos, buscar otra vez solo añade ruido. Al comparar cambios del
+         # GRAFO (E1/E2) conviene dejar estos JSON intactos a propósito, para que
+         # la diferencia sea atribuible al grafo y no a otra búsqueda.
+         outputs_dyn=lambda cfg: (
+             [resolve(cfg, "reports_dir") / f"optuna_{a}.json"
+              for a in cfg["gnn"].get("arquitecturas", ["graphsage", "gatv2"])]
+             if int(cfg["gnn"].get("optuna_trials", 0)) > 0 else []),
+         # El .db NO marca el paso como hecho (un estudio a medias también lo
+         # crea), pero `--force` tiene que llevárselo: si no, `load_if_exists`
+         # retoma la búsqueda anterior en vez de empezar de cero.
+         limpiar_dyn=lambda cfg: [
+             resolve(cfg, "reports_dir") / f"optuna_{a}.db"
+             for a in cfg["gnn"].get("arquitecturas", ["graphsage", "gatv2"])],
          acepta_force=True,
          desc="Entrena GraphSAGE y GAT con 3 semillas cada uno = 6 corridas, con "
               "neighbor sampling 15-10-5 (nunca ve el grafo entero). Elige la mejor "
@@ -569,7 +606,7 @@ def main():
             # Borrar las salidas es lo que hace que --force funcione IGUAL en
             # todos los pasos: sin esto, módulos como download ven sus archivos
             # y se saltan solos aunque el pipeline los haya marcado forzados.
-            borradas = [p for p in step.output_paths(cfg) if p.exists()]
+            borradas = [p for p in step.limpiar_paths(cfg) if p.exists()]
             for ruta in borradas:
                 ruta.unlink()
             if borradas:
