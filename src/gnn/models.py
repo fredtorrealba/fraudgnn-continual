@@ -150,10 +150,24 @@ class _BaseHeteroGNN(nn.Module):
         """
         x = self._dict_inicial(x_dict, edge_index_dict, batch)
         vecinos = None
+        # ÚLTIMA capa, no la primera. Los nodos de entidad entran en CEROS
+        # (`_dict_inicial`, es lo que los hace inductivos) y su vector se calcula
+        # en la capa 0: si se captura ahí, la transacción está leyendo ceros y el
+        # embedding "solo vecinos" no contiene ni un vecino.
+        #
+        # Medido antes del arreglo: las 64 columnas `embv_` tenían AUC mediana
+        # 0.5263 por dimensión —azar— y eran, en cristiano,
+        # `constante + 4 proyecciones lineales de las features propias`.
+        # En la última capa las entidades ya llevan agregadas sus transacciones,
+        # así que `lin_l(entidades)` sí es el camino del vecindario.
+        ultima = len(self.convs) - 1
         for i, (conv, bn) in enumerate(zip(self.convs, self.bns)):
             h = conv(x, edge_index_dict)
-            if solo_vecinos and i == 0 and TXN in h:
-                vecinos = self._termino_vecinos(h[TXN], x[TXN])
+            if solo_vecinos and i == ultima and TXN in h:
+                # Se captura ANTES de bn/relu/dropout a propósito: `bn` es
+                # BatchNorm y pasarle un segundo tensor le corrompería las
+                # estadísticas móviles durante el entrenamiento.
+                vecinos = self._termino_vecinos(conv, h[TXN], x[TXN])
             nuevo = {}
             for nt, v in h.items():
                 if nt == TXN:
@@ -166,9 +180,11 @@ class _BaseHeteroGNN(nn.Module):
             x = nuevo
         return (x[TXN], vecinos) if solo_vecinos else x[TXN]
 
-    def _termino_vecinos(self, h_txn, x_txn):
+    def _termino_vecinos(self, conv, h_txn, x_txn):
         """
         La parte de la representación que viene SOLO del vecindario.
+
+        `conv` es la capa donde se captura: de ahí salen los `lin_r` a restar.
 
         XGBoost ya tiene las 431 features propias entre sus columnas tabulares:
         entregarle también la proyección de esas mismas features sería repetirle
@@ -208,17 +224,28 @@ class FraudGraphSAGE(_BaseHeteroGNN):
     def _make_conv(self, in_c, out_c):
         return SAGEConv((-1, -1), out_c, aggr=self.aggr)
 
-    def _termino_vecinos(self, h_txn, x_txn):
+    def _termino_vecinos(self, conv, h_txn, x_txn):
         """
         SAGEConv calcula `lin_l(agregado) + lin_r(x_i)`, así que el término de
         vecinos se despeja restando — exacto, sin reimplementar la convolución.
+
+        SE RESTAN LAS CINCO, no una. A `transaction` entran cinco tipos de arista
+        (uid, card, email, device, net) y `HeteroConv` los suma con `aggr="sum"`,
+        así que la salida lleva CINCO términos `lin_r_k(x_i)`, uno por tipo. La
+        versión anterior hacía `return` dentro del bucle en la primera y dejaba
+        cuatro copias de las features propias dentro del embedding "solo
+        vecinos" — justo lo que la función existe para quitar.
+
+        `conv` se recibe como argumento en vez de usar `self.convs[0]`: hay que
+        restar los `lin_r` de la MISMA capa donde se captura.
         """
-        for et, sub in self.convs[0].convs.items():
+        resto = h_txn
+        for et, sub in conv.convs.items():
             if et[2] == TXN:                       # aristas que ENTRAN a transacción
                 lin_r = getattr(sub, "lin_r", None)
                 if lin_r is not None:
-                    return h_txn - lin_r(x_txn)
-        return h_txn
+                    resto = resto - lin_r(x_txn)
+        return resto
 
 
 class FraudGATv2(_BaseHeteroGNN):
@@ -228,7 +255,7 @@ class FraudGATv2(_BaseHeteroGNN):
         return GATv2Conv((-1, -1), out_c, heads=self.extra.get("heads", 4),
                          concat=False, add_self_loops=False)
 
-    def _termino_vecinos(self, h_txn, x_txn):
+    def _termino_vecinos(self, conv, h_txn, x_txn):
         """
         Con `add_self_loops=False` el nodo NO se atiende a sí mismo: la salida
         de GATv2 es ya una suma ponderada de vecinos, sin término de raíz que

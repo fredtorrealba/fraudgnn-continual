@@ -226,8 +226,33 @@ def main():
         rev = (nombre, f"tiene_{nombre}", "transaction")
         src = torch.tensor(filas, dtype=torch.long)
         dst = torch.tensor(ent_idx, dtype=torch.long)
+
+        # GRADO MÍNIMO, y ASIMÉTRICO. Una entidad con una sola transacción no
+        # conecta a nadie: su vector es esa misma transacción, y al bajar se la
+        # devuelve. La transacción se recibe a sí misma. En `uid` le pasaba a
+        # 59.189 de 94.901 nodos (62%), el 26,8% del dataset.
+        #
+        # Las dos direcciones NO se podan igual, y esto es lo importante:
+        #
+        #   SUBIDA  transaction -> entidad    se conservan TODAS
+        #           si se quitara la primera compra de un cliente, las
+        #           siguientes nunca sabrían de ella
+        #
+        #   BAJADA  entidad -> transaction    solo si `previas >= minimo`
+        #           una transacción sin ninguna anterior en su entidad no
+        #           tiene de quién enterarse: lo único que recibiría es su
+        #           propio eco
+        #
+        # CAUSAL por la misma razón que la poda de arriba: se mira cuántas
+        # había ANTES, no cuántas acabará teniendo la entidad. Contar el total
+        # dejaría que la actividad de junio decidiera si una compra de enero
+        # tiene vecinos. `previas == 0` es exactamente "soy la primera".
+        minimo = int(cfg["graph"].get("min_previas_entidad", 1))
+        recibe = previas_vivas >= minimo
+        n_sin_vecinos = int((~recibe).sum())
+
         data[et].edge_index = torch.stack([src, dst])
-        data[rev].edge_index = torch.stack([dst, src])
+        data[rev].edge_index = torch.stack([dst[recibe], src[recibe]])
         data[nombre].num_nodes = int(len(remap))
 
         # GRADO de la entidad como feature del nodo: cuántas transacciones
@@ -258,12 +283,18 @@ def main():
             "entidades_afectadas": n_ent_afectadas,
             "txn_por_entidad_media": round(len(filas) / max(len(remap), 1), 1),
             "degenerada": bool(len(filas) / max(len(remap), 1) < 2),
+            # Aristas de BAJADA que se quitaron por no tener ninguna
+            # transacción anterior en su entidad (ver `min_previas_entidad`).
+            "aristas_subida": int(len(filas)),
+            "aristas_bajada": int(recibe.sum()),
+            "sin_anteriores": n_sin_vecinos,
         }
         media = len(filas) / max(len(remap), 1)
-        log.info("  %-7s %7d nodos | %7d aristas | cobertura %5.1f%% | "
-                 "%4.1f txn/entidad | %d txn podadas en %d entidades",
-                 nombre, len(remap), len(filas), 100 * cob, media,
-                 n_podadas, n_ent_afectadas)
+        log.info("  %-7s %7d nodos | subida %7d / bajada %7d aristas | "
+                 "cobertura %5.1f%% | %4.1f txn/entidad | %d podadas por grado "
+                 "en %d entidades | %d sin anteriores",
+                 nombre, len(remap), len(filas), int(recibe.sum()), 100 * cob,
+                 media, n_podadas, n_ent_afectadas, n_sin_vecinos)
         # Una entidad con ~1 transacción por grupo NO CONECTA NADA: cada
         # transacción cuelga de su propio nodo y el paso de mensajes no
         # transporta información de nadie. Suele significar que la clave es
