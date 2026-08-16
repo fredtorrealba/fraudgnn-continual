@@ -335,7 +335,7 @@ gnn:
   # se podría objetar que la GNN salió peor por haberla buscado menos.
   # Además el MedianPruner necesita 5 trials de arranque: con 12 solo 7 eran
   # podables, con 30 son 25 y la poda trabaja de verdad.
-  optuna_trials: 100
+  optuna_trials: 30
 
   # PRESUPUESTO POR TIEMPO. Si está puesto, MANDA sobre optuna_trials.
   #
