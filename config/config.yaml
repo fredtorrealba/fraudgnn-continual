@@ -397,7 +397,15 @@ xgboost:
   #
   # Lo que NO vale es fijar a mano hiperparámetros peores para una cabeza que
   # para otra: eso no mide las columnas, mide quién recibió mejor trato.
-  optuna_modo: "por_cabeza"
+  #
+  # 2026-08-16: se vuelve a "compartido". Con "por_cabeza", Optuna le dio a
+  # `gnn_mas_tabular` lr 0.1256 (contra 0.0391 del control): ganaba por 0.0004
+  # de AUC en validación y perdía en el examen. La búsqueda sobreajustaba la
+  # ventana donde se busca, y la diferencia entre cabezas medía eso, no las
+  # columnas. Además "por_cabeza" contradice el invariante de CLAUDE.md
+  # ("Optuna corre una sola vez... para que la ventaja de las grandes sea una
+  # cota inferior conservadora"). Los dos números van en la memoria.
+  optuna_modo: "compartido"
 
   # Ajustes finos POR CABEZA, encima de lo que salga de Optuna. Vacíos por
   # defecto. Si pones algo aquí, el log te avisa: es un valor elegido a mano y
