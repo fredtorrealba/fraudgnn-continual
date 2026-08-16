@@ -402,29 +402,24 @@ xgboost:
   # Ajustes finos POR CABEZA, encima de lo que salga de Optuna. Vacíos por
   # defecto. Si pones algo aquí, el log te avisa: es un valor elegido a mano y
   # necesita justificación en la memoria.
-  # Estos valores SIEMBRAN la búsqueda de Optuna de esa cabeza: se evalúan como
-  # primer trial, así que la búsqueda parte de una configuración conocida y solo
-  # puede mejorarla. No la sustituyen — fijar hiperparámetros a mano cuando la
-  # otra cabeza recibe 30 trials sería PERJUDICAR a esta, porque una búsqueda
-  # bayesiana casi siempre gana a una elección manual.
+  # CUIDADO: esto NO solo siembra la búsqueda. `train_head.py:_params()` lo
+  # aplica como override FINAL, encima de lo que haya encontrado Optuna. Solo
+  # las claves de `_ESPACIO_OPTUNA` se siembran además como primer trial;
+  # `n_estimators` no está entre ellas, así que aquí es un tope duro y nada más.
   #
-  # Los de abajo están pensados para entradas con embeddings densos: árboles
-  # menos profundos, aprendizaje lento y más árboles, que es lo que suele ir
-  # mejor con features continuas que con 431 columnas categóricas dispersas.
+  # Esto ya costó una conclusión errónea (2026-08-15). Con `control: {}` y las
+  # otras dos fijadas a mano, `gnn_mas_tabular` entrenó con max_depth 6 y 500
+  # árboles —topando en 500— mientras `control` usaba los suyos de Optuna
+  # (max_depth 12) con techo de 1000 y paraba solo en 379. El aporte del grafo
+  # salió -0.0668 y "significativo"; con las tres cabezas en igualdad es
+  # +0.0053. Lo que se midió fue quién recibió mejor trato, no las columnas.
+  #
+  # Déjalo VACÍO salvo que tengas una razón escrita en la memoria. Si pones
+  # algo, ponlo en las TRES o la comparación deja de ser atribuible.
   por_cabeza:
     control: {}
-    solo_gnn:
-      max_depth: 6
-      n_estimators: 500
-      learning_rate: 0.03
-      colsample_bytree: 0.8
-      subsample: 0.8
-    gnn_mas_tabular:
-      max_depth: 6
-      n_estimators: 500
-      learning_rate: 0.03
-      colsample_bytree: 0.8
-      subsample: 0.8
+    solo_gnn: {}
+    gnn_mas_tabular: {}
   # Dónde entrena XGBoost: "auto" usa la GPU si hay CUDA, si no CPU.
   # En una VM con GPU esto baja la búsqueda de 30 trials de ~35 min a minutos.
   # Fuerza "cpu" si quieres el baseline reproducible en cualquier máquina.
