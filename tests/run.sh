@@ -26,9 +26,12 @@ correr() {
     salida=$(python3 "$archivo" 2>&1)
     codigo=$?
     echo "$salida" | sed 's/^/  /'
-    if [ $codigo -ne 0 ]; then
+    if echo "$salida" | grep -q "MODO PRECONDICIÓN"; then
+        echo "  -> PARCIAL (sin pyg-lib solo se comprobó la precondición)"
+        saltados=$((saltados + 1))
+    elif [ $codigo -ne 0 ]; then
         # El sampler nativo no existe en macOS: no es un fallo del código.
-        if echo "$salida" | grep -q "sampler nativo"; then
+        if echo "$salida" | grep -qE "sampler nativo|MODO PRECONDICIÓN"; then
             echo "  -> SALTADO (necesita pyg-lib; córrelo en el pod)"
             saltados=$((saltados + 1))
         else
@@ -44,8 +47,14 @@ correr "E1 · la primera transacción de una entidad no recibe de ella" \
        tests/test_grado_minimo_entidad.py "necesita el grafo construido"
 correr "E2 · el grafo tiene las aristas que dicen los datos" \
        tests/test_poda_grado_maximo.py "necesita el grafo construido"
+correr "salud · ninguna entidad se cayó en silencio" \
+       tests/test_salud_grafo.py "necesita el grafo construido"
+correr "SMOTE · solo sintetiza fraude y respeta el ratio" \
+       tests/test_smote.py "necesita la etapa embed"
 correr "A2 · el muestreo solo mira hacia atrás" \
        tests/test_causalidad_muestreo.py "necesita el grafo construido"
+correr "recencia · baja las N más recientes anteriores" \
+       tests/test_seleccion_vecinos.py "modo completo solo con pyg-lib"
 
 echo "────────────────────────────────────────────────────────────"
 if [ $fallos -gt 0 ]; then

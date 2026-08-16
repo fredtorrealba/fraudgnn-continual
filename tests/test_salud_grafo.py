@@ -1,42 +1,45 @@
 """
-Radiografía del grafo construido. Para decidir con números, no con intuición.
+INVARIANTE — el grafo está sano: ninguna entidad se cayó en silencio.
 
-    python scripts/inspeccionar_grafo.py
-    python scripts/inspeccionar_grafo.py --guardar antes.json
-    python scripts/inspeccionar_grafo.py --contra antes.json     # el diff
+No comprueba que los números sean BUENOS, sino que no son CATASTRÓFICOS. Los
+umbrales son deliberadamente generosos: esto tiene que saltar cuando algo se
+rompe (una entidad sin aristas, la mitad del dataset desconectado, una feature
+en cero), no cuando una cifra se mueve unas décimas. Un test que salta con cada
+ajuste enseña a ignorarlo.
 
-Flujo típico para comparar dos configuraciones:
+Lo que guarda, y por qué cada cosa ya pasó o pudo pasar:
 
-    # con la poda actual
-    python scripts/inspeccionar_grafo.py --guardar /tmp/con_poda.json
-    # cambias max_entity_degree en el config y reconstruyes
-    python -m src.data.build_graph
-    python scripts/inspeccionar_grafo.py --contra /tmp/con_poda.json
+  ENTIDAD VACÍA      `EDGE_RAW_COLS` estaba escrito a mano y `device` y `net`
+                     acabaron con cero nodos sin que nada avisara.
 
-Qué mira, y por qué cada cosa:
+  ASIMETRÍA          la bajada nunca puede superar a la subida: E1 poda solo
+                     una dirección.
 
-  CONECTIVIDAD   cuántas transacciones se quedan sin recibir de NADIE. Son las
-                 que el grafo no puede ayudar: para ellas la GNN es una MLP.
+  ORDEN TEMPORAL     `temporal_strategy="last"` coge un sufijo de las aristas
+                     de cada entidad. Sin orden exacto, "las 10 más recientes"
+                     devuelve cualquier cosa y nadie avisa.
 
-  VECINDARIO     a cuántas transacciones distintas llega cada una por sus 5
-                 entidades. Es el material del que sale el embedding.
+  __grado_*          si queda en cero para TODAS las filas con arista, la
+                     feature que sustituye a las columnas C no existe.
 
-  GRADO          la feature `__grado_*`. Con poda, la transacción nº 502 de una
-                 tarjeta recibía 0 — el MISMO valor que una sin card1. La
-                 columna quedaba invertida justo donde más historial hay.
+  DESCONEXIÓN        si más de la cuarta parte de las transacciones no recibe
+                     de ninguna entidad, el grafo dejó de ser un grafo.
 
-  FRAUDE         si lo que se pierde está sesgado. Cortar conexiones donde hay
-                 más fraude que la media es peor que cortarlas al azar.
+Además del test, trae el INFORME con los números finos y el diff entre
+configuraciones — que es lo que sirve para DECIDIR, no solo para vigilar. La
+decisión de E2 salió de comparar dos radiografías:
 
-  ORDEN          `temporal_strategy="last"` exige las aristas de bajada
-                 ordenadas por tiempo. Si no lo están, "los 10 más recientes"
-                 devuelve cualquier cosa y nadie avisa.
+    python tests/test_salud_grafo.py                          # el test
+    python tests/test_salud_grafo.py --informe                # los números
+    python tests/test_salud_grafo.py --informe --guardar a.json
+    python tests/test_salud_grafo.py --informe --contra a.json   # el diff
 """
-import argparse
 import json
 import sys
 import warnings
 from pathlib import Path
+
+import argparse  # noqa: F401
 
 import numpy as np
 import torch
@@ -46,6 +49,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.utils.common import load_config, resolve      # noqa: E402
 
 TXN = "transaction"
+MAX_AISLADAS_PCT = 25.0        # generoso a propósito: alarma, no termómetro
 
 
 def radiografia(cfg) -> dict:
@@ -178,22 +182,90 @@ def _pinta(r, prev=None):
           f"p99 {v['p99']} · media {v['media']}"
           f"{d(v['mediana'], pv.get('mediana'))}")
 
-
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Radiografía del grafo")
+    import argparse
+    ap = argparse.ArgumentParser(description="Salud del grafo (test + informe)")
+    ap.add_argument("--informe", action="store_true", help="números finos")
     ap.add_argument("--guardar", metavar="RUTA")
     ap.add_argument("--contra", metavar="RUTA", help="compara con un guardado")
     a = ap.parse_args()
 
-    r = radiografia(load_config())
-    prev = json.load(open(a.contra)) if a.contra else None
-    if prev:
-        print(f"\n  comparando contra {a.contra}")
-    _pinta(r, prev)
-    if a.guardar:
-        Path(a.guardar).write_text(json.dumps(r, indent=2, ensure_ascii=False))
-        print(f"\n  guardado en {a.guardar}")
-    print()
+    cfg = load_config()
+    if a.informe or a.guardar or a.contra:
+        import json as _json
+        r = radiografia(cfg)
+        _pinta(r, _json.load(open(a.contra)) if a.contra else None)
+        if a.guardar:
+            Path(a.guardar).write_text(_json.dumps(r, indent=2, ensure_ascii=False))
+            print(f"\n  guardado en {a.guardar}")
+        print()
+        return 0
+
+    g = resolve(cfg, "graph_dir") / "graph.pt"
+    if not g.exists():
+        print(f"  SALTADO: no existe {g}. Corre la etapa `graph`.")
+        return 0
+
+    data = torch.load(g, weights_only=False)
+    meta = json.load(open(resolve(cfg, "graph_dir") / "graph_meta.json"))
+    cols = meta["feature_cols_gnn"]
+    N = data[TXN].num_nodes
+    t = data[TXN].time
+    fallos = []
+    recibe_alguna = np.zeros(N, bool)
+
+    esperadas = list(cfg["graph"]["entidades"])
+    faltan = [e for e in esperadas if e not in data.node_types]
+    if faltan:
+        fallos.append(f"entidades del config que NO están en el grafo: {faltan}")
+
+    for nt in [n for n in data.node_types if n != TXN]:
+        sub = data[(TXN, f"en_{nt}", nt)].edge_index
+        baj = data[(nt, f"tiene_{nt}", TXN)].edge_index
+        mal = []
+
+        if data[nt].num_nodes == 0 or sub.shape[1] == 0:
+            mal.append("no tiene nodos o no tiene aristas")
+        if baj.shape[1] > sub.shape[1]:
+            mal.append(f"la bajada ({baj.shape[1]}) supera a la subida "
+                       f"({sub.shape[1]}); E1 poda una sola dirección")
+
+        if baj.numel():
+            recibe_alguna[baj[1].numpy()] = True
+            clave = baj[0].to(torch.int64) * (int(t.max()) + 1) + t[baj[1]].to(torch.int64)
+            fuera = int((clave[1:] < clave[:-1]).sum())
+            if fuera:
+                mal.append(f"{fuera} aristas de bajada fuera de orden temporal")
+
+        c = f"__grado_{nt}"
+        if c in cols:
+            v = data[TXN].x[:, cols.index(c)].numpy()
+            con_arista = np.zeros(N, bool)
+            con_arista[sub[0].numpy()] = True
+            if con_arista.any() and float(v[con_arista].max()) == 0.0:
+                mal.append(f"{c} vale 0 en TODAS las filas con arista")
+
+        print(f"  [{'MAL' if mal else 'OK '}] {nt:<7} {data[nt].num_nodes:>7} nodos · "
+              f"subida {sub.shape[1]:>7} · bajada {baj.shape[1]:>7}")
+        fallos += [f"{nt}: {m}" for m in mal]
+
+    aisladas = 100 * float((~recibe_alguna).mean())
+    ok = aisladas <= MAX_AISLADAS_PCT
+    print(f"  [{'OK ' if ok else 'MAL'}] transacciones sin recibir de nadie: "
+          f"{int((~recibe_alguna).sum())} ({aisladas:.1f}%, tope {MAX_AISLADAS_PCT}%)")
+    if not ok:
+        fallos.append(f"el {aisladas:.1f}% de las transacciones no recibe de "
+                      f"ninguna entidad; el grafo dejó de conectar")
+
+    if not torch.isfinite(data[TXN].x).all():
+        fallos.append("hay NaN o Inf en las features de transaction")
+
+    if fallos:
+        print("\n  GRAFO ENFERMO:")
+        for f in fallos:
+            print(f"   · {f}")
+        return 1
+    print("\n  Grafo sano — todas las entidades conectan y las features son finitas.")
     return 0
 
 

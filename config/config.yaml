@@ -335,7 +335,7 @@ gnn:
   # se podría objetar que la GNN salió peor por haberla buscado menos.
   # Además el MedianPruner necesita 5 trials de arranque: con 12 solo 7 eran
   # podables, con 30 son 25 y la poda trabaja de verdad.
-  optuna_trials: 30
+  optuna_trials: 100
 
   # PRESUPUESTO POR TIEMPO. Si está puesto, MANDA sobre optuna_trials.
   #
@@ -348,7 +348,7 @@ gnn:
   # que GATv2, y eso ES el resultado: una arquitectura que necesita media hora
   # por configuración es peor candidata, y así se ve en vez de esconderse.
   # Ponlo a 0 o coméntalo para volver al presupuesto por número de trials.
-  optuna_presupuesto_min: 60
+  optuna_presupuesto_min: 0
   # Ningún trial puede pasar de aquí. El `timeout` de arriba no corta un trial
   # ya empezado: sin este tope, el trial 3 de gatv2 se comió 29 minutos él solo.
   optuna_tope_trial_min: 10
@@ -365,12 +365,12 @@ gnn:
   #   1 = en serie (como antes)
   #   2 = las dos arquitecturas de Optuna a la vez
   #   3-4 = además, varias semillas a la vez
-  paralelo_optuna: 1               # tope: son 2 arquitecturas
+  paralelo_optuna: 2               # tope: son 2 arquitecturas
   # 2, no 6: las corridas heredan los hiperparámetros ganadores, y con `capas 3`
   # cada proceso pide ~8 GB de VRAM. 6 x 8 = 48 GB sobre una tarjeta de 20 es
   # OOM seguro. Con 2 son 16 GB — que es lo que hizo Optuna toda la noche del
   # 15/08 al 78%. Por CPU sí cabrían 6 (1,2 núcleos por proceso); manda la VRAM.
-  paralelo_corridas: 6
+  paralelo_corridas: 2
   threshold: 0.5                   # umbral de alerta P(fraude) >= 0.5
   kpi_auc: 0.93                    # KPI OE2: AUC-ROC > 0.93
 
