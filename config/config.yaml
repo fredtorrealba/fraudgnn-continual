@@ -101,7 +101,24 @@ graph:
   # de fila de full.parquet); lo que se limita son las aristas y los grados.
   meses: []                        # [] = deducido de `ventanas`
 
-  max_entity_degree: 500
+  # E2 — TOPE POR GRADO. 0 = SIN PODA (recomendado): el grafo queda con todas
+  # sus conexiones y el corte lo hace el MUESTREO, que ya baja solo 10
+  # transacciones por entidad. Podar aquí era redundante y caro: con 500, el
+  # 0,7% de las entidades de `card` dejaba sin arista al 24,6% del dataset
+  # —justo el tramo con más fraude— y además ponía `__grado_card` a 0 en las
+  # tarjetas con MÁS historial, indistinguibles de una transacción sin card1.
+  #   0    sin poda; manda `vecinos_por_entidad`
+  #   500  comportamiento previo a E2
+  max_entity_degree: 0
+  # E1 — GRADO MÍNIMO, en la dirección entidad -> transacción.
+  # Una transacción sin ninguna anterior en su entidad no tiene de quién
+  # enterarse: lo único que recibiría por ahí es su propio eco de vuelta. En
+  # `uid` eso pasaba en 59.189 de sus 94.901 nodos (62%), o sea el 26,8% del
+  # dataset. La dirección transacción -> entidad se conserva ENTERA: quitar la
+  # primera compra de un cliente dejaría a las siguientes sin saber de ella.
+  #   1 = necesita al menos una anterior (recomendado)
+  #   0 = desactiva la poda, comportamiento previo a E1
+  min_previas_entidad: 1
   vecinos_por_entidad: 10          # cuántas transacciones trae cada entidad
   # Features derivadas, para recuperar lo que daban las columnas C (conteos) y
   # D (tiempos) que la ablación quita. Quién las calcula NO es lo mismo:

@@ -163,8 +163,12 @@ def main():
     tope = int(cfg["graph"].get("max_entity_degree", 500))
     meta = {"n_transacciones": n_txn, "max_entity_degree": tope, "entidades": {}}
 
-    log.info("Grafo heterogéneo sobre %d transacciones | poda de entidad > %d",
-             n_txn, tope)
+    por_entidad = int(cfg["graph"].get("vecinos_por_entidad", 10))
+    log.info("Grafo heterogéneo sobre %d transacciones | %s | el muestreo baja "
+             "%d vecinas por entidad",
+             n_txn,
+             f"poda de entidad > {tope}" if tope > 0 else "SIN poda por grado",
+             por_entidad)
     grados_extra: dict[str, np.ndarray] = {}
 
     # MESES DEL GRAFO. Por defecto, solo los que alguna ventana usa. Construir
@@ -196,23 +200,43 @@ def main():
         codigos, unicas = pd.factorize(claves[presentes], sort=False)
         filas_pres = np.where(presentes.values)[0]
 
-        # PODA CAUSAL. Una entidad con miles de transacciones tendría como vector
-        # la media del dataset entero, y ese vector se repartiría a todos sus
-        # vecinos borrando las diferencias en vez de crearlas (over-smoothing por
-        # hub). Además explota la memoria al muestrear.
+        # E2 — PODA POR GRADO MÁXIMO. Con `max_entity_degree: 0` no se poda y
+        # el grafo queda con TODAS sus conexiones, que es lo recomendado.
         #
-        # Pero el corte se aplica POR TRANSACCIÓN y en su momento, no a la
+        # La justificación original era el over-smoothing: una entidad con miles
+        # de transacciones tendría como vector la media del dataset y se la
+        # repartiría a todos sus vecinos. Pero eso ya lo impide el MUESTREO:
+        # `vecinos_por_entidad: 10` hace que el vector de la entidad se calcule
+        # SIEMPRE con 10 transacciones, sean 30 o 4.887 las que tenga. Una
+        # tarjeta enorme y una pequeña producen vectores igual de específicos.
+        #
+        # Y podar cuesta caro. Medido con `max_entity_degree: 500`:
+        #   · 72 entidades de las 10.106 de `card` (el 0,7%) dejaban sin arista
+        #     al 24,6% del dataset — 54.274 transacciones
+        #   · esas transacciones tenían MÁS fraude que la media (3,39% vs 3,11%)
+        #   · y `__grado_card` se les quedaba en 0, el MISMO valor que una
+        #     transacción sin card1: la red no distinguía "no tengo tarjeta" de
+        #     "mi tarjeta lleva 3.000 compras". La feature quedaba invertida
+        #     justo en las entidades con más historial.
+        #
+        # Si al quitarla el resultado empeora, la causa serán las entidades que
+        # NO son una identidad real (prepago compartida, valores por defecto):
+        # ahí los 10 vecinos son desconocidos. Pero eso pide un filtro de
+        # calidad de entidad, no un tope por número — el tope mantiene las 501
+        # primeras conexiones a esa misma entidad ruidosa y corta las demás.
+        #
+        # Cuando se poda, el corte es POR TRANSACCIÓN y en su momento, no de la
         # entidad entera. Antes se sumaban todas sus filas del periodo y, si el
         # total pasaba del tope, se borraba la entidad COMPLETA: una tarjeta con
         # 12 compras en enero y 600 en febrero perdía también las de enero, que
         # eran perfectamente normales. Futuro decidiendo el pasado.
         #
         # `previas` es el número de transacciones ANTERIORES de esa entidad, así
-        # que sirve para las dos cosas: cortar aquí y ser el `__grado_*` de más
-        # abajo. Se calcula una sola vez.
+        # que sirve para las tres cosas: este corte, el grado mínimo de más
+        # abajo y el `__grado_*`. Se calcula una sola vez.
         previas = _previas_por_entidad(
             codigos, df["TransactionDT"].values[filas_pres])
-        vivas = previas <= tope
+        vivas = (previas <= tope) if tope > 0 else np.ones(len(previas), bool)
         n_podadas = int((~vivas).sum())
         n_ent_afectadas = int(len(np.unique(codigos[~vivas]))) if n_podadas else 0
 
@@ -304,11 +328,26 @@ def main():
                         "demasiado específica y no conecta transacciones entre "
                         "sí. Revisa sus columnas o quítala de config.", nombre, media)
         # El extremo contrario: pocos grupos enormes conectan medio grafo con el
-        # otro medio, y su vector acaba siendo la media del dataset.
-        elif media > tope / 2:
+        # otro medio. Solo tiene sentido avisar SI HAY TOPE — sin él, `tope / 2`
+        # vale 0 y la condición se cumplía siempre: el aviso saltaba en las cinco
+        # entidades a la vez, incluida `uid` con 2,1 txn/entidad, que es
+        # justamente lo contrario de gruesa. Un aviso que salta siempre enseña a
+        # ignorarlo.
+        elif tope > 0 and media > tope / 2:
             log.warning("    '%s' es muy GRUESA (%.1f txn/entidad): puede que la "
                         "poda por grado esté haciendo casi todo el trabajo.",
                         nombre, media)
+
+        # Sin tope, el riesgo cambia de forma. Ya no es el over-smoothing —el
+        # muestreo baja 10 vecinas y punto— sino QUÉ 10: con miles de candidatas,
+        # "las 10 más recientes anteriores" pueden caer todas en la misma hora y
+        # describir un pico de actividad en vez del comportamiento del cliente.
+        # Es informativo, no un fallo: se mide comparando corridas.
+        gigantes = int((np.bincount(ent_idx) > 50 * por_entidad).sum())
+        if gigantes:
+            log.info("    '%s': %d entidades con más de %d transacciones. El "
+                     "muestreo bajará solo %d, muy juntas en el tiempo.",
+                     nombre, gigantes, 50 * por_entidad, por_entidad)
 
     if grados_extra:
         extra = np.stack([grados_extra[k] for k in sorted(grados_extra)], axis=1)
