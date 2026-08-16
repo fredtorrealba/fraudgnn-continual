@@ -12,13 +12,24 @@
 #   grep -E "WARNING|ERROR" pipeline.log     solo lo que salió mal
 #
 # ETAPAS
-#   1 download    Kaggle -> data/raw/                      ~1 min
-#   2 preprocess  CSV -> parquet + split de 6 meses        ~1 min
-#   3 graph       parquet -> grafo PyG (~22M aristas)      ~4 min
-#   4 gnn         GraphSAGE vs GAT, 6 corridas         2-4 h GPU  <- el caro
-#   5 cl          mes 6 semana a semana + fine-tuning      ~15 min
-#   6 xgboost     baseline tabular CONGELADO               ~10 min
-#   7 final       comparación GNN+CL vs baseline           ~1 min
+#   1  download      Kaggle -> data/raw/                        ~1 min
+#   2  preprocess    CSV -> parquet + split de 6 meses          ~1 min
+#   3  graph         grafo PyG + 8 columnas estructurales       ~5 min
+#   4  gnn           GraphSAGE vs GAT, 6 corridas          30 min-4 h  <- el caro
+#   5  oof           gnn_score honesto (K redes, meses 1-4)     ~20 min
+#   6  hybrid        cabeza XGBoost, 3 variantes                ~12 min
+#   7  refit         GNN reentrenada con meses 1-5              ~10 min
+#   8  oof_refit     gnn_score honesto sobre meses 1-5          ~25 min
+#   9  hybrid_refit  cabeza de producción + umbral operativo     ~3 min
+#  10  cl            mes 6 semana a semana; adaptan AMBOS       ~15 min
+#  11  xgboost       baseline tabular CONGELADO (viene en git)   se salta
+#  12  final         baseline vs GNN sola vs híbrido             ~1 min
+#
+# EL SISTEMA HÍBRIDO
+# La cabeza XGBoost recibe 431 features + 8 columnas del grafo + gnn_score, y
+# emite la probabilidad final. Sin la GNN falta una columna: la red queda
+# dentro del sistema. Las etapas `oof` existen porque la GNN memorizó los meses
+# que entrenó: usar su score sobre ellos enseñaría a la cabeza a copiarla.
 #
 # ELEGIR QUÉ CORRER
 #   --only gnn,cl     SOLO esos pasos             (COMA)

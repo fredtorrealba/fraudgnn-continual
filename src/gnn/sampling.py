@@ -1,181 +1,268 @@
 """
-Neighbor sampling 15-10-5 con fallback propio.
+Muestreo de vecindarios sobre el GRAFO HETEROGÉNEO.
 
-PyG NeighborLoader requiere pyg-lib o torch-sparse (compilación nativa que
-suele fallar según la versión de torch/CUDA). Este módulo expone
-`make_neighbor_loader(...)`: usa NeighborLoader si las libs están, y si no,
-cae a `SimpleNeighborLoader` — una implementación en numpy del mismo
-protocolo (sampleo de N vecinos fijos por capa, subgrafo local, nunca el
-grafo completo). Es más lenta pero 100% portable; para el dataset completo
-conviene instalar torch-sparse.
+DOS DECISIONES QUE NO SON COSMÉTICAS
 
-La interfaz del batch imita a NeighborLoader en lo que usa el proyecto:
-  batch.x, batch.edge_index, batch.y, batch.batch_size, batch.n_id
-con los nodos semilla SIEMPRE en las primeras `batch_size` posiciones.
+1. VECINOS POR RECENCIA, NO AL AZAR
+   `temporal_strategy="last"` + `time_attr` resuelve dos cosas de un tiro:
+     · solo se bajan vecinos con tiempo ANTERIOR al del nodo raíz  -> causalidad
+       estricta. El diseño anterior construía las aristas hacia atrás pero luego
+       hacía el grafo NO DIRIGIDO, así que un nodo podía ver el futuro.
+     · y de esos, los N MÁS RECIENTES, que es lo que importa en fraude: lo que
+       hizo esa tarjeta ayer pesa más que lo que hizo hace tres semanas.
+   Exige que las aristas estén ordenadas por tiempo (lo hace build_graph).
+
+2. SEMILLAS BALANCEADAS
+   Un lote al azar de 1.024 transacciones trae ~36 fraudes y ~988 normales. Con
+   `balanceo_semillas` se repiten fraudes REALES hasta llenar la mitad del lote.
+   No se inventa ningún nodo ni arista — un nodo sintético no tendría vecinos y
+   habría que inventarle el grafo. Cada repetición ve un vecindario distinto
+   (el muestreo cambia), así que funciona como aumento de datos.
+
+   Arregla algo que `pos_weight` NO toca: el BatchNorm calcula media y varianza
+   CON EL LOTE, y con 988 normales contra 36 fraudes esas estadísticas son las
+   de una compra normal. El fraude se normalizaba contra una referencia ajena.
+
+   OJO: al balancear hay que BAJAR `pos_weight` (ver gnn.pos_weight_con_balanceo)
+   o el desbalance se corrige dos veces y la red sobrepredice fraude.
+
+REQUISITO: el grafo heterogéneo necesita el sampler nativo (pyg-lib o
+torch-sparse). El fallback casero en numpy solo servía para grafos homogéneos y
+se ha retirado; si falta el sampler, se aborta con instrucciones.
 """
 import numpy as np
 import torch
 
+# ── CÓMO SE COMPARTEN LOS TENSORES ENTRE PROCESOS ──────────────────────────
+# Por defecto PyTorch los pasa con DESCRIPTORES de fichero. Un descriptor solo
+# vale dentro del proceso que lo abrió, y pasarlo a otro necesita un mecanismo
+# del sistema que exige que la cadena de procesos siga en pie.
+#
+# Aquí hay DOS saltos, porque `compare_gnns` paraleliza los estudios de Optuna:
+#
+#     padre  ->  proceso de Optuna (spawn)  ->  worker del DataLoader
+#
+# En ese segundo salto la cadena se rompe: el nieto recibe un número que en su
+# contexto no apunta a nada, y falla al usarlo:
+#
+#   RuntimeError: unable to resize file <filename not specified> to the right
+#   size: Invalid argument (22)      ->  "DataLoader worker exited unexpectedly"
+#
+# NO es falta de espacio en /dev/shm: se comprobó, había 29 GB con 823 MB en uso.
+# Es un descriptor que no vale en el proceso que lo recibe.
+#
+# `file_system` comparte por NOMBRE de fichero en vez de por descriptor, y un
+# nombre sí vale en cualquier proceso. Contrapartida: si algo muere de golpe
+# puede dejar ficheros temporales sueltos.
+#
+# Apareció al paralelizar Optuna. Antes los estudios corrían en serie y los
+# workers eran hijos directos: no había nieto y no había problema.
+try:
+    torch.multiprocessing.set_sharing_strategy("file_system")
+except Exception:
+    pass
 
-def fanouts(cfg: dict) -> list[int]:
-    """
-    Fanouts recortados al número de capas del modelo.
+TXN = "transaction"
 
-    Cada capa es un salto, así que muestrear 3 saltos para un modelo de 1 capa
-    sería traer miles de nodos que nunca se usan. Se toman los PRIMEROS N
-    valores: el fanout grande corresponde al salto más cercano, que es donde
-    está la señal.
-    """
-    g = cfg.get("gnn", {})
-    n = len(g.get("hidden_dims", [256, 128, 64]))
-    return list(g["fanouts"])[:n]
+
+def _tiene_sampler_nativo() -> bool:
+    for m in ("pyg_lib", "torch_sparse"):
+        try:
+            __import__(m)
+            return True
+        except ImportError:
+            continue
+    return False
 
 
 def loader_opts(cfg: dict) -> dict:
-    """Opciones de muestreo del config, listas para pasar al loader."""
+    """Opciones de muestreo del config, listas para el loader."""
     g = cfg.get("gnn", {})
     return {"num_workers": g.get("num_workers", 0),
             "pin_memory": g.get("pin_memory", False),
+            "prefetch_factor": g.get("prefetch_factor", 2),
             "sin_aristas": g.get("sin_aristas", False)}
 
 
-def _has_pyg_sampler() -> bool:
+def fanouts_hetero(data, cfg: dict) -> dict:
+    """
+    Fanouts POR TIPO DE ARISTA, con tantos saltos como capas tenga el modelo.
+
+    En un grafo bipartito llegar de una transacción a otra cuesta DOS saltos:
+
+        transacción -> [entidad] -> otra transacción de la misma entidad
+
+    OJO CON LA DIRECCIÓN. `NeighborLoader` muestrea HACIA ATRÁS: para calcular
+    un nodo baja sus vecinos de ENTRADA. Así que el fanout de un tipo de arista
+    (origen, rel, destino) dice cuántos ORÍGENES se traen al expandir un
+    DESTINO — al revés de lo que sugiere leer el nombre.
+
+        ('transaction','en',entidad)      destino = entidad
+            se usa al expandir una ENTIDAD y trae TRANSACCIONES
+            -> aquí van los `vecinos_por_entidad`
+
+        (entidad,'tiene','transaction')   destino = transacción
+            se usa al expandir una TRANSACCIÓN y trae ENTIDADES
+            -> aquí va 1: una transacción pertenece a UNA entidad de cada tipo
+
+    ESTUVO AL REVÉS y anulaba el grafo entero: se pedían 10 entidades por
+    transacción (y solo hay 1) y UNA transacción por entidad, así que el
+    vecindario era de un nodo. En el log real, con 2048 semillas salían 2049
+    nodos de transacción — un vecino en total. Y con `time_attr` activo, cero.
+    La GNN llevaba TODAS las corridas heterogéneas entrenando como una MLP.
+
+    Verificado con NeighborLoader aislado, semilla t=900 sobre 10 transacciones:
+        invertido  -> [600, 900]                    1 vecino
+        correcto   -> [0, 100, ..., 900]            los 9, y solo pasado
+
+    Con 5 tipos de entidad y 10 por entidad, el vecindario de una transacción es
+    de hasta 50 transacciones, todas anteriores a ella.
+    """
+    # Default de 2 capas: el bipartito necesita dos saltos para que una
+    # transacción alcance a otra. El [256] de antes venía del grafo homogéneo.
+    n_capas = len(cfg["gnn"].get("hidden_dims", [64, 64]))
+    por_entidad = int(cfg["graph"].get("vecinos_por_entidad", 10))
+    out = {}
+    for et in data.edge_types:
+        # et[0] == TXN  ->  ('transaction','en',entidad)  ->  expande ENTIDAD
+        cuantos = por_entidad if et[0] == TXN else 1
+        out[et] = [cuantos] * n_capas
+    return out
+
+
+def semillas_balanceadas(data, mask, cfg, generador=None) -> torch.Tensor:
+    """
+    Índices semilla con ~50% de fraude, repitiendo fraudes REALES.
+
+    Devuelve un tensor de índices (con repeticiones) apto para `input_nodes`.
+    Si no hay fraudes o el balanceo está desactivado, devuelve la máscara tal cual.
+    """
+    if not cfg["gnn"].get("balanceo_semillas", False):
+        return mask
+    idx = torch.where(mask)[0]
+    y = data[TXN].y[idx]
+    fraude, normal = idx[y == 1], idx[y == 0]
+    if len(fraude) == 0 or len(normal) == 0:
+        return mask
+    rng = generador or np.random.default_rng(42)
+    # tantas normales como el conjunto original, y fraudes repetidos hasta igualar
+    n = len(normal)
+    reps = rng.choice(len(fraude), size=n, replace=True)
+    return torch.cat([normal, fraude[torch.tensor(reps, dtype=torch.long)]])
+
+
+def cerrar_loader(loader) -> None:
+    """
+    Mata los workers de un loader EN CUANTO deja de usarse.
+
+    Con `persistent_workers=True` los procesos siguen vivos hasta que el
+    intérprete termina. Nadie los cerraba, así que se acumulaban: cada trial de
+    Optuna dejaba 12 procesos colgados y el proceso tardaba minutos en morir
+    joinéandolos todos, DESPUÉS de haber escrito su último log.
+
+    Medido en el smoke (2 trials x 2 arquitecturas = 4 loaders):
+        último log de `gnn` 05:11:29  ->  la etapa acabó 05:23:31   12 min
+        último log de `oof` 05:23:42  ->  la etapa acabó 05:25:43    2 min
+
+    En la corrida real son 30 trials x 2 arquitecturas = 60 loaders, o sea 720
+    procesos acumulados. Por eso esto no es cosmético.
+
+    Va con try/except porque `_shutdown_workers` es API privada de PyTorch: si
+    cambia de nombre, se pierde la limpieza pero no se rompe el entrenamiento.
+    """
     try:
-        import pyg_lib  # noqa: F401
-        return True
-    except ImportError:
+        it = getattr(loader, "_iterator", None)
+        if it is not None:
+            it._shutdown_workers()
+            loader._iterator = None
+    except Exception:
         pass
-    try:
-        import torch_sparse  # noqa: F401
-        return True
-    except ImportError:
-        return False
 
 
-class _MiniBatch:
-    __slots__ = ("x", "edge_index", "y", "batch_size", "n_id")
-
-    def __init__(self, x, edge_index, y, batch_size, n_id):
-        self.x, self.edge_index, self.y = x, edge_index, y
-        self.batch_size, self.n_id = batch_size, n_id
-
-    def to(self, device):
-        self.x = self.x.to(device)
-        self.edge_index = self.edge_index.to(device)
-        self.y = self.y.to(device)
-        return self
-
-
-class SimpleNeighborLoader:
-    """Sampling k-hop con fanouts fijos, sobre listas de adyacencia numpy."""
-
-    _adj_cache: dict[int, np.ndarray] = {}
-
-    def __init__(self, data, num_neighbors, input_nodes, batch_size,
-                 shuffle=True, seed=42):
-        self.data = data
-        self.fanouts = list(num_neighbors)
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-        self.rng = np.random.default_rng(seed)
-        self.seeds = torch.where(input_nodes)[0].numpy() \
-            if input_nodes.dtype == torch.bool else np.asarray(input_nodes)
-        self._build_adjacency()
-
-    def _build_adjacency(self):
-        key = id(self.data)
-        if key in SimpleNeighborLoader._adj_cache:
-            self.indptr, self.indices = SimpleNeighborLoader._adj_cache[key]
-            return
-        ei = self.data.edge_index.numpy()
-        n = self.data.num_nodes
-        order = np.argsort(ei[0], kind="stable")
-        src_sorted, dst_sorted = ei[0][order], ei[1][order]
-        self.indptr = np.zeros(n + 1, dtype=np.int64)
-        np.add.at(self.indptr, src_sorted + 1, 1)
-        self.indptr = np.cumsum(self.indptr)
-        self.indices = dst_sorted
-        SimpleNeighborLoader._adj_cache[key] = (self.indptr, self.indices)
-
-    def _neighbors(self, node: int, k: int) -> np.ndarray:
-        lo, hi = self.indptr[node], self.indptr[node + 1]
-        neigh = self.indices[lo:hi]
-        if len(neigh) <= k:
-            return neigh
-        return self.rng.choice(neigh, size=k, replace=False)
-
-    def __iter__(self):
-        seeds = self.rng.permutation(self.seeds) if self.shuffle else self.seeds
-        for i in range(0, len(seeds), self.batch_size):
-            batch_seeds = seeds[i:i + self.batch_size]
-            nodes = list(batch_seeds)
-            seen = set(nodes)
-            frontier = list(batch_seeds)
-            edges = []
-            for k in self.fanouts:                 # 15 -> 10 -> 5
-                nxt = []
-                for u in frontier:
-                    for v in self._neighbors(int(u), k):
-                        edges.append((int(v), int(u)))  # mensaje vecino->nodo
-                        if v not in seen:
-                            seen.add(int(v))
-                            nodes.append(int(v))
-                            nxt.append(int(v))
-                frontier = nxt
-            local = {n: j for j, n in enumerate(nodes)}
-            if edges:
-                ei = torch.tensor([[local[a] for a, _ in edges],
-                                   [local[b] for _, b in edges]],
-                                  dtype=torch.long)
-                ei = torch.cat([ei, ei.flip(0)], dim=1)
-            else:
-                ei = torch.zeros((2, 0), dtype=torch.long)
-            n_id = torch.tensor(nodes, dtype=torch.long)
-            yield _MiniBatch(self.data.x[n_id], ei, self.data.y[n_id],
-                             len(batch_seeds), n_id)
-
-    def __len__(self):
-        return int(np.ceil(len(self.seeds) / self.batch_size))
-
-
-def make_neighbor_loader(data, num_neighbors, input_nodes, batch_size,
-                         shuffle=True, num_workers=0, pin_memory=False,
-                         sin_aristas=False):
+def make_hetero_loader(data, cfg, mask, shuffle=True, batch_size=None,
+                       balancear=False, seed=42):
     """
-    NeighborLoader de PyG si hay backend nativo; si no, el fallback.
+    NeighborLoader heterogéneo con muestreo temporal.
 
-    `num_workers` y `pin_memory` vienen de config.yaml (gnn.num_workers y
-    gnn.pin_memory) y SOLO aplican al NeighborLoader de PyG: el fallback es
-    una clase propia, no un DataLoader, y los ignora.
+    `mask` puede ser una máscara booleana o un tensor de índices (lo que
+    devuelve `semillas_balanceadas`).
     """
-    if sin_aristas:
-        # ABLACIÓN: se anula el grafo dejando edge_index vacío. Cada nodo queda
-        # aislado, así que la convolución se reduce a su transformación propia
-        # (SAGEConv conserva root_weight) y el modelo pasa a ser una MLP con la
-        # misma capacidad. Sirve para responder una sola pregunta: ¿el AUC
-        # depende de las aristas o el grafo nunca aportó nada?
-        # NO se toca graph.pt: el cambio es solo en memoria, por corrida.
-        import torch as _t
-        if data.edge_index.numel():
-            data = data.clone()
-            data.edge_index = _t.zeros((2, 0), dtype=_t.long)
+    if not _tiene_sampler_nativo():
+        raise SystemExit(
+            "El grafo heterogéneo necesita el sampler nativo de PyG y no está "
+            "instalado.\n"
+            "  pip install pyg-lib torch-sparse -f "
+            "https://data.pyg.org/whl/torch-${TORCH}+${CUDA}.html\n"
+            "Ver scripts/setup_runpod.sh, que lo resuelve automáticamente.")
 
-    if _has_pyg_sampler():
-        from torch_geometric.loader import NeighborLoader
-        # pyg-lib exige tensores contiguos. Los grafos generados antes de
-        # arreglar build_graph traen edge_index como vista transpuesta
-        # (stride (1,2)) y revientan en index_sort: se normalizan aquí para
-        # no obligar a reconstruir el grafo.
-        if not data.edge_index.is_contiguous():
-            data.edge_index = data.edge_index.contiguous()
-        extra = {}
-        if num_workers and int(num_workers) > 0:
-            # persistent_workers evita respawnear los procesos en CADA época
-            # (30 épocas x 6 corridas = mucho arranque desperdiciado).
-            extra = {"num_workers": int(num_workers), "persistent_workers": True}
-        return NeighborLoader(data, num_neighbors=num_neighbors,
-                              input_nodes=input_nodes,
-                              batch_size=batch_size, shuffle=shuffle,
-                              pin_memory=bool(pin_memory), **extra)
-    return SimpleNeighborLoader(data, num_neighbors, input_nodes,
-                                batch_size, shuffle)
+    from torch_geometric.loader import NeighborLoader
+
+    opts = loader_opts(cfg)
+    if opts["sin_aristas"]:
+        # ABLACIÓN: se vacían todas las aristas. Cada transacción queda aislada
+        # y el modelo se reduce a una MLP con la misma capacidad. Responde una
+        # sola pregunta: ¿el AUC depende del grafo o nunca lo estaba usando?
+        # NO toca graph.pt: el cambio es en memoria, por corrida.
+        data = data.clone()
+        for et in data.edge_types:
+            data[et].edge_index = torch.empty((2, 0), dtype=torch.long)
+
+    semillas = semillas_balanceadas(data, mask, cfg,
+                                    np.random.default_rng(seed)) if balancear else mask
+
+    # Los workers se escalan con el TAMAÑO, no se copian del config a ciegas.
+    # Levantar 12 procesos cuesta ~60 s cuando el padre ya tiene contexto CUDA y
+    # el grafo en memoria: cada fork lo hereda. Eso se paga por CADA loader, y
+    # `oof` crea uno por fold y Optuna uno por trial. Medido en el smoke:
+    # entrenar un fold de 4.000 nodos tardaba 2 s el primero y 61 s el segundo,
+    # todo en el arranque de los workers, no en muestrear.
+    # Con 410.000 nodos (la corrida real) el reparto sí compensa y se usan los 12.
+    # Dos casos con costes opuestos, y `shuffle` los distingue sin más pistas:
+    #   shuffle=True   ENTRENAR. El loader se crea una vez y se recorre en cada
+    #                  época (persistent_workers), así que el arranque se
+    #                  amortiza y los workers compensan siempre.
+    #   shuffle=False  PUNTUAR. Se crea y se usa UNA vez: arrancar 12 procesos
+    #                  ES el coste. Medido: un fold del OOF pasó de 61 s a 2 s
+    #                  al quitarlos.
+    # El umbral de tamaño sigue para conjuntos grandes de inferencia, donde
+    # muestrear sí domina sobre el arranque.
+    n_semillas = int(semillas.sum()) if semillas.dtype == torch.bool else len(semillas)
+    n_w = int(opts["num_workers"]) if (shuffle or n_semillas >= 20_000) else 0
+    extra = {}
+    if n_w:
+        # persistent_workers evita respawnear procesos en CADA época.
+        # prefetch_factor = lotes que cada worker deja LISTOS por adelantado.
+        # Con el defecto (2) los workers terminan y se quedan esperando: medido
+        # en la corrida real, 12 workers al 2,5% de CPU y la GPU al 5% — nadie
+        # saturado porque todos esperaban. Subirlo hace que sigan muestreando
+        # mientras la GPU consume, que es lo que llena la tubería.
+        # Coste: RAM = workers x prefetch x tamaño del lote.
+        extra = {"num_workers": n_w, "persistent_workers": True,
+                 "prefetch_factor": int(opts["prefetch_factor"])}
+
+    # Generador EXPLÍCITO para el shuffle. Sin él, DataLoader usa el generador
+    # global de torch, así que el orden de los lotes depende de cuánto azar se
+    # haya consumido antes de crear el loader. Funciona por accidente mientras
+    # nadie meta una llamada aleatoria en medio; con uno propio, el orden es el
+    # mismo siempre.
+    gen = torch.Generator()
+    gen.manual_seed(int(seed))
+
+    return NeighborLoader(
+        data,
+        num_neighbors=fanouts_hetero(data, cfg),
+        input_nodes=(TXN, semillas),
+        batch_size=batch_size or cfg["gnn"]["batch_size"],
+        shuffle=shuffle,
+        generator=gen,
+        time_attr="time",              # causalidad: solo vecinos anteriores
+        temporal_strategy="last",      # y de esos, los más recientes
+        pin_memory=bool(opts["pin_memory"]),
+        **extra,
+    )
+
+
+def proporcion_fraude(batch) -> float:
+    """Fracción de fraude entre los nodos SEMILLA del lote (para el log)."""
+    n = batch[TXN].batch_size
+    return float(batch[TXN].y[:n].mean()) if n else 0.0

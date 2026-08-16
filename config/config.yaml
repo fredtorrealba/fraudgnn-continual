@@ -16,7 +16,12 @@ compute:
   # Con -1 se lanzarían 96 hilos para 7 núcleos: el kernel quema la cuota en
   # milisegundos y CONGELA el proceso el resto de cada ventana de 100 ms
   # (cgroup throttling). Poner aquí el número real lo evita.
-  n_jobs: 8
+  # Pod RTX 4000 Ada: 16 vCPU / 53 GB / 20 GB VRAM. 14 deja 2 vCPU al
+  # SO y al proceso que alimenta la GPU. Manda en las etapas de CPU:
+  # el kNN de SMOTE (594.273 x 95) y las partes de XGBoost que no van
+  # en GPU. Durante `gnn` no compite con num_workers: el DataLoader
+  # fija set_num_threads(1) dentro de cada worker (verificado).
+  n_jobs: 14                       # 16 vCPU menos 2 para el SO
 
 paths:
   raw_dir: "data/raw"              # train_transaction.csv + train_identity.csv (IEEE-CIS)
@@ -49,22 +54,151 @@ data:
   # División temporal estricta (walk-forward, sin data leakage)
   # TransactionDT es segundos desde un t0 de referencia -> mes = DT // (86400*30)
   seconds_per_month: 2592000       # 86400 * 30
+  # Meses que llegan a full.parquet. Vacío = los que usan las `ventanas`.
+  # Descartarlos aquí, y no más adelante, es lo que garantiza que ninguna
+  # estadística (mapa de categorías, mediana de imputación) pueda calcularse
+  # con meses que el experimento no usa.
+  meses: []
+
   train_months: [1, 2, 3, 4]       # entrenamiento original (~470K txn)
   val_month: 5                     # validación
   test_month: 6                    # test -> se divide en semanas ("futuro que llega")
   test_weeks: 4                    # el mes 6 se trata como 4 semanas de operación
 
 graph:
-  # Nodos = transacciones, aristas = entidades compartidas
-  edge_entities:                   # columnas que definen "misma entidad"
-    card: ["card1", "card2", "card3", "card5", "addr1"]  # huella de tarjeta
-    email: ["P_emaildomain"]
-    device: ["DeviceInfo", "id_30", "id_31"]             # huella de dispositivo
-  window_days: 30                  # ventana temporal para conectar
-  max_edges_per_node: 50           # tope anti-hub
+  # GRAFO HETEROGÉNEO. Antes las transacciones se conectaban ENTRE SÍ cuando
+  # compartían entidad (10,99 M aristas). Ahora hay nodos de ENTIDAD y las
+  # aristas son bipartitas transacción <-> entidad (~2,5 M).
+  #
+  # Por qué cambia algo: el nodo de entidad tiene su PROPIO vector aprendido.
+  # Antes el vecindario se resumía con una media fija; ahora "esta tarjeta"
+  # es una representación que la red entrena y comparte entre sus
+  # transacciones. Los nodos de entidad NO llevan features propias — su
+  # contenido sale de agregar sus transacciones, lo que los hace inductivos:
+  # una entidad que aparece por primera vez en el mes 6 funciona igual.
+  entidades:
+    # `cols`  columnas que forman la clave. Si CUALQUIERA es nula -> no hay
+    #         nodo ni arista. Nunca se rellena con el texto "nan": hacerlo
+    #         convertía el patrón de ausencia en parte de la identidad y
+    #         partía a un mismo cliente en grupos distintos.
+    # `usa_d1` añade (día - D1) a la clave. D1 es "días desde el primer uso
+    #         de la tarjeta", así que día-D1 es CONSTANTE por cliente: es lo
+    #         que distingue clientes que colisionan en el mismo card1.
+    uid:    {cols: ["card1", "addr1"], usa_d1: true}      # el cliente real
+    card:   {cols: ["card1", "card2", "card3", "card5"]}  # la tarjeta
+    email:  {cols: ["P_emaildomain", "card1"]}            # card1 evita el hub de gmail
+    device: {cols: ["DeviceInfo", "id_30", "id_31", "id_33"]}   # cobertura ~24%
+    net:    {cols: ["id_13", "id_17", "id_19", "id_20"]}        # cobertura ~24%
+  # Entidades con más transacciones que esto se PODAN. Su vector sería la
+  # media del dataset entero y se repartiría a todos sus vecinos, borrando
+  # diferencias en vez de crearlas. Distinto de un tope por nodo: limita el
+  # tamaño de la ENTIDAD.
+  # Meses sobre los que se construye el grafo. Vacío = los que usan las
+  # `ventanas`. Limitarlo no es solo velocidad: el `__grado_*` contaba las
+  # transacciones de la entidad en TODO el dataset, así que una fila de enero
+  # llevaba el grado que su tarjeta alcanzaría en junio — futuro metido en una
+  # feature. Los nodos de transacción se conservan todos (node_idx es el índice
+  # de fila de full.parquet); lo que se limita son las aristas y los grados.
+  meses: []                        # [] = deducido de `ventanas`
+
+  # E2 — TOPE POR GRADO. 0 = SIN PODA (recomendado): el grafo queda con todas
+  # sus conexiones y el corte lo hace el MUESTREO, que ya baja solo 10
+  # transacciones por entidad. Podar aquí era redundante y caro: con 500, el
+  # 0,7% de las entidades de `card` dejaba sin arista al 24,6% del dataset
+  # —justo el tramo con más fraude— y además ponía `__grado_card` a 0 en las
+  # tarjetas con MÁS historial, indistinguibles de una transacción sin card1.
+  #   0    sin poda; manda `vecinos_por_entidad`
+  #   500  comportamiento previo a E2
+  max_entity_degree: 0
+  # E1 — GRADO MÍNIMO, en la dirección entidad -> transacción.
+  # Una transacción sin ninguna anterior en su entidad no tiene de quién
+  # enterarse: lo único que recibiría por ahí es su propio eco de vuelta. En
+  # `uid` eso pasaba en 59.189 de sus 94.901 nodos (62%), o sea el 26,8% del
+  # dataset. La dirección transacción -> entidad se conserva ENTERA: quitar la
+  # primera compra de un cliente dejaría a las siguientes sin saber de ella.
+  #   1 = necesita al menos una anterior (recomendado)
+  #   0 = desactiva la poda, comportamiento previo a E1
+  min_previas_entidad: 1
+  vecinos_por_entidad: 10          # cuántas transacciones trae cada entidad
+  # Features derivadas, para recuperar lo que daban las columnas C (conteos) y
+  # D (tiempos) que la ablación quita. Quién las calcula NO es lo mismo:
+  #
+  #   __hora_dia          preprocess   hora del día en [0,1]. TransactionDT se
+  #                                    excluye por ser identificador, así que sin
+  #                                    esto nadie ve la hora. CÍCLICA: las 3 de
+  #                                    la mañana son 0.125 en enero y en junio,
+  #                                    así que se solapa al 99.9% entre splits.
+  #
+  #   __delta_anterior    preprocess   log1p(segundos desde la compra ANTERIOR de
+  #                                    la misma card1); -1 si no hay anterior.
+  #                                    Es lo que daba D1. Causal (diff hacia
+  #                                    atrás) y comparable entre meses: "hace 2
+  #                                    horas" vale igual en enero que en junio.
+  #                                    OJO: al fabricarla se devuelve parte de lo
+  #                                    que quita la ablación — decláralo al
+  #                                    comparar corridas.
+  #
+  #   __grado_<entidad>   build_graph  cuántas transacciones tiene su entidad,
+  #                                    antes de que el muestreo cape a 10. Es
+  #                                    estructura del grafo, por eso va aquí y
+  #                                    no en preprocess.
+  #
+  # DESCARTADA — __pos_temporal (posición en los 6 meses): train ocupa
+  # [0, 0.667] y validación [0.667, 0.834], 0% de solapamiento. Los árboles no
+  # extrapolan, así que fuera de la ventana es una constante; dentro da un valor
+  # único por fila y permite memorizar. Medido: los meses in-sample pasaron de
+  # 0.53 a 0.86 de PR-AUC y el mes 5 no se movió. No la vuelvas a meter.
+  #
+  # Este flag solo controla los __grado_*; las dos de preprocess van siempre.
+  features_derivadas: true
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VENTANAS TEMPORALES — qué filas hace cada trabajo
+#
+# El diseño anterior entrenaba la GNN y las cabezas con los MISMOS meses 1-4, y
+# por eso hacía falta el OOF: la red memorizaba esos meses, así que K redes se
+# repartían el trabajo de describirlos. Pero cada una de esas K redes aprende sus
+# propios pesos, y la dimensión 7 de su embedding mide algo distinto en cada una.
+# XGBoost aprendía cortes sobre unos ejes y los aplicaba sobre otros.
+#     MEDIDO: gnn_mas_tabular cortó en 2 árboles (control: 517) y su PR-AUC
+#     cayó de 0.4803 a 0.1159. No es que el grafo no aporte: es que las
+#     columnas estaban revueltas.
+#
+# Aquí la GNN entrena en un bloque y las cabezas en OTRO. Una sola red describe
+# todo lo que las cabezas ven, nunca lo memorizó, y las 32 columnas significan lo
+# mismo en toda la tabla. El OOF desaparece.
+#
+# PILOTO (2 meses de los 6). Cada bloque UN trabajo, sin solaparse:
+#   gnn_entrena       ~65.500 txn    entrena las 6 redes
+#   gnn_valida        ~32.700 txn    elige cuál gana
+#   cabezas_entrenan  ~77.700 txn    entrena las 3 cabezas
+#   cabezas_validan   ~22.500 txn    nº de árboles y umbral
+#   examen            ~22.500 txn    el número final
+#
+# Cada bloque queda con ~1.374 fraudes -> IC95 ~±0.10. Con un solo mes serían
+# ~810 y ±0.13: el ruido tapaba cualquier diferencia pequeña.
+#
+# PARA ESCALAR al diseño completo, cambia solo esto (y quita `semanas`):
+#   gnn_entrena:      {mes: 1}   ... o una lista de meses
+#   cabezas_entrenan: [{mes: 3}, {mes: 4}]
+#   cabezas_validan:  {mes: 5}
+#   examen:           {mes: 6}
+#
+# Los meses 3-6 quedan INTACTOS en el piloto: el examen de verdad sigue siendo
+# el mes 6, y no se toca hasta la corrida completa.
+# ═══════════════════════════════════════════════════════════════════════════
+ventanas:
+  gnn_entrena:      {mes: 1, semanas: [1, 2]}
+  gnn_valida:       {mes: 1, semanas: [3]}
+  cabezas_entrenan: [{mes: 1, semanas: [4]}, {mes: 2, semanas: [1, 2]}]
+  cabezas_validan:  {mes: 2, semanas: [3]}
+  examen:           {mes: 2, semanas: [4]}
 
 gnn:
-  in_dim: 431                      # features por transacción (valor real del grafo)
+  # SOLO informativo: el ancho real lo lee cada entrenamiento del propio
+  # grafo (train_gnn.py y compare_gnns.py lo sobrescriben). Depende de la
+  # ablación y de las features derivadas, así que no intentes cuadrarlo.
+  in_dim: 70                       # 63 tabulares + hora/posición + grados
   # --- PROFUNDIDAD: cada capa es un SALTO en el grafo -------------------------
   # Descomenta UNA. El número de capas es len(hidden_dims) y los `fanouts` se
   # recortan solos a esa longitud (src/gnn/sampling.py: fanouts()).
@@ -76,17 +210,56 @@ gnn:
   # Coste por batch de 256 nodos semilla: 3.4K nodos con 1 capa, 12.3K con 2,
   # 23.7K con 3 — o sea que 1 capa entrena ~7x más barato.
   #
-  hidden_dims: [256]               # 1 capa   431 -> 256
-  # hidden_dims: [256, 128]        # 2 capas  431 -> 256 -> 128
-  # hidden_dims: [256, 128, 64]    # 3 capas  431 -> 256 -> 128 -> 64  (original)
+  # MÍNIMO DOS CAPAS. En el grafo bipartito, llegar de una transacción a otra
+  # cuesta dos saltos: transacción -> entidad -> transacción. Con una sola capa
+  # los nodos de entidad siguen siendo ceros cuando alcanzan a la transacción y
+  # el vecindario NO influye — medido: diferencia con y sin aristas = 0.000000.
+  # El modelo lanza un error si se pone menos de 2, para que no pase en silencio.
+  #
+  #   [64, 64]        2 saltos bipartitos = 1 salto entre transacciones
+  #   [64, 64, 64]    3 capas; el tercero ya mezcla entidades distintas
+  #
+  # 64 y no 256: con embeddings densos no hace falta tanta anchura, y entrena
+  # mucho más rápido. La salida hacia XGBoost la fija `mlp_head_dim`, no esto.
+  hidden_dims: [64, 64]
+  #
+  # Las alternativas NO estrechan la salida a propósito: el embedding que
+  # recibe la cabeza es `hidden_dims[-1]`, así que la pirámide clásica
+  # [256,128,64] daría un vector de 64 — más estrecho que el de una sola capa.
   #
   mlp_head_dim: 32                 # cabeza clasificadora: última capa -> 32 -> 1
-  dropout: 0.3
+  dropout: 0.2
   fanouts: [15, 10, 5]             # vecinos por salto; se usan los primeros N
-  batch_size: 1024
+  # Lotes pequeños dan gradientes más ruidosos, que ayudan a escapar de
+  # mínimos locales. Con balanceo de semillas, 256 son 128 fraudes + 128
+  # normales por lote.
+  # Lotes GRANDES a propósito. El cuello de botella NO es el cálculo sino el
+  # número de transferencias worker -> proceso principal: cada lote de un grafo
+  # heterogéneo son 30+ tensores (5 tipos de nodo, 10 de arista) que hay que
+  # serializar. Medido con 256: 1.604 lotes por época, GPU al 5%, 3,7 min/época.
+  # Con 1024 son 401 lotes — mismo trabajo, la cuarta parte de viajes.
+  # VRAM: 250 MB con 256, ~1 GB con 1024, de 19.500 disponibles.
+  # FÍJALO ANTES de la primera corrida: cambia la dinámica de entrenamiento y
+  # las 6 semillas deben compartirlo.
+  # MEDIDO en la corrida real (/proc, 20 muestras): el proceso principal estaba
+  # en R (ejecutando) 14 de 20 veces y los 12 workers en S (durmiendo) 20 de 20,
+  # con la GPU al 4%. O sea: el muestreo NO es el cuello y el cálculo tampoco.
+  # El tiempo se va en ORQUESTAR: HeteroConv recorre los 10 tipos de arista en
+  # un bucle de Python y lanza una convolución por cada uno.
+  #     10 aristas x 2 capas x 1.604 lotes = 32.000 kernels diminutos por época
+  # Cada kernel se despacha en microsegundos y la GPU espera al siguiente: el
+  # coste está en el Python que los lanza, y ese coste es POR LOTE.
+  # Con 2048 son 201 lotes/época en vez de 1.604: 8x menos orquestación.
+  # VRAM: 250 MB con 256 -> ~1,5 GB con 2048, de 19.500 disponibles.
+  # FÍJALO ANTES de la primera corrida: las 6 semillas deben compartirlo.
+  batch_size: 2048
   lr: 0.001
-  epochs: 30
-  patience: 5                      # early stopping sobre AUC de validación
+  # Regularización L2: penaliza pesos grandes para que la red no memorice
+  # los fraudes concretos del entrenamiento. No se estaba aplicando en el
+  # bucle principal, solo dentro de la búsqueda de Optuna.
+  weight_decay: 0.0005
+  epochs: 50
+  patience: 10             # early stopping sobre PR-AUC de validación                      # early stopping sobre AUC de validación
   # Épocas del paso `refit`. Vacío = usar el pico de la corrida ganadora, que
   # compare_gnns anota en selected_model.json. Poner un número aquí permite
   # relanzar SOLO el refit con otra cantidad, sin repetir las 6 corridas.
@@ -101,11 +274,103 @@ gnn:
   # ABLACIÓN: true anula TODAS las aristas (cada nodo queda aislado y el modelo
   # se convierte en una MLP con la misma capacidad). Responde si el grafo aporta
   # algo: si el AUC no baja, la GNN nunca lo estaba usando. No modifica graph.pt.
-  sin_aristas: true
+  sin_aristas: false
+  # 12 de los 16 vCPU muestreando; los 4 restantes, para el proceso
+  # principal y la GPU. El muestreo de vecinos es el cuello de botella
+  # de `gnn` y `oof` (las dos etapas caras), no las multiplicaciones.
+  # 8. La medición que decía "los workers duermen" se hizo con batch 256, donde
+  # cada lote muestreaba ~45.000 nodos. Con batch 2048 son ~358.000 por lote:
+  # ocho veces más trabajo, y con 4 workers la GPU se quedaba sin datos —
+  # oscilaba entre 88% y 30% en vez de mantenerse.
+  # Con paralelo_optuna=2 son 2 x 8 = 16 workers sobre 16 vCPU; no están al
+  # 100% cada uno, así que la sobresuscripción es nominal.
   num_workers: 4                   # 0 = todo en el proceso principal
+  # 8 x 8 = 64 lotes en cola por proceso: colchón de sobra para los baches.
+  prefetch_factor: 4               # 4 workers x 4 = 16 lotes en cola
   pin_memory: true                 # copia CPU->GPU más rápida (cientos de MB/batch)
-  seeds: [42, 123, 2026]           # 3 corridas para la comparación GraphSAGE vs GAT
+  seeds: [42, 123, 2026]           # 3 corridas por arquitectura
   gat_heads: 4
+  # GATv2 en vez de GAT: la atención de GAT es estática (el ranking de vecinos
+  # no depende del nodo que pregunta). GATv2 lo corrige y es estrictamente más
+  # expresivo — Brody et al., ICLR 2022.
+  arquitecturas: ["graphsage", "gatv2"]
+  # AGREGACIÓN de vecinos. La media destruye la dispersión, y la dispersión es
+  # lo ÚNICO que no está ya en las columnas del dataset: C1-C14 son conteos,
+  # D1-D15 deltas temporales y V1-V339 agregados de historial — ninguna trae
+  # varianza. Con ["mean","max","std"] la red recibe el centro, el extremo y la
+  # irregularidad del vecindario.
+  #   una tarjeta con 15 compras de 20€ y una de 800€
+  #     mean -> 78€    (el pico desaparece)
+  #     max  -> 800€   (el pico sobrevive)
+  #     std  -> 195€   (y se ve que es irregular)
+  #   sum: distingue "tengo pocos vecinos" de "tengo muchos". OJO: NO recupera
+  #        el conteo real, porque el muestreo ya capó a `vecinos_por_entidad`
+  #        (una entidad con 3 transacciones y otra con 300 traen 3 y 10). El
+  #        conteo de verdad lo da la feature __grado_<entidad>, contada sobre el
+  #        grafo completo. `sum` solo añade "cuántos de los 10 huecos se
+  #        llenaron", que es información parcial pero gratis.
+  aggr: ["mean", "max", "std", "sum"]
+  # DESBALANCE por muestreo, no por pérdida: cada lote lleva 50% fraudes,
+  # repitiendo fraudes REALES como semilla. No se inventa ningún nodo ni arista
+  # (un nodo sintético no tendría vecinos), y cada repetición ve un vecindario
+  # distinto, así que funciona como aumento de datos.
+  # Arregla algo que pos_weight no toca: el BatchNorm calcula sus estadísticas
+  # CON EL LOTE, y con 988 normales contra 36 fraudes esas estadísticas son las
+  # de una compra normal.
+  balanceo_semillas: true
+  # OJO: con los lotes balanceados hay que BAJAR pos_weight o el desbalance se
+  # corrige dos veces y la red sobrepredice fraude. 1.0 = sin corrección extra.
+  pos_weight_con_balanceo: 1.0
+  # Búsqueda de hiperparámetros para la GNN. Hasta ahora XGBoost recibía 30
+  # trials y la GNN cero: la comparación no era justa en esfuerzo de ajuste.
+  # No es paridad de cómputo (un trial de XGBoost cuesta 13 s y uno de GNN
+  # ~5 min) pero sí de protocolo, que es lo que se defiende.
+  # 12 y no 30: cada trial son epochs//4 = 12 épocas sobre 410.601 nodos.
+  # A 30 trials x 2 arquitecturas la etapa `gnn` sola pasaba de 40 horas.
+  # Sigue siendo búsqueda bayesiana con el mismo sampler; decláralo en la
+  # memoria junto a los 30 trials que sí reciben las cabezas XGBoost.
+  # 30, los MISMOS que reciben las tres cabezas XGBoost. Estuvo en 12 mientras
+  # cada trial costaba 44 min; con batch 2048 y los estudios en paralelo bajó a
+  # ~6 min y ya no hay razón para la asimetría. Importa para la defensa: con 12
+  # se podría objetar que la GNN salió peor por haberla buscado menos.
+  # Además el MedianPruner necesita 5 trials de arranque: con 12 solo 7 eran
+  # podables, con 30 son 25 y la poda trabaja de verdad.
+  optuna_trials: 100
+
+  # PRESUPUESTO POR TIEMPO. Si está puesto, MANDA sobre optuna_trials.
+  #
+  # "30 trials cada una" suena justo y no lo es: con `ancho` y `capas` en el
+  # espacio, un trial cuesta entre 1,7 y 29 minutos. Medido el 15/08, los mismos
+  # 30 trials fueron 2 h para graphsage y 11 h para gatv2 — cinco veces más
+  # máquina por la misma etiqueta, y el pipeline entero esperando a la lenta.
+  #
+  # Con minutos las dos reciben lo mismo de verdad. GraphSAGE meterá más trials
+  # que GATv2, y eso ES el resultado: una arquitectura que necesita media hora
+  # por configuración es peor candidata, y así se ve en vez de esconderse.
+  # Ponlo a 0 o coméntalo para volver al presupuesto por número de trials.
+  optuna_presupuesto_min: 0
+  # Ningún trial puede pasar de aquí. El `timeout` de arriba no corta un trial
+  # ya empezado: sin este tope, el trial 3 de gatv2 se comió 29 minutos él solo.
+  optuna_tope_trial_min: 10
+
+  # ── PARALELISMO de la etapa `gnn` ─────────────────────────────────────────
+  # Las 8 tareas son independientes: 2 estudios de Optuna + 6 corridas que solo
+  # cambian de semilla. En serie la máquina quedaba al 13% de CPU y 11% de GPU.
+  #
+  # Cada proceso cuesta ~1,5 GB de VRAM y ~2 GB de RAM (su copia de graph.pt),
+  # más `num_workers` procesos de muestreo. Con 20 GB de VRAM y 62 de RAM el
+  # techo práctico está en 4-6. Súbelos hasta que `nvidia-smi` marque ~80% de
+  # VRAM o el CPU se sature; bájalos si ves OOM.
+  #
+  #   1 = en serie (como antes)
+  #   2 = las dos arquitecturas de Optuna a la vez
+  #   3-4 = además, varias semillas a la vez
+  paralelo_optuna: 2               # tope: son 2 arquitecturas
+  # 2, no 6: las corridas heredan los hiperparámetros ganadores, y con `capas 3`
+  # cada proceso pide ~8 GB de VRAM. 6 x 8 = 48 GB sobre una tarjeta de 20 es
+  # OOM seguro. Con 2 son 16 GB — que es lo que hizo Optuna toda la noche del
+  # 15/08 al 78%. Por CPU sí cabrían 6 (1,2 núcleos por proceso); manda la VRAM.
+  paralelo_corridas: 2
   threshold: 0.5                   # umbral de alerta P(fraude) >= 0.5
   kpi_auc: 0.93                    # KPI OE2: AUC-ROC > 0.93
 
@@ -114,12 +379,123 @@ xgboost:
   smote:
     sampling_strategy: 0.5         # fraudes sintéticos hasta ratio 1:2 (solo en TRAIN)
     k_neighbors: 5
+    # Se midió contra scale_pos_weight con los mismos hiperparámetros:
+    #   SMOTE            PR-AUC 0.5866   594,273 filas
+    #   scale_pos_weight PR-AUC 0.5627   410,601 filas
+    # SMOTE gana 0.024, así que se mantiene. Coste asumido: al aplicarlo a las
+    # columnas del grafo interpola valores sin vecindario real detrás. Ambos
+    # modelos comparados reciben idéntico tratamiento, así que la comparación
+    # no se ve afectada. La GNN no puede usarlo (un nodo sintético no tiene
+    # aristas) y sigue con pos_weight en la loss.
   optuna_trials: 30                # búsqueda bayesiana de hiperparámetros
+
+  # ── ABLACIONES SOBRE LAS COLUMNAS Y LA CAPACIDAD ───────────────────────────
+  # Se aplican a TODAS las cabezas por igual. Esa es la condición para que la
+  # comparación siga midiendo lo que dice medir: si `control` corre con menos
+  # columnas o menos capacidad que `gnn_mas_tabular`, la diferencia entre ellas
+  # deja de ser "el aporte del grafo" y pasa a ser "quién recibió mejor trato".
+  #
+  # excluir_prefijos: quita familias enteras de columnas. La interesante es
+  #   ["V", "C", "D"]: son los agregados relacionales que Vesta precalculó
+  #   (conteos por entidad, deltas temporales, rankings sobre historiales), y
+  #   son la explicación de por qué el grafo no aportaba nada. Quitarlas prueba
+  #   esa hipótesis DIRECTAMENTE: si el grafo empieza a aportar sin ellas, la
+  #   redundancia queda demostrada y es un resultado positivo.
+  #   431 columnas -> ~92 al excluir V, C y D.
+  excluir_prefijos: ["V", "C", "D"]
+
+  # capacidad_limitada: fuerza un modelo pequeño y salta Optuna. Responde
+  #   "¿aporta más el grafo cuando el tabular no puede exprimir 431 columnas?".
+  capacidad_limitada:
+    activo: false
+    max_depth: 3
+    n_estimators: 100
+    colsample_bytree: 1.0
+
+  # ── CÓMO SE AJUSTA CADA CABEZA ─────────────────────────────────────────────
+  # Las tres cabezas reciben entradas MUY distintas:
+  #     control          431 columnas, mayormente categóricas y dispersas
+  #     solo_gnn          32 columnas, densas y continuas
+  #     gnn_mas_tabular  463 columnas, mezcla de las dos cosas
+  # Un colsample o una profundidad que le va bien a 431 columnas dispersas
+  # puede estar penalizando a 32 densas. Hay dos protocolos válidos:
+  #
+  #   "compartido"   Optuna corre UNA vez sobre la variante más pequeña y las
+  #                  tres heredan. La diferencia entre cabezas es atribuible
+  #                  SOLO a las columnas, y cualquier ventaja de las grandes es
+  #                  una cota inferior conservadora. Es el más estricto.
+  #
+  #   "por_cabeza"   Optuna corre para CADA cabeza con el MISMO número de
+  #                  trials y el mismo sampler. Cada una rinde a su máximo, que
+  #                  es más justo cuando las entradas son tan distintas. A
+  #                  cambio, la diferencia entre cabezas incluye algo de suerte
+  #                  en la búsqueda: hay que declararlo en la memoria.
+  #                  Es el protocolo habitual en la literatura.
+  #
+  # Lo que NO vale es fijar a mano hiperparámetros peores para una cabeza que
+  # para otra: eso no mide las columnas, mide quién recibió mejor trato.
+  #
+  # 2026-08-16: se vuelve a "compartido". Con "por_cabeza", Optuna le dio a
+  # `gnn_mas_tabular` lr 0.1256 (contra 0.0391 del control): ganaba por 0.0004
+  # de AUC en validación y perdía en el examen. La búsqueda sobreajustaba la
+  # ventana donde se busca, y la diferencia entre cabezas medía eso, no las
+  # columnas. Además "por_cabeza" contradice el invariante de CLAUDE.md
+  # ("Optuna corre una sola vez... para que la ventaja de las grandes sea una
+  # cota inferior conservadora"). Los dos números van en la memoria.
+  optuna_modo: "compartido"
+
+  # Ajustes finos POR CABEZA, encima de lo que salga de Optuna. Vacíos por
+  # defecto. Si pones algo aquí, el log te avisa: es un valor elegido a mano y
+  # necesita justificación en la memoria.
+  # CUIDADO: esto NO solo siembra la búsqueda. `train_head.py:_params()` lo
+  # aplica como override FINAL, encima de lo que haya encontrado Optuna. Solo
+  # las claves de `_ESPACIO_OPTUNA` se siembran además como primer trial;
+  # `n_estimators` no está entre ellas, así que aquí es un tope duro y nada más.
+  #
+  # Esto ya costó una conclusión errónea (2026-08-15). Con `control: {}` y las
+  # otras dos fijadas a mano, `gnn_mas_tabular` entrenó con max_depth 6 y 500
+  # árboles —topando en 500— mientras `control` usaba los suyos de Optuna
+  # (max_depth 12) con techo de 1000 y paraba solo en 379. El aporte del grafo
+  # salió -0.0668 y "significativo"; con las tres cabezas en igualdad es
+  # +0.0053. Lo que se midió fue quién recibió mejor trato, no las columnas.
+  #
+  # Déjalo VACÍO salvo que tengas una razón escrita en la memoria. Si pones
+  # algo, ponlo en las TRES o la comparación deja de ser atribuible.
+  por_cabeza:
+    control: {}
+    solo_gnn: {}
+    gnn_mas_tabular: {}
   # Dónde entrena XGBoost: "auto" usa la GPU si hay CUDA, si no CPU.
   # En una VM con GPU esto baja la búsqueda de 30 trials de ~35 min a minutos.
   # Fuerza "cpu" si quieres el baseline reproducible en cualquier máquina.
   device: "auto"                   # auto | cuda | cpu
   early_stopping_rounds: 50
+
+hybrid:
+  # Sistema híbrido: GNN + columnas del grafo + cabeza XGBoost.
+  # La cabeza recibe 431 features originales + 8 estructurales + gnn_score.
+  oof_folds: 4                     # trozos para el gnn_score honesto
+  # TRES CABEZAS, con nombre en vez de número: el número dependía de `in_dim`
+  # y cambiaba solo al tocar el dataset.
+  #   control          las N features tabulares         ¿cuánto vale lo tabular solo?
+  #   solo_gnn         SOLO la salida de la GNN         ¿basta el grafo por sí mismo?
+  #   gnn_mas_tabular  tabular + salida de la GNN       ¿APORTA el grafo sobre lo tabular?
+  # La pregunta del capstone la responde `control` vs `gnn_mas_tabular`, con
+  # idéntica ventana de entrenamiento. `solo_gnn` acota el techo del grafo aislado.
+  variantes: ["control", "solo_gnn", "gnn_mas_tabular"]
+  optuna_on_variant: "control"     # se afina sobre la MÁS PEQUEÑA a propósito:
+                                   # así la ventaja de las otras es una cota
+                                   # inferior conservadora, no atacable por
+                                   # hiperparámetros
+  alert_budget_pct: 2.0            # % del mes que se marca para revisión
+  cl_head:
+    # Warm start de la cabeza en cada ciclo: la mezcla 40/60 son ~20 filas, así
+    # que reentrenar desde cero daría ruido. Árboles poco profundos para que
+    # solo puedan hacer correcciones groseras con tan pocos puntos.
+    rounds: 30
+    lr_scale: 0.1
+    max_depth: 3
+    min_child_weight: 5
 
 continual_learning:
   trigger:
@@ -167,7 +543,6 @@ continual_learning:
       epochs: 12
 
 comparison:
-  # OE4: GNN+CL vs XGBoost congelado sobre el mes 6, mismo threshold
-  kpi_recall_gap: 0.20             # recall >= 20% superior sobre patrones emergentes
-  avg_fraud_amount_usd: 120        # para impacto económico (ajustable al dataset real)
+  # El desglose de métricas (por mes, mes 5, mes 6) no necesita configuración:
+  # los presupuestos y precisiones objetivo están en final_comparison.py.
 

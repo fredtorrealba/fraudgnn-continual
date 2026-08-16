@@ -85,8 +85,27 @@ def get_logger(name: str) -> logging.Logger:
     return logging.getLogger(name)
 
 
-def set_seed(seed: int = 42):
-    """Reproducibilidad: numpy, random y torch (si está disponible)."""
+def set_seed(seed: int = 42, determinista: bool = True):
+    """
+    Reproducibilidad: numpy, random y torch (si está disponible).
+
+    `determinista` NO es redundante con la semilla. Fijarla ordena los sorteos,
+    pero la GPU suma en paralelo y el ORDEN de esas sumas cambia entre
+    ejecuciones. Con decimales, sumar en distinto orden da resultados
+    ligeramente distintos —(0.1+0.2)+0.3 no es 0.1+(0.2+0.3)— y esa diferencia
+    del decimal 16 se propaga por 50 épocas.
+
+    MEDIDO: dos corridas del smoke con el MISMO dato y la MISMA semilla dieron
+    PR-AUC 0.2756 y 0.3077 en graphsage. Y el efecto llegaba a las cabezas:
+    gnn_mas_tabular cortó en 7 árboles una vez y en 1 la otra.
+
+    Cuesta entre un 10% y un 30% de velocidad: las versiones deterministas de
+    `scatter` no pueden usar sumas atómicas en paralelo. A cambio, la corrida se
+    puede repetir, que es lo que puede pedir un tribunal.
+
+    `warn_only=True` porque algunas operaciones no tienen versión determinista:
+    avisa en vez de reventar a mitad de una corrida de horas.
+    """
     random.seed(seed)
     np.random.seed(seed)
     try:
@@ -96,6 +115,14 @@ def set_seed(seed: int = 42):
             torch.cuda.manual_seed_all(seed)
         if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
             torch.mps.manual_seed(seed)
+        if determinista:
+            # CUBLAS lo exige para las multiplicaciones deterministas, y hay que
+            # ponerlo ANTES de que se cree el primer contexto de CUDA.
+            os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+            torch.use_deterministic_algorithms(True, warn_only=True)
+            if hasattr(torch.backends, "cudnn"):
+                torch.backends.cudnn.deterministic = True
+                torch.backends.cudnn.benchmark = False
     except ImportError:
         pass
 
@@ -193,15 +220,35 @@ def load_state(cfg: dict) -> dict:
 
 
 def _update_section(cfg: dict, section: str, key: str, **fields) -> dict:
-    st = load_state(cfg)
-    entry = st.setdefault(section, {}).setdefault(key, {})
-    entry.update(fields)
-    now = datetime.now().isoformat(timespec="seconds")
-    entry["updated"] = now
-    st["updated"] = now
+    """
+    Actualiza una entrada del archivo de estado, con CERROJO.
+
+    Es un leer-modificar-escribir, y desde que la etapa `gnn` entrena varias
+    corridas en procesos paralelos hay varias a la vez. Sin cerrojo se pierden
+    actualizaciones: A lee, B lee, A escribe, B escribe y borra lo de A. El
+    `_atomic_write` evita el archivo a medias, pero no esa carrera.
+
+    El cerrojo es un archivo aparte (.lock) y no el propio estado, porque
+    `_atomic_write` sustituye el archivo por otro y el bloqueo se perdería con
+    el inodo viejo.
+    """
+    import fcntl
+
     p = state_path(cfg)
     p.parent.mkdir(parents=True, exist_ok=True)    # primera corrida: lo crea
-    _atomic_write(p, json.dumps(st, indent=2))
+    lock = p.with_suffix(p.suffix + ".lock")
+    with open(lock, "w") as fl:
+        fcntl.flock(fl, fcntl.LOCK_EX)
+        try:
+            st = load_state(cfg)
+            entry = st.setdefault(section, {}).setdefault(key, {})
+            entry.update(fields)
+            now = datetime.now().isoformat(timespec="seconds")
+            entry["updated"] = now
+            st["updated"] = now
+            _atomic_write(p, json.dumps(st, indent=2))
+        finally:
+            fcntl.flock(fl, fcntl.LOCK_UN)
     return st
 
 

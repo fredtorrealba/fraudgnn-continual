@@ -56,9 +56,27 @@ class Step:
     args: list[str] = field(default_factory=list)
     desc: str = ""                  # resumen de qué hace, ver --steps
     acepta_force: bool = False      # el módulo entiende --force por su cuenta
+    # Salidas cuyo NOMBRE depende del config (una por arquitectura, por ejemplo)
+    # y no se pueden escribir como constantes. Cuentan igual que `outputs`:
+    # marcan el paso como hecho y `--force` las borra.
+    outputs_dyn: object = None      # (cfg) -> list[Path]
+    # Archivos que `--force` debe borrar pero que NO marcan el paso como hecho.
+    # El caso es el .db de Optuna: si se borra el JSON y se deja el .db, la
+    # búsqueda "nueva" RETOMA la vieja desde el storage y no se entera nadie.
+    limpiar_dyn: object = None      # (cfg) -> list[Path]
 
     def output_paths(self, cfg) -> list[Path]:
-        return [resolve(cfg, key) / name for key, name in self.outputs]
+        p = [resolve(cfg, key) / name for key, name in self.outputs]
+        if self.outputs_dyn:
+            p += list(self.outputs_dyn(cfg))
+        return p
+
+    def limpiar_paths(self, cfg) -> list[Path]:
+        """Todo lo que `--force` debe borrar: las salidas más los auxiliares."""
+        p = self.output_paths(cfg)
+        if self.limpiar_dyn:
+            p += list(self.limpiar_dyn(cfg))
+        return p
 
     def missing(self, cfg) -> list[Path]:
         return [p for p in self.output_paths(cfg) if not p.exists()]
@@ -69,6 +87,18 @@ class Step:
 
 # El pipeline del capstone, en orden. Las salidas son las que cada módulo
 # escribe al terminar bien — por eso sirven como marca de "paso completado".
+# El continual learning está DESACTIVADO en esta fase. Aquí solo se comparan
+# enfoques —tres cabezas, dos arquitecturas— y para eso el mes 6 tiene que ser
+# test puro: si el CL adaptara el modelo durante el mes 6, las métricas dejarían
+# de medir el enfoque y medirían la adaptación. El código de
+# src/continual_learning/ se conserva intacto y se reactiva cuando haya ganador.
+CL_ACTIVO = False
+
+# La segunda pasada (`refit`/`oof_refit`/`heads_refit`) SE ELIMINÓ. Existía
+# porque la GNN y las cabezas compartían los meses 1-4: había que reentrenarlo
+# todo incorporando el mes 5. Con `ventanas` cada bloque tiene un trabajo y no
+# hay nada que reentrenar — el bloque `examen` nunca se toca hasta el informe.
+
 STEPS = [
     Step("download", "[0] Descarga del dataset IEEE-CIS",
          "src.data.download_ieee_cis",
@@ -85,58 +115,68 @@ STEPS = [
               "faltantes (mapas y medianas ajustados SOLO con train, sin fuga) y "
               "parte 6 meses por TransactionDT: 1-4 entrenan, 5 valida, 6 es test. "
               "~1 min."),
-    Step("graph", "[2] Construcción del grafo (PyG)",
+    Step("graph", "[2] Grafo HETEROGÉNEO (transacciones + entidades)",
          "src.data.build_graph",
-         [("graph_dir", "graph.pt")],
-         desc="Construye el grafo: nodos = transacciones, aristas = comparten "
-              "entidad (tarjeta / email / dispositivo) dentro de 30 días, con tope "
-              "de 50 aristas por nodo para evitar hubs. ~4 min, ~22M aristas."),
+         [("graph_dir", "graph.pt"), ("graph_dir", "graph_meta.json")],
+         desc="Nodos transacción + nodos ENTIDAD (uid, card, email, device, "
+              "net), aristas bipartitas. El nodo de entidad aprende un "
+              "vector propio que comparte con sus transacciones. Deja "
+              "graph_meta.json con la cobertura real de cada entidad. ~5 min."),
     # Este paso tiene reanudación propia por seed y por época: aunque se corte
     # a la mitad, al relanzarlo sigue desde la última época guardada.
-    Step("gnn", "[4-5] GraphSAGE vs GAT (3 seeds c/u) + selección",
+    Step("gnn", "[3] GraphSAGE vs GATv2: Optuna + 3 seeds + selección",
          "src.gnn.compare_gnns",
          [("models_dir", "selected_model.json")],
+         # La búsqueda de Optuna es la mitad cara de esta etapa y hasta ahora no
+         # figuraba como salida: `--status` no la veía y `--force` no la borraba,
+         # así que una corrida "forzada" reutilizaba en silencio hiperparámetros
+         # de una búsqueda anterior. Ahora cuenta como el resto.
+         #
+         # Cuándo NO debe repetirse: si el espacio de búsqueda y el grafo son los
+         # mismos, buscar otra vez solo añade ruido. Al comparar cambios del
+         # GRAFO (E1/E2) conviene dejar estos JSON intactos a propósito, para que
+         # la diferencia sea atribuible al grafo y no a otra búsqueda.
+         outputs_dyn=lambda cfg: (
+             [resolve(cfg, "reports_dir") / f"optuna_{a}.json"
+              for a in cfg["gnn"].get("arquitecturas", ["graphsage", "gatv2"])]
+             if int(cfg["gnn"].get("optuna_trials", 0)) > 0 else []),
+         # El .db NO marca el paso como hecho (un estudio a medias también lo
+         # crea), pero `--force` tiene que llevárselo: si no, `load_if_exists`
+         # retoma la búsqueda anterior en vez de empezar de cero.
+         limpiar_dyn=lambda cfg: [
+             resolve(cfg, "reports_dir") / f"optuna_{a}.db"
+             for a in cfg["gnn"].get("arquitecturas", ["graphsage", "gatv2"])],
          acepta_force=True,
          desc="Entrena GraphSAGE y GAT con 3 semillas cada uno = 6 corridas, con "
               "neighbor sampling 15-10-5 (nunca ve el grafo entero). Elige la mejor "
               "por AUC walk-forward semanal. EL PASO CARO: 2-4 h con GPU. "
               "Reanudable por corrida Y por época."),
-    Step("refit", "[6] Refit del ganador sobre train + validación",
-         "src.gnn.refit",
-         [("models_dir", "refit_model.pt"), ("reports_dir", "refit.json")],
-         desc="Refit estándar: la validación ya eligió arquitectura y número de "
-              "épocas, así que se reentrena DESDE CERO con todos los datos hasta "
-              "el mes 5 (+21%). Sin early stopping — las épocas se heredan del "
-              "pico de la corrida ganadora. El mes 6 sigue intacto. ~35 min GPU."),
-    Step("cl", "[7] Ciclo de Continual Learning (mes 6 por semanas)",
-         "src.continual_learning.cl_orchestrator",
-         [("reports_dir", "cl_cycles.json"),
-          ("reports_dir", "gnn_cl_test_scores.npz"),
-          ("graph_dir", "graph_scored.pt")],
-         desc="Simula el mes 6 semana a semana. Por cada una: mide qué fraudes se "
-              "escaparon, dispara el gatillo si hay patrón nuevo, hace fine-tuning "
-              "40/60 (nuevos + replay buffer) con LR diferenciado por capa, y valida "
-              "que aprendió SIN olvidar. Solo despliega si pasa ambas. ~15 min."),
-    # XGBoost va aquí, no en su posición nominal [3]: solo necesita
-    # `preprocess` (lee full.parquet, no toca el grafo) y su salida la consume
-    # únicamente `final`. Ponerlo al final deja que las 6 corridas GNN —lo caro
-    # y lo que puede fallar— arranquen cuanto antes. Los títulos conservan la
-    # numeración del capstone, que es lógica y no de ejecución.
-    Step("xgboost", "[3] Baseline XGBoost (SMOTE + Optuna) — queda CONGELADO",
-         "src.baseline_xgboost.train_xgboost",
-         [("models_dir", "xgboost_baseline.json"),
-          ("reports_dir", "xgboost_val_metrics.json")],
-         desc="Baseline tabular sobre las MISMAS features: SMOTE en train + "
-              "búsqueda bayesiana con Optuna (30 trials). Queda CONGELADO, nunca se "
-              "reentrena: es el punto de referencia contra el que se mide todo. "
-              "~10 min en GPU."),
-    Step("final", "[8] Comparación final GNN+CL vs XGBoost (OE4)",
+    Step("embed", "[5a] Embedding de UNA red sobre lo que no entrenó",
+         "src.hybrid.embed", [("processed_dir", "gnn_embed.parquet"),
+                              ("reports_dir", "embed.json")],
+         desc="Sustituye al OOF. Aquel entrenaba K redes y cada una describía "
+              "el trozo que no vio: honesto, pero las K aprendían ejes "
+              "DISTINTOS y las 32 columnas mezclaban idiomas (medido: la cabeza "
+              "mixta cortó en 2 árboles contra 517 del control). Con ventanas "
+              "separadas basta UNA red. ~2 min."),
+    Step("heads", "[5b] Las tres cabezas XGBoost (ventana cabezas_entrenan)",
+         "src.hybrid.train_head",
+         [("models_dir", "hybrid_head_control.json"),
+          ("reports_dir", "heads_variantes.json")],
+         desc="control / solo_gnn / gnn_mas_tabular con los mismos "
+              "hiperparámetros y la misma ventana, para que la diferencia sea "
+              "atribuible solo a las columnas. Optuna corre UNA vez. ~15 min."),
+    Step("final", "[7] Métricas: cabezas_validan y examen",
          "src.comparison.final_comparison",
-         [("reports_dir", "final_comparison.json")],
-         desc="Compara GNN+CL contra el baseline congelado sobre el mes 6: a "
-              "threshold fijo, a IGUAL presupuesto de alertas y a IGUAL precisión. "
-              "Las dos últimas son las comparables — con calibraciones distintas, el "
-              "threshold fijo mide agresividad, no detección. ~1 min."),
+         [("reports_dir", "final_comparison.json"),
+          ("reports_dir", "resumen.json")],
+         desc="Compara control / gnn_mas_tabular / solo_gnn sobre `examen`, el "
+              "bloque que no entrenó ni validó nada. A igual presupuesto de "
+              "alertas (el 2% es el punto operativo) y a igual precisión: con "
+              "calibraciones distintas, un umbral fijo mide agresividad y no "
+              "detección. Añade el bootstrap del aporte y la importancia por "
+              "bloque. Al terminar deja reports/resumen.json con las seis "
+              "métricas de las redes, las cabezas y el examen. ~1 min."),
 ]
 
 BY_NAME = {s.name: s for s in STEPS}
@@ -566,7 +606,7 @@ def main():
             # Borrar las salidas es lo que hace que --force funcione IGUAL en
             # todos los pasos: sin esto, módulos como download ven sus archivos
             # y se saltan solos aunque el pipeline los haya marcado forzados.
-            borradas = [p for p in step.output_paths(cfg) if p.exists()]
+            borradas = [p for p in step.limpiar_paths(cfg) if p.exists()]
             for ruta in borradas:
                 ruta.unlink()
             if borradas:

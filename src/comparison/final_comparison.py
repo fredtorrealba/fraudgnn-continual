@@ -1,79 +1,68 @@
 """
-Paso 8 — COMPARACIÓN FINAL (OE4): GNN + Continual Learning vs XGBoost congelado.
+Etapa `final` — métricas de las tres cabezas sobre TODOS los meses.
 
-Protocolo:
-- Mismo mes 6, mismo threshold >= 0.5.
-- XGBoost representa el "mundo actual" estático: entrenado en meses 1-4,
-  jamás reentrenado.
-- La GNN+CL se evaluó semana a semana adaptándose (scores generados por el
-  orquestador de CL).
-- KPI: recall de la GNN+CL >= 20% superior sobre PATRONES EMERGENTES.
-  Patrón emergente = fraude del mes 6 que el modelo GNN ORIGINAL (antes de
-  cualquier ciclo de CL) scoreó bajo (<0.5) — es decir, lo que el mundo
-  estático no tenía cómo ver.
-- Impacto económico: fraudes adicionales detectados x monto promedio (USD).
-  Si el dataset tiene TransactionAmt se usa el monto real de cada fraude
-  adicional en vez del promedio de config.
+QUÉ SE COMPARA
 
-Requiere haber corrido antes:
-  1. train_xgboost.py            (baseline congelado)
-  2. compare_gnns.py             (modelo GNN seleccionado)
-  3. cl_orchestrator.py          (scores GNN+CL del mes 6)
+    control          las N features tabulares      ¿cuánto vale lo tabular solo?
+    solo_gnn         SOLO el embedding de la GNN   ¿basta el grafo por sí mismo?
+    gnn_mas_tabular  tabular + embedding           ¿APORTA el grafo sobre lo tabular?
 
-Uso: python -m src.comparison.final_comparison
+Las tres se entrenaron con la MISMA ventana (meses 1-5), los mismos
+hiperparámetros y el mismo SMOTE, así que la diferencia es atribuible solo a las
+columnas. Esa es toda la razón de ser de `control`: sin él, comparar el híbrido
+contra un baseline entrenado con menos meses cambia dos cosas a la vez y la
+diferencia no significa nada.
+
+TRES CORTES DE MÉTRICAS
+    por mes (1-6)  los meses 1-5 van marcados IN-SAMPLE: el modelo entrenó con
+                   ellos y sus números son optimistas por construcción
+    cabezas_validan  donde se eligió el nº de árboles y el umbral
+    mes 6          test — no se toca hasta aquí
+
+EL UMBRAL NO ES 0.5
+Cada cabeza tiene su propia calibración, así que un corte fijo compara
+volúmenes de alerta distintos y no dice nada. Se usa el cuantil que produce
+`hybrid.alert_budget_pct` de alertas sobre el mes que se mide, y las
+comparaciones de fondo van a IGUAL PRESUPUESTO y a IGUAL PRECISIÓN.
 """
 import json
-import os
 import sys
 from pathlib import Path
 
-# macOS: este es el único módulo que carga PyTorch y XGBoost en el mismo
-# proceso, y cada uno trae su propio runtime de OpenMP (torch empaqueta el
-# suyo; XGBoost usa el libomp de Homebrew). Con los dos multihilo a la vez el
-# intérprete muere con SIGSEGV al llamar a load_model(). Limitar OpenMP a un
-# hilo es el único workaround que funciona (KMP_DUPLICATE_LIB_OK no basta), y
-# tiene que definirse ANTES de importar torch/xgboost. En Linux hay un solo
-# runtime, así que no se toca nada.
-if sys.platform == "darwin":
-    # Asignación directa, NO setdefault: el pipeline padre exporta
-    # OMP_NUM_THREADS desde compute.n_jobs y el subproceso lo hereda, así que
-    # un setdefault no llegaría a aplicarse nunca. En macOS esto no es un valor
-    # por defecto sino un requisito para no segfaultear.
-    os.environ["OMP_NUM_THREADS"] = "1"
-
 import numpy as np
-import pandas as pd
-import torch
-import xgboost as xgb
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from src.continual_learning.validate import score_nodes
-from src.gnn.models import build_model
-from src.utils.common import ensure_dirs, get_logger, load_config, resolve
-from src.utils.metrics import full_report
+from src.utils.omp import guard_omp
+
+guard_omp()   # antes de importar xgboost (SIGSEGV en macOS si torch ya está)
+
+from src.hybrid.head import (cargar, cargar_tabla, cols_embedding,  # noqa: E402
+                             columnas, nombre_modelo,
+                             umbral_por_presupuesto)
+from src.utils.common import (ensure_dirs, get_logger, load_config,  # noqa: E402
+                              resolve)
+from sklearn.metrics import average_precision_score  # noqa: E402
+from src.utils.metrics import full_report  # noqa: E402
+from src.utils.ventanas import verificar  # noqa: E402
 
 log = get_logger("comparison")
 
-
-# Puntos de operación para la comparación justa. No son hiperparámetros del
-# modelo (por eso no van a config.yaml): son los cortes con que se lee el
-# resultado. Porcentajes del mes y objetivos de precisión.
-BUDGETS_PCT = (0.5, 1.0, 2.0, 5.0, 10.0, 25.0)
-PRECISION_TARGETS = (0.90, 0.80, 0.70, 0.50)
+PRESUPUESTOS_PCT = (0.5, 1.0, 2.0, 5.0, 10.0, 25.0)
+PRECISIONES = (0.9, 0.8, 0.7, 0.5)
 
 
-def _curva(y: np.ndarray, s: np.ndarray):
-    """Ordenado por score descendente: TP acumulados y precisión en cada K."""
-    orden = np.argsort(-s)
-    tp = np.cumsum(y[orden])
-    return tp, tp / np.arange(1, len(y) + 1)
+def _curva(y, s):
+    """(aciertos acumulados, precisión acumulada) recorriendo de mayor a menor."""
+    orden = np.argsort(-np.asarray(s))
+    tp = np.cumsum(np.asarray(y)[orden])
+    return tp, tp / np.arange(1, len(tp) + 1)
 
 
 def recall_at_budget(y, s, k: int) -> float:
     """Recall si solo se pueden revisar las K transacciones de mayor score."""
     k = max(1, min(int(k), len(y)))
     tp, _ = _curva(y, s)
-    return float(tp[k - 1] / max(y.sum(), 1))
+    return float(tp[k - 1] / max(np.sum(y), 1))
 
 
 def recall_at_precision(y, s, objetivo: float):
@@ -83,279 +72,316 @@ def recall_at_precision(y, s, objetivo: float):
     if len(ok) == 0:
         return None, 0
     k = int(ok[-1]) + 1
-    return float(tp[k - 1] / max(y.sum(), 1)), k
+    return float(tp[k - 1] / max(np.sum(y), 1)), k
 
 
-def por_semana(test_df, y, scores_xgb, scores_gnn, thr):
+def _confusion(y, s, thr):
+    """Reporte completo + matriz de confusión al umbral dado."""
+    rep = full_report(y, s, thr)
+    pred = np.asarray(s) >= thr
+    y = np.asarray(y).astype(bool)
+    rep.update(TP=int((pred & y).sum()), FP=int((pred & ~y).sum()),
+               FN=int((~pred & y).sum()), TN=int((~pred & ~y).sum()),
+               alertas=int(pred.sum()))
+    n = len(y)
+    rep["accuracy"] = float((rep["TP"] + rep["TN"]) / n) if n else 0.0
+    # El accuracy va con su referencia al lado a propósito: con 3,4% de fraude,
+    # un modelo que no alerte nunca saca 96,6%. Sin esa comparación el número
+    # engaña.
+    rep["accuracy_sin_alertar"] = float((~y).sum() / n) if n else 0.0
+    return rep
+
+
+def bootstrap_delta(y, s_a, s_b, n_rep: int = 1000, seed: int = 42) -> dict:
     """
-    AUC y PR-AUC SEMANA A SEMANA dentro del mes 6.
+    ¿La diferencia de PR-AUC entre dos cabezas es real o es ruido del mes?
 
-    Existe porque el AUC del mes agregado puede mentir. Medido en la ablación
-    sin aristas: el modelo daba 0.8524 sobre el mes completo pero 0.6075 de
-    media semanal — separaba transacciones por PERIODO TEMPORAL, no por fraude.
-    Al agrupar el mes entero esa correlación con el tiempo infla la métrica;
-    dentro de una semana, donde apenas hay variación temporal, no queda nada.
+    Sin esto, un +0.004 y un +0.04 se leen igual en el informe, y en un mes con
+    ~2.900 fraudes el primero cabe de sobra dentro del error de muestreo.
 
-    Un sistema de fraude decide semana a semana, así que esta es la métrica con
-    sentido operativo. La misma lógica que ya usa compare_gnns para elegir
-    arquitectura (AUC walk-forward), aplicada ahora al mes de test.
+    Bootstrap EMPAREJADO: se remuestrean FILAS (las mismas para ambas cabezas)
+    y se recalcula la diferencia en cada réplica. Emparejar importa —las dos
+    puntúan las mismas transacciones y sus errores están correlacionados—:
+    tratarlas como independientes ensancharía el intervalo sin motivo.
+
+    Mide el error de MUESTREO del mes de evaluación, no la varianza de
+    entrenamiento (eso exigiría reentrenar con varias semillas). Es la cota
+    optimista: si el intervalo ya cruza el cero, la varianza de entrenamiento
+    solo puede empeorarlo.
     """
-    if "week_in_month" not in test_df.columns:
-        return None
-    semanas = test_df["week_in_month"].values
-    filas = []
-    for w in sorted(set(semanas.tolist())):
-        m = semanas == w
-        if len(np.unique(y[m])) < 2:
-            continue
-        rx = full_report(y[m], scores_xgb[m], thr)
-        rg = full_report(y[m], scores_gnn[m], thr)
-        filas.append({"semana": int(w), "n": int(m.sum()),
-                      "n_fraude": int(y[m].sum()),
-                      "xgboost": {"auc_roc": rx.get("auc_roc"),
-                                  "pr_auc": rx.get("pr_auc")},
-                      "gnn_cl": {"auc_roc": rg.get("auc_roc"),
-                                 "pr_auc": rg.get("pr_auc")}})
-    if not filas:
-        return None
-    med = lambda k, c: float(np.mean([f[k][c] for f in filas]))
-    return {"nota": ("AUC dentro de cada semana. Si cae mucho respecto al mes "
-                     "agregado, la métrica mensual estaba inflada por "
-                     "correlación temporal, no por capacidad de detección."),
-            "semanas": filas,
-            "media_semanal": {
-                "xgboost": {"auc_roc": med("xgboost", "auc_roc"),
-                            "pr_auc": med("xgboost", "pr_auc")},
-                "gnn_cl": {"auc_roc": med("gnn_cl", "auc_roc"),
-                           "pr_auc": med("gnn_cl", "pr_auc")}}}
+    y = np.asarray(y); s_a = np.asarray(s_a); s_b = np.asarray(s_b)
+    rng = np.random.default_rng(seed)
+    n = len(y)
+    obs = average_precision_score(y, s_b) - average_precision_score(y, s_a)
+    deltas = []
+    for _ in range(n_rep):
+        i = rng.integers(0, n, n)
+        if y[i].sum() == 0 or y[i].sum() == len(i):
+            continue                       # réplica sin ambas clases: no hay curva
+        deltas.append(average_precision_score(y[i], s_b[i]) -
+                      average_precision_score(y[i], s_a[i]))
+    d = np.asarray(deltas)
+    lo, hi = np.percentile(d, [2.5, 97.5])
+    return {"delta_observado": round(float(obs), 5),
+            "ic95": [round(float(lo), 5), round(float(hi), 5)],
+            "p_delta_mayor_que_cero": round(float((d > 0).mean()), 4),
+            "significativo": bool(lo > 0 or hi < 0),
+            "n_replicas": int(len(d))}
 
 
-def cl_desplego(cfg) -> bool:
-    """¿Algún ciclo de CL llegó a desplegar? Si no, el modelo nunca cambió."""
-    ruta = resolve(cfg, "reports_dir") / "cl_cycles.json"
-    if not ruta.exists():
-        return True                      # sin datos, no se afirma nada
-    with open(ruta) as f:
-        ciclos = json.load(f)
-    return any(c.get("verdict", {}).get("deploy") for c in ciclos)
+def importancia_por_bloque(booster, cols: list[str]) -> dict:
+    """
+    Cuánta GANANCIA saca la cabeza de cada bloque de columnas.
 
+    Responde algo que ninguna métrica de rendimiento contesta: si el embedding
+    aporta +0.000, ¿es que el grafo no sirve, o que XGBoost ni lo miró? Con la
+    ganancia por bloque se distingue: importancia ~0 significa que los árboles
+    no encontraron un corte útil en esas 32 columnas.
 
-def xgboost_scores_on_test(cfg) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
-    proc = resolve(cfg, "processed_dir")
-    df = pd.read_parquet(proc / "full.parquet")
-    with open(proc / "feature_cols.json") as f:
-        cols = json.load(f)["feature_cols"]
-    test = df[df.split == "test"].reset_index(drop=True)
-    model = xgb.XGBClassifier()
-    model.load_model(resolve(cfg, "models_dir") / "xgboost_baseline.json")
-    return (model.predict_proba(test[cols].values)[:, 1],
-            test["isFraud"].values.astype(int), test)
-
-
-def original_gnn_scores_on_test(cfg, data, test_idx) -> np.ndarray:
-    """Scores del GNN ORIGINAL (pre-CL) para identificar patrones emergentes."""
-    from src.gnn.train_gnn import ruta_modelo_operativo
-    ruta, etiqueta = ruta_modelo_operativo(cfg)
-    ckpt = torch.load(ruta, weights_only=False)
-    cfg["gnn"]["in_dim"] = ckpt["in_dim"]
-    model = build_model(ckpt["model_name"], cfg)
-    model.load_state_dict(ckpt["state_dict"])
-    log.info("GNN de referencia (pre-CL): %s", etiqueta)
-    return score_nodes(model, data, test_idx, cfg)
+    La ganancia se reparte por columna; se agrega por bloque y se normaliza,
+    así que las cifras son porcentajes del total y suman 100.
+    """
+    g = booster.get_score(importance_type="gain")   # solo columnas USADAS
+    # XGBoost nombra f0, f1... por POSICIÓN cuando entrena desde numpy.
+    por_col = {}
+    for k, v in g.items():
+        i = int(k[1:]) if k.startswith("f") and k[1:].isdigit() else None
+        if i is not None and i < len(cols):
+            por_col[cols[i]] = float(v)
+    total = sum(por_col.values()) or 1.0
+    bloques = {"tabular": 0.0, "embedding": 0.0}
+    for c, v in por_col.items():
+        bloques["embedding" if c.startswith(("emb_", "embv_")) else "tabular"] += v
+    n_emb = sum(1 for c in cols if c.startswith(("emb_", "embv_")))
+    return {
+        "ganancia_pct": {k: round(100 * v / total, 2) for k, v in bloques.items()},
+        "columnas_usadas": len(por_col),
+        "columnas_totales": len(cols),
+        "embedding_usadas": sum(1 for c in por_col
+                                if c.startswith(("emb_", "embv_"))),
+        "embedding_totales": n_emb,
+        "top10": sorted(por_col.items(), key=lambda kv: -kv[1])[:10],
+    }
 
 
 def main():
     cfg = load_config()
     ensure_dirs(cfg)
-    thr = cfg["gnn"]["threshold"]
     reports_dir = resolve(cfg, "reports_dir")
+    hcfg = cfg.get("hybrid") or {}
+    pct = float(hcfg.get("alert_budget_pct", 2.0))
 
-    # --- scores de los tres actores sobre el mes 6 ---
-    xgb_scores, y_xgb, test_df = xgboost_scores_on_test(cfg)
+    # MODO. Mientras se decide qué enfoque gana, las etapas `refit`/`oof_refit`/
+    # `heads_refit` no se corren: cuestan ~38 min y solo sirven para medir el
+    # mes 6, que en esta fase debe seguir sellado. Si no hay cabezas de
+    # producción se cae al modo exploración, que mide el MES 5 y no mira el 6.
+    modelos_dir = resolve(cfg, "models_dir")
+    variantes = [str(x) for x in hcfg.get("variantes", ())]
+    sufijo, corte = "", "examen"     # el veredicto sale del bloque SELLADO
+    log.info("=" * 62)
+    log.info("Veredicto sobre la ventana `examen`, que no entrenó ni validó nada.")
+    log.info("  `cabezas_validan` se informa aparte: eligió nº de árboles y")
+    log.info("  umbral, así que sus cifras son de SELECCIÓN, no finales.")
 
-    cl_pack = np.load(reports_dir / "gnn_cl_test_scores.npz")
-    gnn_cl_scores, y_gnn, test_idx = cl_pack["scores"], cl_pack["y"], cl_pack["node_idx"]
+    df, cols_base = cargar_tabla(cfg, "train")
+    cols_emb = cols_embedding(df, "completo")
+    cols_embv = cols_embedding(df, "vecinos")
+    # VENTANAS: el veredicto sale de `examen`, un bloque que no entrenó ni
+    # validó nada. `cabezas_validan` se informa aparte porque eligió el nº de
+    # árboles y el umbral: sus cifras son de SELECCIÓN, no finales.
+    _v = verificar(cfg, df["month"].values, df["week_in_month"].values)
+    y_all = df["isFraud"].values.astype(int)
 
-    data = torch.load(resolve(cfg, "graph_dir") / "graph.pt", weights_only=False)
-    gnn_orig_scores = original_gnn_scores_on_test(cfg, data, test_idx)
+    # --- puntuar TODO el dataset con cada cabeza de producción -------------
+    scores, imp = {}, {}
+    for v in variantes:
+        ruta = modelos_dir / nombre_modelo(v, sufijo)
+        if not ruta.exists():
+            log.warning("Falta %s — se omite '%s'", ruta.name, v)
+            continue
+        booster = cargar(cfg, ruta.name)
+        cols_v = columnas(v, cols_base, cols_emb, cols_embv)
+        # EL ANCHO LO DICTA EL BOOSTER, nunca una constante (regla 1). Sin este
+        # assert el fallo llega como "Feature shape mismatch, expected: 63, got
+        # 431" desde las tripas de XGBoost, sin decir qué cabeza ni por qué.
+        esperado = booster.num_features()
+        assert len(cols_v) == esperado, (
+            f"La cabeza '{v}' se entrenó con {esperado} columnas y aquí se le "
+            f"arman {len(cols_v)}. Suele significar que la ablación "
+            f"(xgboost.excluir_prefijos) cambió DESPUÉS de entrenarla: vuelve a "
+            f"correr `heads`.")
+        X = df[cols_v].values.astype(np.float32)
+        scores[v] = np.asarray(booster.inplace_predict(X), dtype=np.float64)
+        imp[v] = importancia_por_bloque(booster, cols_v)
+        log.info("'%s' cargada (%d columnas) | ganancia: tabular %.1f%% / "
+                 "embedding %.1f%% | usa %d de %d columnas del embedding",
+                 v, X.shape[1], imp[v]["ganancia_pct"]["tabular"],
+                 imp[v]["ganancia_pct"]["embedding"],
+                 imp[v]["embedding_usadas"], imp[v]["embedding_totales"])
+        del X
+    if not scores:
+        raise SystemExit(
+            "No hay ninguna cabeza entrenada. Corre `heads` (exploración) o "
+            "`heads_refit` (producción).")
 
-    assert len(y_xgb) == len(y_gnn), \
-        "El test de XGBoost y de la GNN no coinciden en tamaño"
+    # La GNN SOLA, como referencia. Es el `gnn_score` que ya guarda el OOF:
+    # sigmoid(clasificador(embedding)), o sea la red decidiendo por su cuenta
+    # sin XGBoost de por medio. No cuesta nada —ya está calculado— y responde
+    # una pregunta propia: ¿XGBoost extrae del embedding MÁS de lo que la propia
+    # red sacaba de él? Si `solo_gnn` supera a `gnn_sola`, la respuesta es sí.
+    if "gnn_score" in df.columns and df["gnn_score"].notna().any():
+        scores["gnn_sola"] = df["gnn_score"].fillna(0.0).values.astype(np.float64)
+        log.info("'gnn_sola' añadida como referencia (el gnn_score de la red única)")
 
-    # --- métricas globales mes 6 ---
-    rep_xgb = full_report(y_xgb, xgb_scores, thr)
-    rep_cl = full_report(y_gnn, gnn_cl_scores, thr)
+    meses_txt = "la ventana cabezas_entrenan"
+    resultado = {"modo": "ventanas",
+                 "corte_del_veredicto": corte,
+                 "nota": (f"Las tres cabezas comparten ventana ({meses_txt}), "
+                          "hiperparámetros y SMOTE: la diferencia es atribuible "
+                          "solo a las columnas. 'gnn_sola' es la red decidiendo "
+                          "por su cuenta, sin XGBoost: va como referencia, no "
+                          "como competidora."),
+                 "cabezas_validan": {}, "examen": {}}
+    resultado["aviso"] = (
+        "El bloque `examen` no entrenó ni validó nada: su cifra es limpia. "
+        "El bloque `cabezas_validan` sí eligió el nº de árboles y el umbral, "
+        "así que sus cifras son OPTIMISTAS en términos absolutos — se informan "
+        "para diagnóstico, no como resultado. La COMPARACIÓN entre cabezas es "
+        "válida en ambos: las tres reciben las mismas filas, las mismas "
+        "ventanas y el mismo presupuesto de búsqueda.")
 
-    # --- patrones emergentes: fraudes que el GNN ORIGINAL no veía ---
-    fraud = y_gnn == 1
-    emerging = fraud & (gnn_orig_scores < thr)
-    n_emerging = int(emerging.sum())
-    recall_cl_emerging = float((gnn_cl_scores[emerging] >= thr).mean()) if n_emerging else 0.0
-    recall_xgb_emerging = float((xgb_scores[emerging] >= thr).mean()) if n_emerging else 0.0
-    gap = recall_cl_emerging - recall_xgb_emerging
-    kpi_ok = gap >= cfg["comparison"]["kpi_recall_gap"]
+    # Las métricas POR MES se eliminaron: con las `ventanas` el experimento vive
+    # en dos meses, y una tabla de dos filas donde los bloques de entrenamiento
+    # salen inflados por construcción no informa de nada. Lo que importa son las
+    # dos ventanas que no entrenaron: `cabezas_validan` (diagnóstico) y `examen`
+    # (el veredicto).
 
-    # --- impacto económico ---
-    extra_detected = emerging & (gnn_cl_scores >= thr) & (xgb_scores < thr)
-    if "TransactionAmt" in test_df.columns:
-        usd = float(test_df.loc[np.where(extra_detected)[0], "TransactionAmt"].sum())
-        usd_note = "suma de TransactionAmt de los fraudes adicionales detectados"
-    else:
-        usd = float(extra_detected.sum() * cfg["comparison"]["avg_fraud_amount_usd"])
-        usd_note = f"n x monto promedio (USD {cfg['comparison']['avg_fraud_amount_usd']})"
+    cortes = (("cabezas_validan", "cabezas_validan"), ("examen", "examen"))
+    for etiqueta, clave in cortes:
+        sel = _v[clave]
+        y = y_all[sel]
+        if not sel.any():
+            continue
+        bloque = {"n": int(sel.sum()), "n_fraud": int(y.sum()),
+                  "modelos": {}, "presupuesto": [], "precision": []}
+        log.info("=" * 62)
+        log.info("%s — %d transacciones, %d fraudes (%.2f%%)",
+                 etiqueta.upper(), sel.sum(), y.sum(), 100 * y.mean())
 
-    # --- comparación JUSTA: mismo coste operativo -------------------------
-    # Comparar recall a un threshold fijo entre dos modelos con calibraciones
-    # distintas no mide detección, mide agresividad: la GNN entrena con
-    # pos_weight (~27) y sus scores están desplazados hacia arriba, así que al
-    # mismo 0.5 alerta muchísimo más. Estas dos vistas eliminan ese sesgo.
-    n_alertas_xgb = int((xgb_scores >= thr).sum())
-    presupuestos = sorted({int(len(y_gnn) * p / 100) for p in BUDGETS_PCT}
-                          | {n_alertas_xgb})
-    por_presupuesto = [
-        {"n_alertas": k,
-         "pct_del_mes": round(100 * k / len(y_gnn), 2),
-         "recall_xgboost": recall_at_budget(y_xgb, xgb_scores, k),
-         "recall_gnn_cl": recall_at_budget(y_gnn, gnn_cl_scores, k)}
-        for k in presupuestos
-    ]
-    por_precision = []
-    for objetivo in PRECISION_TARGETS:
-        rx, kx = recall_at_precision(y_xgb, xgb_scores, objetivo)
-        rg, kg = recall_at_precision(y_gnn, gnn_cl_scores, objetivo)
-        por_precision.append({
-            "precision_objetivo": objetivo,
-            "xgboost": {"recall": rx, "n_alertas": kx},
-            "gnn_cl": {"recall": rg, "n_alertas": kg},
-        })
+        for v, s in scores.items():
+            thr = umbral_por_presupuesto(s[sel], pct)
+            rep = _confusion(y, s[sel], thr)
+            rep["umbral_usado"] = thr
+            bloque["modelos"][v] = rep
+            log.info("  %-16s PR %.4f | ROC %.4f | recall %.4f | prec %.4f | "
+                     "F1 %.4f | acc %.4f", v, rep.get("pr_auc", 0),
+                     rep.get("auc_roc", 0), rep["recall"], rep["precision"],
+                     rep["f1"], rep["accuracy"])
+        log.info("  %-16s (no alertar nunca da accuracy %.4f — por eso el "
+                 "accuracy no compara)", "",
+                 next(iter(bloque["modelos"].values()))["accuracy_sin_alertar"])
 
-    # A igual presupuesto (el de XGBoost en su threshold), ¿quién gana?
-    r_xgb_ref = recall_at_budget(y_xgb, xgb_scores, n_alertas_xgb)
-    r_gnn_ref = recall_at_budget(y_gnn, gnn_cl_scores, n_alertas_xgb)
+        log.info("  -- a IGUAL presupuesto de alertas --")
+        for p in PRESUPUESTOS_PCT:
+            k = int(round(sel.sum() * p / 100))
+            fila = {"pct": p, "n_alertas": k}
+            for v, s in scores.items():
+                fila[v] = round(recall_at_budget(y, s[sel], k), 4)
+            bloque["presupuesto"].append(fila)
+            log.info("     %6d alertas (%5.1f%%) | %s", k, p,
+                     " | ".join(f"{v} {fila[v]:.4f}" for v in scores))
 
-    # El impacto económico se recalcula al MISMO presupuesto, no al mismo
-    # threshold: si no, se contabiliza como "ganancia" el alertar 16x más.
-    k_ref = n_alertas_xgb
-    top_gnn = np.zeros(len(y_gnn), dtype=bool)
-    top_gnn[np.argsort(-gnn_cl_scores)[:k_ref]] = True
-    top_xgb = np.zeros(len(y_xgb), dtype=bool)
-    top_xgb[np.argsort(-xgb_scores)[:k_ref]] = True
-    extra_iso = (y_gnn == 1) & top_gnn & ~top_xgb
-    if "TransactionAmt" in test_df.columns:
-        usd_iso = float(test_df.loc[np.where(extra_iso)[0], "TransactionAmt"].sum())
-    else:
-        usd_iso = float(extra_iso.sum() * cfg["comparison"]["avg_fraud_amount_usd"])
+        log.info("  -- a IGUAL precisión --")
+        for objetivo in PRECISIONES:
+            fila = {"precision_objetivo": objetivo}
+            for v, s in scores.items():
+                r, k = recall_at_precision(y, s[sel], objetivo)
+                fila[v] = {"recall": r, "n_alertas": k}
+            bloque["precision"].append(fila)
+            log.info("     precisión %3.0f%% | %s", 100 * objetivo,
+                     " | ".join(f"{v} {fila[v]['recall'] or 0:.4f}" for v in scores))
 
-    semanal = por_semana(test_df, y_gnn, xgb_scores, gnn_cl_scores, thr)
-    desplego = cl_desplego(cfg)
+        # semana a semana: el AUC del mes agregado puede inflarse por
+        # correlación temporal; dentro de una semana esa correlación no está.
+        if "week_in_month" in df.columns:
+            semanas = df["week_in_month"].values[sel]
+            bloque["semanal"] = []
+            for w in sorted(np.unique(semanas)):
+                sw = semanas == w
+                if y[sw].sum() == 0:
+                    continue
+                fila = {"semana": int(w), "n": int(sw.sum()),
+                        "n_fraude": int(y[sw].sum())}
+                for v, s in scores.items():
+                    r = full_report(y[sw], s[sel][sw], 0.5)
+                    fila[v] = {"auc_roc": r.get("auc_roc"), "pr_auc": r.get("pr_auc")}
+                bloque["semanal"].append(fila)
 
-    result = {
-        "month6_overall": {"xgboost_frozen": rep_xgb, "gnn_continual_learning": rep_cl},
-        "matched_budget": {
-            "nota": ("Recall cuando ambos modelos emiten el MISMO número de "
-                     "alertas. Es la comparación con sentido operativo: el "
-                     "coste de revisión es el mismo para los dos."),
-            "presupuesto_referencia": n_alertas_xgb,
-            "recall_xgboost_ref": r_xgb_ref,
-            "recall_gnn_cl_ref": r_gnn_ref,
-            "gana_en_referencia": "xgboost" if r_xgb_ref > r_gnn_ref else "gnn_cl",
-            "barrido": por_presupuesto,
-        },
-        "month6_weekly": semanal,
-        "matched_precision": {
-            "nota": ("Recall máximo de cada modelo sin bajar de la precisión "
-                     "objetivo. Responde: a igual calidad de alerta, ¿quién "
-                     "recupera más fraude?"),
-            "barrido": por_precision,
-        },
-        "emerging_patterns": {
-            "definition": "fraudes del mes 6 con score <0.5 del GNN original (pre-CL)",
-            "n_emerging_frauds": n_emerging,
-            "recall_gnn_cl": recall_cl_emerging,
-            "recall_xgboost": recall_xgb_emerging,
-            "recall_gap": round(gap, 4),
-            "kpi_gap_target": cfg["comparison"]["kpi_recall_gap"],
-            "kpi_ok": bool(kpi_ok),
-            "cl_desplego_alguna_vez": desplego,
-            "advertencia": (None if desplego else
-                "NINGÚN ciclo de CL llegó a desplegar: el modelo 'GNN+CL' y el "
-                "'GNN original' son EL MISMO. La diferencia entre sus scores es "
-                "solo ruido del neighbor sampling (cada pasada elige vecinos "
-                "distintos), así que este recall NO mide adaptación."),
-        },
-        "economic_impact": {
-            "a_threshold_fijo": {
-                "extra_frauds_detected_vs_xgboost": int(extra_detected.sum()),
-                "estimated_usd_saved": round(usd, 2),
-                "method": usd_note,
-                "sesgo": ("Cuenta como ganancia alertar más. Solo es "
-                          "comparable si ambos modelos emiten alertas "
-                          "similares; ver a_igual_presupuesto."),
-            },
-            "a_igual_presupuesto": {
-                "presupuesto": k_ref,
-                "extra_frauds_detected_vs_xgboost": int(extra_iso.sum()),
-                "estimated_usd_saved": round(usd_iso, 2),
-                "method": ("fraudes en el top-K de la GNN que NO están en el "
-                           "top-K de XGBoost, con el mismo K"),
-            },
-        },
-    }
+        resultado[etiqueta] = bloque
 
-    with open(reports_dir / "final_comparison.json", "w") as f:
-        json.dump(result, f, indent=2)
+    # --- atribución --------------------------------------------------------
+    if "control" in scores and "gnn_mas_tabular" in scores and resultado[corte]:
+        c = resultado[corte]["modelos"]["control"].get("pr_auc")
+        g = resultado[corte]["modelos"]["gnn_mas_tabular"].get("pr_auc")
+        s_ = resultado[corte]["modelos"].get("solo_gnn", {}).get("pr_auc")
+        resultado["atribucion"] = {
+            "control_pr_auc": c, "gnn_mas_tabular_pr_auc": g,
+            "solo_gnn_pr_auc": s_,
+            "aporte_del_grafo": round(g - c, 4) if (c and g) else None,
+            "medido_en": corte,
+            "importancia": imp,
+            "nota": (f"Ambas con {meses_txt} y mismos hiperparámetros: la "
+                     "diferencia es el aporte del grafo, sin confundirlo con "
+                     "la ventana de entrenamiento."
+                     ),
+        }
+        log.info("=" * 62)
+        log.info("APORTE DEL GRAFO (%s): %.4f - %.4f = %+.4f",
+                 corte, g, c, g - c)
+        if s_ is not None:
+            log.info("  solo_gnn: %.4f  (techo del grafo aislado)", s_)
 
-    log.info("=========== COMPARACIÓN FINAL (mes 6) ===========")
-    log.info("-- A threshold fijo %.2f (NO comparable: distinta calibración) --", thr)
-    log.info("  XGBoost  alertas %6d (%5.2f%%) | recall %.4f | precisión %.4f",
-             n_alertas_xgb, 100 * n_alertas_xgb / len(y_xgb),
-             rep_xgb["recall"], rep_xgb["precision"])
-    log.info("  GNN+CL   alertas %6d (%5.2f%%) | recall %.4f | precisión %.4f",
-             int((gnn_cl_scores >= thr).sum()),
-             100 * (gnn_cl_scores >= thr).sum() / len(y_gnn),
-             rep_cl["recall"], rep_cl["precision"])
-    log.info("-- A IGUAL presupuesto de alertas (comparación válida) --")
-    for fila in por_presupuesto:
-        log.info("  %6d alertas (%5.2f%%) | XGBoost %.4f | GNN+CL %.4f | gana %s",
-                 fila["n_alertas"], fila["pct_del_mes"],
-                 fila["recall_xgboost"], fila["recall_gnn_cl"],
-                 "XGBoost" if fila["recall_xgboost"] > fila["recall_gnn_cl"] else "GNN+CL")
-    log.info("-- A IGUAL precisión --")
-    for fila in por_precision:
-        fmt = lambda d: ("—" if d["recall"] is None
-                         else f"{d['recall']:.4f} ({d['n_alertas']} alertas)")
-        log.info("  precisión %3.0f%% | XGBoost %-22s | GNN+CL %s",
-                 100 * fila["precision_objetivo"], fmt(fila["xgboost"]),
-                 fmt(fila["gnn_cl"]))
-    if semanal:
-        log.info("-- SEMANA A SEMANA (el mes agregado puede inflar el AUC) --")
-        for f in semanal["semanas"]:
-            log.info("  semana %d (%5d txn, %3d fraudes) | XGBoost %.4f | GNN+CL %.4f",
-                     f["semana"], f["n"], f["n_fraude"],
-                     f["xgboost"]["auc_roc"], f["gnn_cl"]["auc_roc"])
-        ms = semanal["media_semanal"]
-        log.info("  MEDIA SEMANAL             | XGBoost %.4f | GNN+CL %.4f",
-                 ms["xgboost"]["auc_roc"], ms["gnn_cl"]["auc_roc"])
-        log.info("  (contra el mes agregado   | XGBoost %.4f | GNN+CL %.4f)",
-                 rep_xgb.get("auc_roc", float("nan")),
-                 rep_cl.get("auc_roc", float("nan")))
-    log.info("-- Threshold-independiente --")
-    log.info("  XGBoost  ROC-AUC %.4f | PR-AUC %.4f",
-             rep_xgb.get("auc_roc", float("nan")), rep_xgb.get("pr_auc", float("nan")))
-    log.info("  GNN+CL   ROC-AUC %.4f | PR-AUC %.4f",
-             rep_cl.get("auc_roc", float("nan")), rep_cl.get("pr_auc", float("nan")))
-    log.info("-- Emergentes --")
-    log.info("  XGBoost %.4f | GNN+CL %.4f | gap %+.4f (KPI >= %.2f: %s)",
-             recall_xgb_emerging, recall_cl_emerging, gap,
-             cfg["comparison"]["kpi_recall_gap"], "OK" if kpi_ok else "NO")
-    if not desplego:
-        log.warning("  NINGÚN ciclo de CL desplegó: 'GNN+CL' y 'GNN original' son "
-                    "el MISMO modelo. Ese gap es ruido de muestreo, no adaptación.")
-    log.info("-- Impacto económico --")
-    log.info("  a threshold fijo   : %d fraudes ~ USD %.0f  (sesgado: alerta 16x más)",
-             int(extra_detected.sum()), usd)
-    log.info("  a igual presupuesto: %d fraudes ~ USD %.0f",
-             int(extra_iso.sum()), usd_iso)
+        # ¿Ese delta sobrevive al ruido del mes? Sin esto, un +0.004 y un
+        # +0.04 se leen igual en el informe.
+        sel_v = _v["examen"]
+        bs = bootstrap_delta(y_all[sel_v], scores["control"][sel_v],
+                             scores["gnn_mas_tabular"][sel_v])
+        resultado["atribucion"]["bootstrap"] = bs
+        log.info("  bootstrap emparejado (1000 réplicas sobre %s):", corte)
+        log.info("    delta %+.5f | IC95 [%+.5f, %+.5f] | P(delta>0) = %.3f",
+                 bs["delta_observado"], bs["ic95"][0], bs["ic95"][1],
+                 bs["p_delta_mayor_que_cero"])
+        if bs["significativo"]:
+            log.info("    -> el intervalo NO cruza el cero: la diferencia se "
+                     "sostiene")
+        else:
+            log.info("    -> el intervalo CRUZA EL CERO: con estos datos no se "
+                     "puede afirmar que haya diferencia")
+
+        # Y si el aporte es ~0, ¿es que el grafo no sirve o que XGBoost ni lo
+        # miró? La ganancia por bloque separa las dos explicaciones.
+        e = imp.get("gnn_mas_tabular", {})
+        if e:
+            log.info("  la cabeza mixta saca el %.1f%% de su ganancia del "
+                     "embedding (%d de %d columnas usadas)",
+                     e["ganancia_pct"]["embedding"], e["embedding_usadas"],
+                     e["embedding_totales"])
+
+    # Fichero distinto: un informe de exploración NO debe pisar el definitivo.
+    salida = reports_dir / "final_comparison.json"
+    with open(salida, "w") as f:
+        json.dump(resultado, f, indent=2, ensure_ascii=False)
+    log.info("-> %s", salida)
+
+    # El resumen se genera AQUÍ y no como etapa aparte: es derivado, cuesta
+    # milisegundos, y una etapa con salida propia se saltaría por "ya hecha"
+    # dejando un resumen viejo junto a métricas nuevas.
+    try:
+        from src.comparison.resumen import main as _resumen
+        _resumen(escribir_json=True)
+    except Exception as e:                       # nunca debe tumbar la corrida
+        log.warning("El resumen falló (%s). Las métricas están en %s",
+                    e, salida)
 
 
 if __name__ == "__main__":

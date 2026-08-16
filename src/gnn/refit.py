@@ -39,7 +39,7 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from src.gnn.models import build_model
+from src.gnn.models import TXN, build_model, cfg_arquitectura
 from src.gnn.train_gnn import make_loader
 from src.utils.common import (ensure_dirs, get_device, get_logger, load_config,
                               resolve, set_seed)
@@ -102,23 +102,30 @@ def main():
     set_seed(seed)
     device = get_device()
     data = torch.load(resolve(cfg, "graph_dir") / "graph.pt", weights_only=False)
-    cfg["gnn"]["in_dim"] = data.x.shape[1]
+    cfg["gnn"]["in_dim"] = data[TXN].x.shape[1]
 
-    entrena = data.train_mask | data.val_mask          # meses 1-5 completos
-    n_tr, antes = int(entrena.sum()), int(data.train_mask.sum())
+    entrena = data[TXN].train_mask | data[TXN].val_mask   # meses 1-5 completos
+    n_tr, antes = int(entrena.sum()), int(data[TXN].train_mask.sum())
     log.info("Entrena %d txn (+%.0f%% sobre las %d de la corrida original) | "
              "mes 6 intacto (%d)", n_tr, 100 * (n_tr - antes) / antes, antes,
              int(data.test_mask.sum()))
 
-    y_tr = data.y[entrena]
+    y_tr = data[TXN].y[entrena]
     pos_weight = float((y_tr == 0).sum() / max(1, (y_tr == 1).sum()))
     log.info("pos_weight recalculado: %.2f", pos_weight)
 
-    model = build_model(nombre, cfg).to(device)        # pesos NUEVOS
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg["gnn"]["lr"])
+    # Arquitectura de la GANADORA (checkpoint o cache de Optuna), no la del
+    # config: los pesos son nuevos, pero la forma tiene que ser la misma.
+    cfg = cfg_arquitectura(nombre, cfg)
+    model = build_model(nombre, cfg, data.metadata()).to(device)  # pesos NUEVOS
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=cfg["gnn"]["lr"],
+        weight_decay=float(cfg["gnn"].get("weight_decay", 0.0)))
     criterion = torch.nn.BCEWithLogitsLoss(
         pos_weight=torch.tensor(pos_weight, device=device))
-    train_loader = make_loader(data, entrena, cfg, shuffle=True)
+    balancear = bool(cfg["gnn"].get("balanceo_semillas", False))
+    train_loader = make_loader(data, entrena, cfg, shuffle=True,
+                               balancear=balancear)
 
     # Sin early stopping: no queda conjunto de validación. La única señal
     # disponible es la loss de entrenamiento, que se registra para poder ver
@@ -130,11 +137,12 @@ def main():
         for batch in train_loader:
             batch = batch.to(device)
             optimizer.zero_grad()
-            logits = model(batch.x, batch.edge_index)[: batch.batch_size]
-            loss = criterion(logits, batch.y[: batch.batch_size])
+            n = batch[TXN].batch_size
+            logits = model(batch.x_dict, batch.edge_index_dict, batch)[:n]
+            loss = criterion(logits, batch[TXN].y[:n])
             loss.backward()
             optimizer.step()
-            total += loss.item() * batch.batch_size
+            total += loss.item() * batch[TXN].batch_size
         perdidas.append(round(total / n_tr, 4))
         log.info("Época %02d/%02d | loss %.4f", epoca, n_epocas, perdidas[-1])
 

@@ -14,8 +14,19 @@ torch>=2.2
 torch-geometric>=2.5
 
 # Baseline tabular
-# En macOS, XGBoost necesita el runtime de OpenMP:  brew install libomp
-xgboost>=2.0
+# VERSIÓN FIJADA por compatibilidad con CUDA, no por capricho.
+# Las versiones nuevas (3.4.x) se compilan contra CUDA 13 y exigen driver 580+.
+# Los pods de RunPod suelen traer driver 570 (CUDA 12.8): ahí XGBoost reporta
+# "No visible GPU is found" y cae a CPU EN SILENCIO — el paso `hybrid` pasa de
+# ~7 min a ~50. Medido en pod con driver 570.211.01:
+#     xgboost 3.4.0  ->  no ve la GPU
+#     xgboost 3.0.5  ->  GPU OK          <- por eso el tope en <3.1
+# Si tu driver es 580+, puedes soltar el tope y usar la última.
+# OJO al diagnosticar: build_info()["USE_CUDA"] dice True aunque no funcione, y
+# train(device="cuda") no lanza excepción: solo avisa. Hay que entrenar de
+# verdad y buscar el aviso — es lo que hace scripts/setup_runpod.sh.
+# En macOS da igual (no hay CUDA), pero necesita OpenMP:  brew install libomp
+xgboost>=3.0,<3.1
 imbalanced-learn>=0.12
 optuna>=3.5
 
