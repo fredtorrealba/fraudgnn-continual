@@ -1,0 +1,14 @@
+{
+  "modelo": "graphsage",
+  "n_trials": 30,
+  "mejor_valor": 0.24854748126080667,
+  "mejores_params": {
+    "lr": 0.0003620595965204201,
+    "dropout": 0.3376681522595246,
+    "ancho": 256,
+    "capas": 3,
+    "mlp_head_dim": 64,
+    "weight_decay": 8.376070586201612e-06
+  },
+  "podados": 21
+}

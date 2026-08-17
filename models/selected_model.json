@@ -1,0 +1,162 @@
+{
+  "selection": {
+    "selected": "graphsage",
+    "seed": 2026,
+    "checkpoint": "graphsage_seed2026.pt",
+    "best_epoch": 1,
+    "reason": "Mayor PR-AUC walk-forward: graphsage 0.2018 contra gatv2 0.1500 (\u0394=+0.0518).",
+    "auc_mean": 0.201793798117492,
+    "auc_std": 0.004414643839640312,
+    "auc_month_mean": 0.804864896810311,
+    "pr_auc_mean": 0.20179320554448132,
+    "kpi_auc_target": 0.93,
+    "kpi_auc_ok": false,
+    "kpi_medido_sobre": "auc_roc mensual"
+  },
+  "results": {
+    "graphsage": {
+      "runs": [
+        {
+          "n": 37386,
+          "n_fraud": 923,
+          "threshold": 0.5,
+          "recall": 0.6348862405200434,
+          "precision": 0.0864689390585805,
+          "f1": 0.1522077922077922,
+          "accuracy": 0.8253891831166746,
+          "accuracy_sin_alertar": 0.975311613973145,
+          "auc_roc": 0.7976610047930272,
+          "pr_auc": 0.20019570348706228,
+          "train_minutes": 14.7,
+          "pos_weight": 1.0,
+          "model": "graphsage",
+          "seed": 42,
+          "resumed": false,
+          "best_epoch": 1,
+          "weekly_auc": [
+            0.2001976444596405
+          ]
+        },
+        {
+          "n": 37386,
+          "n_fraud": 923,
+          "threshold": 0.5,
+          "recall": 0.6944745395449621,
+          "precision": 0.08162485674264612,
+          "f1": 0.1460802187784868,
+          "accuracy": 0.7995506339271385,
+          "accuracy_sin_alertar": 0.975311613973145,
+          "auc_roc": 0.8108958400639376,
+          "pr_auc": 0.19736490277791735,
+          "train_minutes": 14.7,
+          "pos_weight": 1.0,
+          "model": "graphsage",
+          "seed": 123,
+          "resumed": false,
+          "best_epoch": 1,
+          "weekly_auc": [
+            0.19736474949625812
+          ]
+        },
+        {
+          "n": 37386,
+          "n_fraud": 923,
+          "threshold": 0.5,
+          "recall": 0.6164680390032503,
+          "precision": 0.09945813668938996,
+          "f1": 0.17128236002408187,
+          "accuracy": 0.8527256192157492,
+          "accuracy_sin_alertar": 0.975311613973145,
+          "auc_roc": 0.8060378455739681,
+          "pr_auc": 0.20781901036846429,
+          "train_minutes": 13.5,
+          "pos_weight": 1.0,
+          "model": "graphsage",
+          "seed": 2026,
+          "resumed": false,
+          "best_epoch": 1,
+          "weekly_auc": [
+            0.2078190003965774
+          ]
+        }
+      ],
+      "auc_mean": 0.201793798117492,
+      "auc_std": 0.004414643839640312,
+      "auc_month_mean": 0.804864896810311,
+      "recall_mean": 0.6486096063560852,
+      "pr_auc_mean": 0.20179320554448132
+    },
+    "gatv2": {
+      "runs": [
+        {
+          "n": 37386,
+          "n_fraud": 923,
+          "threshold": 0.5,
+          "recall": 0.5460455037919827,
+          "precision": 0.10574905581200168,
+          "f1": 0.17718403937423097,
+          "accuracy": 0.8747927031509121,
+          "accuracy_sin_alertar": 0.975311613973145,
+          "auc_roc": 0.7805347524400951,
+          "pr_auc": 0.1609686035340258,
+          "train_minutes": 8.7,
+          "pos_weight": 1.0,
+          "model": "gatv2",
+          "seed": 42,
+          "resumed": false,
+          "best_epoch": 1,
+          "weekly_auc": [
+            0.16096858943536574
+          ]
+        },
+        {
+          "n": 37386,
+          "n_fraud": 923,
+          "threshold": 0.5,
+          "recall": 0.733477789815818,
+          "precision": 0.06545489703180896,
+          "f1": 0.12018462630924907,
+          "accuracy": 0.7348740170117156,
+          "accuracy_sin_alertar": 0.975311613973145,
+          "auc_roc": 0.7959601013200013,
+          "pr_auc": 0.15158272493039987,
+          "train_minutes": 8.3,
+          "pos_weight": 1.0,
+          "model": "gatv2",
+          "seed": 123,
+          "resumed": false,
+          "best_epoch": 1,
+          "weekly_auc": [
+            0.15158272608952114
+          ]
+        },
+        {
+          "n": 37386,
+          "n_fraud": 923,
+          "threshold": 0.5,
+          "recall": 0.5785482123510293,
+          "precision": 0.09626825310978908,
+          "f1": 0.16506955177743432,
+          "accuracy": 0.8555074091906061,
+          "accuracy_sin_alertar": 0.975311613973145,
+          "auc_roc": 0.7829660152981922,
+          "pr_auc": 0.13732123957076361,
+          "train_minutes": 5.9,
+          "pos_weight": 1.0,
+          "model": "gatv2",
+          "seed": 2026,
+          "resumed": false,
+          "best_epoch": 1,
+          "weekly_auc": [
+            0.13732117370188718
+          ]
+        }
+      ],
+      "auc_mean": 0.1499574964089247,
+      "auc_std": 0.009722177271716148,
+      "auc_month_mean": 0.7864869563527628,
+      "recall_mean": 0.6193571686529433,
+      "pr_auc_mean": 0.14995752267839643
+    }
+  }
+}

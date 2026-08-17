@@ -1,0 +1,18 @@
+{
+  "n": 37386,
+  "n_fraud": 923,
+  "threshold": 0.5,
+  "recall": 0.6164680390032503,
+  "precision": 0.09945813668938996,
+  "f1": 0.17128236002408187,
+  "accuracy": 0.8527256192157492,
+  "accuracy_sin_alertar": 0.975311613973145,
+  "auc_roc": 0.8060378455739681,
+  "pr_auc": 0.20781901036846429,
+  "train_minutes": 13.5,
+  "pos_weight": 1.0,
+  "model": "graphsage",
+  "seed": 2026,
+  "resumed": false,
+  "best_epoch": 1
+}

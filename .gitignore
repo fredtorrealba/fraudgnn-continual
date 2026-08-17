@@ -29,6 +29,16 @@ historial/*
 !reports/xgboost_val_metrics.json
 !reports/smoke_synthetic/
 !reports/smoke_synthetic/**
+# Los checkpoints de la GNN y el caché de Optuna TAMBIÉN se versionan
+# (decisión 2026-08-17): son la mitad cara del pipeline (horas de GPU) y
+# subirlos permite que el pod los reutilice con `git pull` en vez de
+# reentrenar. OJO: ~30 MB por checkpoint; si algún día pesan >100 MB, GitHub
+# los rechaza y habrá que pasar a git-lfs o a scp.
+!models/*_seed*.pt
+!models/selected_model.json
+!reports/optuna_*.json
+!reports/optuna_*.db
+!reports/*_seed*_val.json
 
 # --- Entornos virtuales ------------------------------------------------------
 .venv/

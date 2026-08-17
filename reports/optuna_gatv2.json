@@ -1,0 +1,14 @@
+{
+  "modelo": "gatv2",
+  "n_trials": 30,
+  "mejor_valor": 0.18706730710576633,
+  "mejores_params": {
+    "lr": 0.0003358392569497307,
+    "dropout": 0.19634287282666124,
+    "ancho": 256,
+    "capas": 2,
+    "mlp_head_dim": 16,
+    "weight_decay": 0.0003070450636777896
+  },
+  "podados": 11
+}
