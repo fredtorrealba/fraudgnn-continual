@@ -258,9 +258,9 @@ gnn:
   # los fraudes concretos del entrenamiento. No se estaba aplicando en el
   # bucle principal, solo dentro de la búsqueda de Optuna.
   weight_decay: 0.0005
-  epochs: 10
-  patience: 4              # con epochs 10, una paciencia de 10 nunca dispara:
-                           # el early stopping quedaba desactivado de facto
+  epochs: 50
+  patience: 10             # con lr bajo la red sube durante varias épocas;
+                           # con paciencia corta se cortaría antes del techo
   # Épocas del paso `refit`. Vacío = usar el pico de la corrida ganadora, que
   # compare_gnns anota en selected_model.json. Poner un número aquí permite
   # relanzar SOLO el refit con otra cantidad, sin repetir las 6 corridas.
@@ -352,7 +352,7 @@ gnn:
   optuna_presupuesto_min: 0
   # Ningún trial puede pasar de aquí. El `timeout` de arriba no corta un trial
   # ya empezado: sin este tope, el trial 3 de gatv2 se comió 29 minutos él solo.
-  optuna_tope_trial_min: 10
+  optuna_tope_trial_min: 12
 
   # ── PARALELISMO de la etapa `gnn` ─────────────────────────────────────────
   # Las 8 tareas son independientes: 2 estudios de Optuna + 6 corridas que solo

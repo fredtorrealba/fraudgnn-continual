@@ -476,7 +476,16 @@ def buscar_hiperparametros(model_name: str, cfg) -> dict:
         storage=f"sqlite:///{db}",
         load_if_exists=True,
         sampler=optuna.samplers.TPESampler(seed=semilla_tpe),
-        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=2))
+        # n_warmup_steps=4, no 2. Con la entrada CRUDA las redes tocaban techo
+        # en la época 1 y podar en la 2 no perdía nada. Con la entrada
+        # normalizada aprenden de verdad, y una configuración con learning rate
+        # bajo puede ir mediocre en la época 2 y ser la mejor en la 8: podarla
+        # ahí mataría justo la que buscamos.
+        #
+        # Cuesta ~1,3 min más por trial podado (4 épocas en vez de 2 a 0,65
+        # min/época). Con 30 trials son unos 25 minutos, que es barato comparado
+        # con descartar la configuración buena.
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=4))
 
     hechos = len([t for t in estudio.trials
                   if t.state.name in ("COMPLETE", "PRUNED")])
