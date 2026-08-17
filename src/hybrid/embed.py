@@ -95,7 +95,15 @@ def main():
              int(entrenadas.sum()), int((~usa & ~entrenadas).sum()))
 
     t0 = time.time()
-    emb, embv, sc = embed_and_score_nodes(model, data, describir, cfg)
+    # Con `c`, NO con el cfg global. El loader de embed_and_score_nodes arma
+    # los fanouts con len(cfg.gnn.hidden_dims): pasarle el global significaba
+    # muestrear los saltos del config ([64,64] = 2) aunque la red ganadora
+    # tuviera 3 capas. La red entrenaba viendo 3 saltos y describía viendo 2:
+    # la tercera capa agregaba vecindarios truncados, sin ningún síntoma. El
+    # bug fue LATENTE mientras Optuna eligió 2 capas (config y checkpoint
+    # coincidían) y se activó en la primera corrida que ganó 256x3 — la del
+    # 2026-08-17, cuyo veredicto hubo que repetir.
+    emb, embv, sc = embed_and_score_nodes(model, data, describir, c)
     log.info("Embedding listo en %.1f min | %d dimensiones",
              (time.time() - t0) / 60, emb.shape[1])
 

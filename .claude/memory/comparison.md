@@ -57,11 +57,62 @@ llamarlo antes de los imports pesados o el intérprete muere con SIGSEGV.
 
 # RESULTADOS
 
-## El estado actual (piloto de 2 meses, 220.806 transacciones)
+## ⚠️ La corrida 2026-08-17 está CONTAMINADA — repetir embed→heads→final
+
+El veredicto de abajo (−0.0201 significativo) se midió con un embedding
+DEFECTUOSO: `embed.py` pasaba el cfg global a `embed_and_score_nodes`, así que
+el loader muestreó los 2 saltos del config mientras la red ganadora (256×3,
+primera vez que gana 3 capas) esperaba 3. Entrenó viendo 3 saltos y describió
+viendo 2: la tercera capa agregó vecindarios truncados. Arreglado en embed.py
+(pasa `c` de `cfg_arquitectura`) con guarda en `validate.py` que ahora revienta
+ante el mismatch. **Los números de la GNN (sección 1) siguen siendo válidos**
+— el bug solo afecta al parquet del embedding, no al entrenamiento ni a la
+selección (`compare_gnns` ya hacía `cfg = c`). Rehacer solo embed→heads→final.
+
+## El estado de la corrida 2026-08-17 (entrada v2 — veredicto PENDIENTE de repetir)
 
 ```
 EXAMEN — 21.284 txn · 876 fraudes (4,12%)
 
+                   PR-AUC   ROC      recall@2%
+control            0.3341   0.8321     0.2614
+gnn_mas_tabular    0.3140   0.8241     0.2352
+solo_gnn           0.2078   0.7375     0.1884
+gnn_sola           0.2024   0.7166     0.1667
+
+APORTE DEL GRAFO   -0.0201   IC95 [-0.0349, -0.0043]   SIGNIFICATIVO (negativo)
+                   P(delta > 0) = 0.013
+```
+
+**Dos hechos a la vez, y no se contradicen:**
+
+1. **La normalización desbloqueó la RED.** `gnn_sola` pasó de ROC 0.512 (azar)
+   a 0.717 en el examen y su PR-AUC ×4 (0.048→0.202); la validación de
+   graphsage ×3 (PR-AUC 0.06→0.20). Y por primera vez Optuna eligió la red
+   grande (256×3 capas, antes «capas 3 nunca ha ganado»): con la entrada sana,
+   la capacidad extra por fin sirve de algo.
+2. **Y el grafo como AÑADIDO pasó de neutro a dañino medible.** El embedding
+   nuevo es 64 dims (mlp_head_dim de Optuna) y mucho más fuerte; la cabeza lo
+   usa de verdad (46,7% de la ganancia, las 64 columnas) — y pierde en
+   cabezas_validan (0.376 vs 0.413) Y en examen (0.314 vs 0.334). Es el patrón
+   ya documentado en gnn.md: cuanto más señal por dimensión, más redundante con
+   lo tabular y más arrastra el drift temporal (la cabeza calibra confianza en
+   una señal que se degrada hacia el examen). El precedente exacto: el emb_ de
+   64 cols dio −0.0325.
+
+`control` apenas se movió (0.3396→0.3341) pese a sumar 20 flags `__na` y los 5
+`__grado_*` — pero los USA: `id_03__na`, `dist1__na` y `__grado_uid` están en
+su top-10 de ganancia. Reordenó su importancia sin mover el techo.
+
+**Cabo suelto de la corrida:** `best_epoch: 1` en las 6 redes (antes 1-4, con
+epochs 10 y patience 4). La red toca techo en la primera época. Candidatos: lr
+de Optuna (3.6e-4) sobre entrada ya normalizada, o que 10 épocas con paciencia
+4 corten antes de ver una segunda subida. Investigar antes del A/B de
+RankGauss/LayerNorm.
+
+## El estado anterior (referencia, hasta 2026-08-16)
+
+```
                    PR-AUC   ROC      recall   prec     F1       recall@2%
 control            0.3396   0.8313   0.2489   0.5117   0.3349     0.2489
 gnn_mas_tabular    0.3339   0.8347   0.2443   0.5023   0.3287     0.2443
@@ -69,11 +120,7 @@ solo_gnn           0.1027   0.6770   0.0856   0.1761   0.1152     0.0856
 gnn_sola           0.0810   0.6436   0.0753   0.1549   0.1014     0.0753
 
 APORTE DEL GRAFO   -0.0058   IC95 [-0.0209, +0.0089]   NO significativo
-                   P(delta > 0) = 0.206
 ```
-
-**El intervalo cruza el cero.** Con estos datos no se puede afirmar que el grafo
-aporte ni que perjudique.
 
 ## Cómo se llegó aquí: tres artefactos descartados
 
@@ -85,6 +132,17 @@ La historia importa porque el primer número parecía concluyente y era falso.
 | sin overrides (A1) | −0.0110 | [−0.0210, −0.0017] | **sí** |
 | + `optuna_modo: compartido` (A3) | −0.0012 | [−0.0093, +0.0060] | no |
 | + E0/E1/E2, hiperparámetros nuevos | −0.0058 | [−0.0209, +0.0089] | no |
+| + entrada v2 (normalización causal, flags, grados, embedding 64d) | −0.0201 | [−0.0349, −0.0043] | **CONTAMINADA** (embed con 2 saltos para red de 3 capas) |
+
+La última fila NO es un artefacto de medición como las dos primeras: la
+simetría se mantuvo (misma ablación, Optuna compartido, grados a las tres). Lo
+que cambió es el embedding — más fuerte, más ancho (64d) y con más drift que
+descontar. El resultado desplaza la pregunta: ya no es «¿el grafo aporta?» sino
+«¿por qué una señal de grafo 4× mejor RESTA al combinarla?». Las hipótesis
+vivas: redundancia con lo tabular + caducidad temporal (medida) + 64 columnas
+que XGBoost sobreajusta en su ventana. La poda por consistencia temporal
+(MEJORAS punto 6) y un `mlp_head_dim` menor son los siguientes controles
+baratos.
 
 **El 98% del «daño del grafo» era artefacto de medición**: hiperparámetros
 puestos a mano en dos de las tres cabezas, y búsqueda por cabeza sobreajustando

@@ -69,6 +69,19 @@ def embed_and_score_nodes(model, data, node_idx, cfg):
     repeticiones (el balanceo de semillas repite fraudes): con un mapeo directo
     id->fila, las repeticiones quedarían en ceros SIN avisar.
     """
+    # GUARDA: la profundidad del muestreo la fija cfg.gnn.hidden_dims y la del
+    # modelo su número de capas. Si no coinciden, el loader trae MENOS saltos
+    # de los que la red espera y las capas de más agregan vecindarios truncados
+    # — sin error, sin warning, solo un embedding degradado. Pasó de verdad:
+    # embed.py mandaba el cfg global ([64,64]) con la ganadora de 3 capas.
+    # El llamador debe construir el cfg con `cfg_arquitectura()`.
+    n_fanout = len(cfg["gnn"]["hidden_dims"])
+    if getattr(model, "n_capas", n_fanout) != n_fanout:
+        raise ValueError(
+            f"El cfg define {n_fanout} salto(s) de muestreo y el modelo tiene "
+            f"{model.n_capas} capa(s): el vecindario llegaría truncado. "
+            f"Construye el cfg con cfg_arquitectura(modelo, cfg, checkpoint).")
+
     device = get_device()
     model = model.to(device).eval()
 

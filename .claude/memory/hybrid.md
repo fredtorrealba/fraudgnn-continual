@@ -14,6 +14,17 @@ una cabeza XGBoost.
 
 ## embed.py — UNA red, no K
 
+**El fallo del cfg global (2026-08-17).** `embed_and_score_nodes` arma su
+loader con `len(cfg.gnn.hidden_dims)` saltos. `embed.py` construía el modelo
+con `cfg_arquitectura()` (la arquitectura real del checkpoint) pero pasaba el
+**cfg global** al scorer: con la ganadora de 3 capas, la red describió con
+vecindarios de 2 saltos — truncados, sin síntoma alguno. Latente mientras
+Optuna eligió 2 capas; se activó la primera vez que ganó 256×3 y contaminó el
+veredicto de esa corrida (−0.0201 «significativo»). Hoy `embed.py` pasa `c` y
+`validate.py` tiene una guarda que revienta ante el mismatch. Si añades un
+consumidor de `embed_and_score_nodes`/`score_nodes`, constrúyele el cfg con
+`cfg_arquitectura(modelo, cfg, checkpoint)`.
+
 Sustituye al OOF. Una sola red describe **todo lo que no entrenó**:
 
 ```python
