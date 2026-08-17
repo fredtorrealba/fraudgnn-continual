@@ -118,10 +118,18 @@ STEPS = [
     Step("graph", "[2] Grafo HETEROGÉNEO (transacciones + entidades)",
          "src.data.build_graph",
          [("graph_dir", "graph.pt"), ("graph_dir", "graph_meta.json")],
+         # Los __grado_* que la GNN lleva como features del nodo, en parquet
+         # para que las TRES cabezas los reciban también (MEJORAS punto 2).
+         # Dinámico porque solo existe con graph.features_derivadas activo:
+         # declararlo fijo dejaría la etapa eternamente pendiente al apagarlo.
+         outputs_dyn=lambda cfg: (
+             [resolve(cfg, "processed_dir") / "grados_entidad.parquet"]
+             if cfg["graph"].get("features_derivadas", True) else []),
          desc="Nodos transacción + nodos ENTIDAD (uid, card, email, device, "
               "net), aristas bipartitas. El nodo de entidad aprende un "
               "vector propio que comparte con sus transacciones. Deja "
-              "graph_meta.json con la cobertura real de cada entidad. ~5 min."),
+              "graph_meta.json con la cobertura real de cada entidad y "
+              "grados_entidad.parquet para las cabezas. ~5 min."),
     # Este paso tiene reanudación propia por seed y por época: aunque se corte
     # a la mitad, al relanzarlo sigue desde la última época guardada.
     Step("gnn", "[3] GraphSAGE vs GATv2: Optuna + 3 seeds + selección",

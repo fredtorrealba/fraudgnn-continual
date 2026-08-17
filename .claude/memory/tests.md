@@ -11,17 +11,49 @@ reventar**, que es peor.
 Cada test guarda un fallo que **ya ocurrió** y que no producía ningún síntoma:
 ni excepción, ni warning, ni número raro. Solo un resultado plausible y falso.
 
-## Los siete
+## Los nueve
 
 | Test | Qué guarda | Necesita |
 |---|---|---|
 | `test_embedding_vecinos.py` | E0 · el embedding «solo vecinos» contiene vecinos | nada, 2 s |
+| `test_features_entrada.py` | las derivadas dicen lo que prometen: hora cíclica, delta sin centinela, flags de ausencia, frecuencia causal | nada, sintético |
+| `test_normalizacion.py` | la entrada de la GNN está normalizada Y es recomputable desde `x_crudo` + `graph_meta.json` | el grafo |
 | `test_grado_minimo_entidad.py` | E1 · la primera transacción de una entidad no recibe de ella | el grafo |
 | `test_poda_grado_maximo.py` | E2 · el grafo tiene las aristas que dicen los datos | grafo + parquet |
 | `test_salud_grafo.py` | ninguna entidad se cayó en silencio · **+ el informe** | el grafo |
 | `test_smote.py` | SMOTE solo sintetiza fraude y respeta el ratio | la etapa `embed` |
 | `test_causalidad_muestreo.py` | A2 · el muestreo solo mira hacia atrás | **`pyg-lib`** |
 | `test_seleccion_vecinos.py` | baja las N más recientes anteriores | parcial sin `pyg-lib` |
+
+### test_features_entrada — la familia "la columna existe pero no significa eso"
+
+Todo sintético, corre siempre. Fuerza bruta contra la implementación: la
+frecuencia causal se recomputa fila a fila con `tiempo < tiempo[i]`, el delta
+contra la compra anterior real, los flags contra el patrón de NaN. Guarda
+además LA propiedad que motivó la frecuencia causal: un valor que solo aparece
+tras la ventana de ajuste tiene que salir de 0 (la tabla estática lo dejaba en
+"nunca visto" para siempre) y la fracción de un valor estable no puede derivar
+con el tiempo (el conteo acumulado sí derivaba: crecía monótono, como
+`__pos_temporal`).
+
+### test_normalizacion — dos trampas que ya saltaron
+
+- **La std en `gnn_entrena` no es 1.0 en todas**: el clip ±10 recorta DESPUÉS
+  del ajuste, así que las columnas casi constantes con un puñado de extremos
+  encogen (mín 0.17 en el sintético). El test separa: columnas sin recorte →
+  media 0 / std 1 exactas; con recorte → la std solo puede ENCOGER. Una std > 1
+  sí es fallo: parámetros de otro bloque.
+- **Detecta el grafo de la versión vieja** por `metodo` y pide reconstruir. Un
+  grafo con tabla estática no es un bug del código de hoy, pero medir con él
+  sería medir otra cosa.
+
+### E2 y el umbral que era una constante
+
+La comprobación de `__grado_card` comparaba contra `log1p(500)` fijo: con el
+dataset real (grado máx 4.887) funcionaba, con el sintético del smoke (grado
+máx 18) daba falso positivo. Ahora exige `max == log1p(max_previas según el
+parquet)` — contra los datos, como el resto del test. Y lee `x_crudo`, no `x`:
+desde la normalización, `x` guarda z-scores.
 
 ## Tres estados, no dos
 

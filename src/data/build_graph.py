@@ -47,32 +47,13 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from src.utils.common import ensure_dirs, get_logger, load_config, resolve
+# Nació aquí como `_previas_por_entidad`; hoy vive en normalizacion.py porque
+# también lo usa la frecuencia causal (y build_graph importa normalizacion, así
+# que al revés sería circular). El alias conserva a los importadores de siempre
+# (final_comparison, tests).
+from src.data.normalizacion import previas_por_grupo as _previas_por_entidad
 
 log = get_logger("build_graph")
-
-
-def _previas_por_entidad(ent_idx: np.ndarray, tiempo: np.ndarray) -> np.ndarray:
-    """
-    Cuántas transacciones ANTERIORES tiene cada fila dentro de su entidad.
-
-    El conteo total (`bincount`) mira al futuro: una transacción de enero
-    llevaba el número de compras que su tarjeta acumularía hasta junio. Es una
-    fuga que no rompe nada y falsea el resultado, justo el tipo que hay que
-    cazar a mano.
-
-    Se ordena por (entidad, tiempo) y la posición dentro del grupo ES el número
-    de anteriores. Vectorizado: con 500.000 filas un bucle en Python tardaría
-    más que el resto de la etapa.
-    """
-    orden = np.lexsort((tiempo, ent_idx))       # primero por entidad, luego por tiempo
-    e = ent_idx[orden]
-    # inicio de cada grupo dentro del array ordenado
-    nuevo_grupo = np.r_[True, e[1:] != e[:-1]]
-    inicio = np.repeat(np.flatnonzero(nuevo_grupo), np.diff(
-        np.r_[np.flatnonzero(nuevo_grupo), len(e)]))
-    previas = np.empty(len(e), dtype=np.int64)
-    previas[orden] = np.arange(len(e)) - inicio
-    return previas
 
 
 def clave_entidad(df: pd.DataFrame, spec: dict) -> pd.Series:
@@ -360,6 +341,16 @@ def main():
         feature_cols = feature_cols + sorted(grados_extra)
         log.info("Grados de entidad añadidos como features: %s",
                  sorted(grados_extra))
+        # También a parquet, para las CABEZAS. `__grado_uid` es exactamente el
+        # `UID_FE` de los ganadores de Kaggle, y hasta ahora la GNN lo veía y
+        # XGBoost no: `control` competía sin una feature que el híbrido llevaba
+        # dentro del embedding. Dárselo a las TRES cabezas cierra esa asimetría
+        # (MEJORAS.md, punto 2). Alineado POR POSICIÓN con full.parquet, como
+        # todo lo demás: una fila por transacción, mismo orden.
+        pd.DataFrame({k: grados_extra[k] for k in sorted(grados_extra)}
+                     ).to_parquet(proc / "grados_entidad.parquet", index=False)
+        log.info("Grados escritos para las cabezas: %s",
+                 proc / "grados_entidad.parquet")
 
     # ── NORMALIZACIÓN, con TODAS las columnas ya presentes ──────────────────
     # Va aquí y no al cargar el grafo a propósito: si se hiciera al entrar a la
@@ -373,12 +364,16 @@ def main():
     #
     # Sin esto, `id_02` se llevaba el 99,55% de la varianza y la red no veía
     # nada más. Ver src/data/normalizacion.py para el diagnóstico completo.
+    # El TIEMPO entra porque la frecuencia de las categóricas es CAUSAL: cuenta
+    # las apariciones anteriores de cada valor, no una tabla estática que
+    # caduque entre el ajuste y el examen.
     from src.data.normalizacion import normalizar
     from src.utils.ventanas import mascara
     _crudo = data["transaction"].x.numpy()
     _entrena = mascara(cfg, "gnn_entrena", df["month"].values,
                        df["week_in_month"].values)
-    _norm, _par_norm = normalizar(_crudo, feature_cols, _entrena, log=log)
+    _norm, _par_norm = normalizar(_crudo, feature_cols, _entrena,
+                                  df["TransactionDT"].values, log=log)
     data["transaction"].x = torch.tensor(_norm, dtype=torch.float32)
     # El crudo se conserva para AUDITAR qué se transformó y para probar otra
     # normalización sin reconstruir el grafo. Un grafo normalizado sin su

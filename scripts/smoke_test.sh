@@ -18,13 +18,13 @@ cd "$(dirname "$0")/.."
 PROY="$PWD"
 SB="${SMOKE_DIR:-/tmp/smoke_fraudgnn}"
 
-echo "== [1/4] Sandbox en $SB =="
+echo "== [1/5] Sandbox en $SB =="
 rm -rf "$SB"; mkdir -p "$SB"
-cp -R src scripts config requirements.txt "$SB"/
+cp -R src scripts config tests requirements.txt "$SB"/
 mkdir -p "$SB"/data/{raw,processed,graph} "$SB"/{models,reports,artifacts,historial}
 cd "$SB"
 
-echo "== [2/4] Config reducido (CUDA y workers INTACTOS) =="
+echo "== [2/5] Config reducido (CUDA y workers INTACTOS) =="
 python3 - <<'PY'
 import yaml, pathlib
 p = pathlib.Path("config/config.yaml"); c = yaml.safe_load(p.read_text())
@@ -49,15 +49,24 @@ print(f"  INTACTOS -> device={c['xgboost']['device']} "
       f"batch={c['gnn']['batch_size']}")
 PY
 
-echo "== [3/4] Datos sintéticos =="
+echo "== [3/5] Datos sintéticos =="
 # 40.000 y no 12.000: con las ventanas, el bloque `examen` es 1/24 del total.
 # Con 12.000 se quedaba en ~17 fraudes y el PR-AUC era puro ruido; con 40.000
 # son ~57, suficiente para que todas las etapas ejerciten sus caminos.
 python3 scripts/make_synthetic_demo.py --n 40000
 
-echo "== [4/4] Pipeline completo =="
+echo "== [4/5] Pipeline completo =="
 t0=$(date +%s)
 bash scripts/run_pipeline.sh --skip download
+
+# Los INVARIANTES, sobre los artefactos sintéticos recién construidos. El
+# pipeline de arriba solo demuestra que nada revienta; estos cazan lo peor:
+# respuestas equivocadas SIN reventar (ver tests/run.sh). Corren aquí dentro
+# del sandbox, así que en el pod los dos tests que exigen `pyg-lib` corren
+# COMPLETOS antes de gastar horas en la corrida real. `set -e` corta el smoke
+# si alguno falla — es exactamente lo que se quiere.
+echo "== [5/5] Invariantes sobre los artefactos sintéticos =="
+bash tests/run.sh
 # Los resultados se COPIAN al proyecto, a una subcarpeta propia. La corrida
 # sigue siendo aislada —si escribiera en reports/ directamente, el pipeline
 # creería que las etapas están hechas y se las saltaría CON DATOS SINTÉTICOS—

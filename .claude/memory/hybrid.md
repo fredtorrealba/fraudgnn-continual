@@ -52,13 +52,15 @@ falte cualquier otra, no.
 ### `columnas(variante, ...)` — las tres cabezas
 
 ```
-control            cols_base                 65   ¿cuánto sin grafo?
-solo_gnn           emb_*                     16   ¿el grafo solo basta?
-gnn_mas_tabular    cols_base + embv_*        81   ¿el grafo SUMA?
+control            cols_base                 ¿cuánto sin grafo?
+solo_gnn           emb_*                     ¿el grafo solo basta?
+gnn_mas_tabular    cols_base + embv_*        ¿el grafo SUMA?
 ```
 
-El ancho depende de `mlp_head_dim` que gane Optuna: con 16 son 16 y 81; con 64,
-64 y 129. **No lo escribas como constante en ningún sitio.**
+El ancho depende de `mlp_head_dim` que gane Optuna Y de cuántas derivadas traiga
+el preprocess (flags `__na`, hora sin/cos, `__tiene_anterior`, `__grado_*`).
+**No lo escribas como constante en ningún sitio**: `cols_base` sale de
+`cargar_tabla` y el del booster de `booster.num_features()`.
 
 Cada cabeza recibe el embedding que le corresponde y no es intercambiable:
 `solo_gnn` no recibe nada más, así que sin las features propias no sabría nada de
@@ -91,6 +93,15 @@ assert len(np.unique(ni)) == len(ni)
 
 Y avisa si quedan filas sin embedding dentro de las ventanas que usan las
 cabezas.
+
+**Desde 2026-08-16 añade los `__grado_*`** de `grados_entidad.parquet` (lo
+escribe `build_graph`) a `cols_base`, para las TRES cabezas por igual.
+`__grado_uid` es el `UID_FE` de los ganadores de Kaggle y la GNN ya lo veía
+entre sus features: sin esto, `control` competía sin una columna que el híbrido
+llevaba dentro del embedding. Va DESPUÉS de la ablación a propósito (no sale de
+V/C/D) y también por posición, con su propio assert de longitud. Si el parquet
+no está, WARNING y sigue sin ellos — pero esa corrida es asimétrica y no vale
+para el veredicto.
 
 ### `umbral_por_presupuesto(scores, pct)`
 

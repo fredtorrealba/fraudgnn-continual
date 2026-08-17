@@ -43,6 +43,8 @@ correr() {
 
 correr "E0 · el embedding de vecinos contiene vecinos" \
        tests/test_embedding_vecinos.py
+correr "entrada · las features derivadas dicen lo que prometen" \
+       tests/test_features_entrada.py
 correr "normalización · ninguna columna domina la entrada" \
        tests/test_normalizacion.py "necesita el grafo construido"
 correr "E1 · la primera transacción de una entidad no recibe de ella" \

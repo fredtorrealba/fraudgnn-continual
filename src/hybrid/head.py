@@ -181,6 +181,28 @@ def cargar_tabla(cfg, oof_window: str | None) -> tuple[pd.DataFrame, list[str]]:
         log.info("ABLACIÓN: se excluyen los prefijos %s -> %d columnas "
                  "tabulares en vez de %d, para TODAS las cabezas",
                  prefijos, len(cols_base), antes)
+
+    # LOS __grado_* TAMBIÉN PARA LAS CABEZAS. `__grado_uid` es el `UID_FE` de
+    # los ganadores de Kaggle y la GNN ya lo ve entre sus 70 features: sin esto,
+    # `control` competía sin una columna que el híbrido llevaba dentro del
+    # embedding, y parte del "aporte del grafo" era solo ese conteo. Van a las
+    # TRES cabezas por igual (simétrico, no cambia lo que mide la resta) y
+    # DESPUÉS de la ablación a propósito: no salen de V/C/D, son estructura del
+    # grafo. Alineado POR POSICIÓN, como el embedding — el assert es la red.
+    ruta_g = proc / "grados_entidad.parquet"
+    if ruta_g.exists():
+        grados = pd.read_parquet(ruta_g)
+        assert len(grados) == len(df), (
+            f"grados_entidad.parquet tiene {len(grados)} filas y full.parquet "
+            f"{len(df)}: no corresponden. Reconstruye la etapa `graph`.")
+        df = pd.concat([df, grados], axis=1)
+        cols_base = cols_base + list(grados.columns)
+        log.info("Grados de entidad para las cabezas: +%d columnas %s",
+                 len(grados.columns), list(grados.columns))
+    else:
+        log.warning("Sin %s: las cabezas entrenan SIN los __grado_* que la GNN "
+                    "sí ve (asimetría del experimento). Reconstruye la etapa "
+                    "`graph` para generarlo.", ruta_g.name)
     return df, cols_base
 
 

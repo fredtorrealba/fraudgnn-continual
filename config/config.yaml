@@ -124,24 +124,41 @@ graph:
   # D (tiempos) que la ablación quita. Quién las calcula NO es lo mismo:
   #
   #   __hora_dia          preprocess   hora del día en [0,1]. TransactionDT se
-  #                                    excluye por ser identificador, así que sin
+  #   __hora_sin/cos                   excluye por ser identificador, así que sin
   #                                    esto nadie ve la hora. CÍCLICA: las 3 de
   #                                    la mañana son 0.125 en enero y en junio,
   #                                    así que se solapa al 99.9% entre splits.
+  #                                    sin/cos porque en la recta [0,1] las 23:59
+  #                                    y las 00:01 quedan en extremos opuestos:
+  #                                    a un árbol le da igual, a `W·x` no.
   #
   #   __delta_anterior    preprocess   log1p(segundos desde la compra ANTERIOR de
-  #                                    la misma card1); -1 si no hay anterior.
-  #                                    Es lo que daba D1. Causal (diff hacia
-  #                                    atrás) y comparable entre meses: "hace 2
-  #                                    horas" vale igual en enero que en junio.
-  #                                    OJO: al fabricarla se devuelve parte de lo
-  #                                    que quita la ablación — decláralo al
-  #                                    comparar corridas.
+  #   __tiene_anterior                 la misma card1). Es lo que daba D1. Causal
+  #                                    (diff hacia atrás) y comparable entre
+  #                                    meses: "hace 2 horas" vale igual en enero
+  #                                    que en junio. Sin anterior -> mediana de
+  #                                    train + flag __tiene_anterior=0; el
+  #                                    centinela -1 de antes era un punto más de
+  #                                    la recta para la red. OJO: al fabricarla
+  #                                    se devuelve parte de lo que quita la
+  #                                    ablación — decláralo al comparar corridas.
   #
-  #   __grado_<entidad>   build_graph  cuántas transacciones tiene su entidad,
-  #                                    antes de que el muestreo cape a 10. Es
-  #                                    estructura del grafo, por eso va aquí y
-  #                                    no en preprocess.
+  #   <col>__na           preprocess   flags de ausencia para numéricas con >20%
+  #                                    de NaN en train, UNO por patrón (las V
+  #                                    comparten ~15 patrones en bloque). La
+  #                                    mediana borra la señal de "faltaba"; el
+  #                                    flag la conserva. Hereda el prefijo a
+  #                                    propósito: la ablación [V,C,D] también se
+  #                                    lleva sus flags.
+  #
+  #   __grado_<entidad>   build_graph  cuántas transacciones ANTERIORES tiene su
+  #                                    entidad, antes de que el muestreo cape a
+  #                                    10. Es estructura del grafo, por eso va
+  #                                    aquí y no en preprocess. Desde 2026-08 va
+  #                                    TAMBIÉN a grados_entidad.parquet para las
+  #                                    tres cabezas: la GNN lo veía y XGBoost no,
+  #                                    y esa asimetría inflaba el "aporte del
+  #                                    grafo" (MEJORAS.md, punto 2).
   #
   # DESCARTADA — __pos_temporal (posición en los 6 meses): train ocupa
   # [0, 0.667] y validación [0.667, 0.834], 0% de solapamiento. Los árboles no

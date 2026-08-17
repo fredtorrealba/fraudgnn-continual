@@ -28,8 +28,8 @@ bash scripts/run_pipeline.sh --from gnn
 bash scripts/run_pipeline.sh --archive "hetero-v2"   # archiva y deja en cero
 bash scripts/run_pipeline.sh --history
 
-bash tests/run.sh                          # los 7 invariantes, segundos
-bash scripts/smoke_test.sh                 # las 7 etapas con datos sintéticos
+bash tests/run.sh                          # los 9 invariantes, segundos
+bash scripts/smoke_test.sh                 # las 7 etapas + los 9 invariantes, con datos sintéticos
 ```
 
 `--force` es un **modificador**: rehace lo que dejen `--only/--skip/--from`.
@@ -69,10 +69,15 @@ código de `continual_learning/` se conserva intacto.
 ### Las tres cabezas
 
 ```
-control            65 col tabulares            ¿cuánto se logra sin grafo?
-solo_gnn           el embedding y nada más     ¿el grafo solo basta?
-gnn_mas_tabular    65 + el embedding           ¿el grafo SUMA?
+control            las col tabulares (+ __grado_*)   ¿cuánto se logra sin grafo?
+solo_gnn           el embedding y nada más           ¿el grafo solo basta?
+gnn_mas_tabular    tabulares + el embedding          ¿el grafo SUMA?
 ```
+
+Desde 2026-08-16 los `__grado_*` van a las TRES cabezas (antes solo la GNN los
+veía y esa asimetría inflaba el aporte del grafo), y `preprocess` añade hora
+sin/cos, `__tiene_anterior` y flags de ausencia `<col>__na`. El ancho lo fija
+el dato, nunca una constante.
 
 **La pregunta del capstone la responde `control` vs `gnn_mas_tabular`.** Las
 tres reciben la misma ablación, la misma ventana y los mismos hiperparámetros.
@@ -168,6 +173,13 @@ ventana que la GNN reentrene se la quitas a la cabeza—, así que **se document
 como cota inferior** y el refit va en la corrida de 6 meses. No es un fallo
 pendiente: es el límite del piloto, y está medido.
 
+## Hacia dónde va
+
+[`MEJORAS.md`](MEJORAS.md) — qué hicieron los ganadores de la competencia Kaggle
+sobre este mismo dataset y qué de eso aplica aquí, con un checklist ordenado por
+esfuerzo. El titular: su clave `uid` es **idéntica** a la nuestra, pero ellos
+tenían grupos de ~6 transacciones y aquí son de 2,1.
+
 ## Memorias por módulo
 
 Leer la memoria del módulo **antes** de modificar cualquier archivo suyo: cada
@@ -180,7 +192,7 @@ una lleva el mapa de acoplamiento y los fallos ya cometidos.
 | [`hybrid.md`](.claude/memory/hybrid.md) | `hybrid/embed.py`, `hybrid/head.py`, `hybrid/train_head.py`, `hybrid/features.py`, `hybrid/system.py`, `hybrid/oof.py`, `hybrid/head_cl.py` |
 | [`comparison.md`](.claude/memory/comparison.md) | `comparison/final_comparison.py`, `comparison/resumen.py` · **y los resultados** |
 | [`pipeline.md`](.claude/memory/pipeline.md) | `pipeline.py`, `scripts/*` |
-| [`tests.md`](.claude/memory/tests.md) | `tests/*` — los siete invariantes y qué fallo guarda cada uno |
+| [`tests.md`](.claude/memory/tests.md) | `tests/*` — los nueve invariantes y qué fallo guarda cada uno |
 | [`utils.md`](.claude/memory/utils.md) | `utils/common.py`, `utils/metrics.py`, `utils/omp.py`, `utils/ventanas.py` |
 | [`baseline_xgboost.md`](.claude/memory/baseline_xgboost.md) | `baseline_xgboost/smote_pipeline.py`, `baseline_xgboost/train_xgboost.py` |
 | [`continual_learning.md`](.claude/memory/continual_learning.md) | `continual_learning/*` — desactivado, se conserva |

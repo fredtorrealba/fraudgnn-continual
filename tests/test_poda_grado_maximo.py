@@ -49,6 +49,7 @@ def main() -> int:
     data = torch.load(g, weights_only=False)
     df = pd.read_parquet(p)
     fallos = []
+    max_previas: dict[str, int] = {}
     print(f"  config: max_entity_degree = {tope}"
           f"{'   (SIN poda)' if tope <= 0 else ''}")
 
@@ -66,6 +67,7 @@ def main() -> int:
         filas = np.where(presentes.values)[0]
         previas = _previas_por_entidad(cod, df["TransactionDT"].values[filas])
         esperadas = int((previas <= tope).sum()) if tope > 0 else int(len(previas))
+        max_previas[nombre] = int(previas.max()) if len(previas) else 0
 
         reales = int(data[(TXN, f"en_{nombre}", nombre)].edge_index.shape[1])
         ok = reales == esperadas
@@ -92,24 +94,29 @@ def main() -> int:
         print(f"  [{'OK ' if ok else 'MAL'}] {nombre:<7} subida {reales:>7} "
               f"(datos: {esperadas}){extra}")
 
-    # La feature de grado no puede quedar topada por la poda.
+    # La feature de grado no puede quedar topada por la poda: su máximo tiene
+    # que ser EXACTAMENTE log1p(máximo de previas según los datos). Contra el
+    # parquet, no contra una constante — el umbral fijo log1p(500) solo tenía
+    # sentido con el dataset real (grado máx 4.887) y daba falso positivo con
+    # cualquier dataset pequeño, como el sintético del smoke (grado máx 18).
     import json
     cols = json.load(open(resolve(cfg, "graph_dir") / "graph_meta.json"))["feature_cols_gnn"]
-    if tope <= 0 and "__grado_card" in cols:
+    if tope <= 0 and "__grado_card" in cols and "card" in max_previas:
         # Sobre `x_crudo`, NO sobre `x`: desde la normalización, `x` guarda
-        # z-scores y compararlos contra log1p(500) no significa nada. Este
+        # z-scores y compararlos contra un log1p no significa nada. Este
         # test lo detectó en cuanto se normalizó — y es exactamente para lo
         # que se conserva el crudo.
         fuente = ("x_crudo" if "x_crudo" in data[TXN] else "x")
         v = data[TXN][fuente][:, cols.index("__grado_card")].numpy()
-        techo = float(np.log1p(500))
-        if v.max() <= techo + 1e-6:
+        esperado = float(np.log1p(max_previas["card"]))
+        if abs(float(v.max()) - esperado) > 1e-5:
             fallos.append(
-                f"__grado_card llega como mucho a {v.max():.3f} = log1p(500). "
-                f"Sigue topada por la poda vieja.")
+                f"__grado_card llega como mucho a {v.max():.3f} y los datos "
+                f"dicen log1p({max_previas['card']}) = {esperado:.3f}. "
+                f"O sigue topada por la poda vieja o se calculó con otro corte.")
         else:
             print(f"  [OK ] __grado_card máx {v.max():.2f} en {fuente} "
-                  f"(el techo de la poda era {techo:.2f})")
+                  f"= log1p({max_previas['card']}) según los datos")
 
     if fallos:
         print("\n  FALLA EL INVARIANTE E2:")

@@ -11,8 +11,9 @@ se decide aquí condiciona todo lo demás, y algunos contratos son **implícitos
 | `processed/full.parquet` | `preprocessing.py` | `build_graph`, `hybrid/head`, `comparison`, `tests/` |
 | `processed/feature_cols.json` | `preprocessing.py` | `build_graph`, `hybrid/head` |
 | `processed/split_masks.parquet` | `preprocessing.py` | `utils/ventanas`, `hybrid/*` |
+| `processed/grados_entidad.parquet` | `build_graph.py` | `hybrid/head.cargar_tabla` — los `__grado_*` para las TRES cabezas |
 | `graph/graph.pt` | `build_graph.py` | `gnn/*`, `hybrid/embed`, `comparison`, `tests/` |
-| `graph/graph_meta.json` | `build_graph.py` | `hybrid/head`, `tests/`, diagnóstico |
+| `graph/graph_meta.json` | `build_graph.py` | `hybrid/head`, `tests/`, diagnóstico · lleva `normalizacion` con los parámetros por columna |
 
 ## EL contrato implícito
 
@@ -38,19 +39,31 @@ Lo protegen asserts en `hybrid/head.py:cargar_tabla()`. **No los quites.**
   se ajustaban con «meses 1-4» y el examen caía dentro: fuga silenciosa.
 - Lo no visto va a `-1` (**SMOTE rechaza NaN**, por eso el centinela).
 
-### Dos features derivadas que hay que conocer
+### Las features derivadas que hay que conocer
 
 La ablación quita las familias C (conteos) y D (deltas), así que se fabrican
 sustitutos **causales**:
 
 ```
 __hora_dia         hora del día en [0,1]. TransactionDT se excluye por ser
-                   identificador, así que sin esto nadie ve la hora. CÍCLICA:
+__hora_sin/cos     identificador, así que sin esto nadie ve la hora. CÍCLICA:
                    las 3 de la mañana valen igual en enero que en junio, así
-                   que se solapa entre bloques.
-__delta_anterior   log1p(segundos desde la compra ANTERIOR de la misma card1),
-                   -1 si no hay anterior. Es lo que daba D1. Causal (diff hacia
-                   atrás) y comparable entre meses.
+                   que se solapa entre bloques. sin/cos porque en [0,1] las
+                   23:59 y las 00:01 caen en extremos opuestos: a un árbol le
+                   da igual, a `W·x` no. La lineal se conserva.
+__delta_anterior   log1p(segundos desde la compra ANTERIOR de la misma card1).
+__tiene_anterior   Es lo que daba D1. Causal (diff hacia atrás) y comparable
+                   entre meses. Sin anterior: mediana de train + flag en 0. El
+                   centinela -1 de antes era, tras normalizar, un punto más de
+                   la recta pegado a "hace muy poco": la red no podía separar
+                   los dos significados.
+<col>__na          flags de ausencia para numéricas con >20% de NaN en train
+                   (UMBRAL_FLAG_NA), UNO por patrón — las V comparten ~15
+                   patrones en bloque y 300 flags idénticos solo diluyen
+                   splits. La mediana borra la señal de "faltaba"; el flag la
+                   conserva. El nombre hereda el prefijo (`V12__na`) para que
+                   la ablación [V,C,D] se lleve también sus flags. Las
+                   categóricas no lo necesitan: "__NA__" ya es una categoría.
 ```
 
 **Al fabricarlas se devuelve parte de lo que quita la ablación.** Hay que
@@ -58,6 +71,38 @@ declararlo al comparar corridas.
 
 `_delta_tarjeta` usa `argsort(stable=True)`: el 3,4% de las transacciones
 comparte `TransactionDT` y sin estabilidad el desempate cambia entre corridas.
+
+## normalizacion.py — lo que entra a la RED, no a los árboles
+
+Hasta el 16/08 las features iban crudas al grafo e `id_02` se llevaba el 99,55%
+de la varianza; XGBoost ni se enteraba (usa el orden) pero `W·x` solo veía esa
+columna. Síntomas que costaron semanas: `running_var` 579.055, `best_epoch: 2`,
+`gnn_sola` bajo el azar. **Solo toca la copia del grafo**: `full.parquet` y las
+cabezas no se mueven un decimal.
+
+- **Cantidades** → log con signo (16 columnas tienen negativos; `log1p` a secas
+  daría NaN) + z-score ajustado con `gnn_entrena` + **clip ±10** (`CLIP`). Sin
+  clip el peor valor quedaba a 44 desviaciones.
+- **Categóricas** (`CATEGORICAS`) → **frecuencia causal RELATIVA**: fracción de
+  las transacciones anteriores con ese mismo valor. El entero de preprocessing
+  es un orden alfabético que no existe (gmail=17, hotmail=20). Dos decisiones
+  con historia:
+  - **Causal, no tabla estática**: la tabla contada en `gnn_entrena` caducaba —
+    un valor que explota tras el día 15 llegaba al examen con frecuencia 0,
+    igual que uno nunca visto. Mismo principio que los `__grado_*`.
+  - **Relativa, no conteo**: el acumulado crece monótono con el tiempo y en el
+    examen queda fuera del rango ajustado — la misma no-estacionariedad que
+    mató a `__pos_temporal`. La fracción es estacionaria.
+- Se aplica **en `build_graph`, al final, con los `__grado_*` ya añadidos**
+  (normalizar antes los dejaba sin tipificar; lo cazó el test). Hacerlo al
+  cargar el grafo obligaría a acordarse en cada punto de entrada.
+- `x_crudo` se conserva en el grafo y los parámetros van a `graph_meta.json`:
+  `tests/test_normalizacion.py` **recomputa la transformación entera** desde
+  ahí y la compara. También detecta un grafo construido con la versión vieja.
+- `previas_por_grupo` **vive aquí** (nació en `build_graph` como
+  `_previas_por_entidad`, que sigue existiendo como alias): lo comparten los
+  `__grado_*`, la frecuencia causal y el reparto conocidos/nuevos del informe.
+  Al revés sería un import circular.
 
 ## build_graph.py — el grafo HETEROGÉNEO
 
@@ -156,6 +201,13 @@ features por nodo: 70   (65 tras la ablación + __hora_dia, __delta_anterior
                          y los 5 __grado_*)
 transacciones sin recibir de ninguna entidad: 6.884 (3,1%)
 ```
+
+**OJO: cifras de ANTES de los cambios de 2026-08-16** (hora sin/cos,
+`__tiene_anterior` y flags `__na`): el ancho real sube y lo fija el grafo en
+cada corrida (`in_dim` se lee del grafo, nunca del config). Los `__grado_*`
+van ahora TAMBIÉN a `grados_entidad.parquet` para las tres cabezas
+(MEJORAS punto 2): la GNN los veía y XGBoost no, y esa asimetría inflaba el
+«aporte del grafo».
 
 **`uid` sigue siendo la entidad débil**: 2,1 transacciones por entidad de media.
 La clave es tan específica que casi no conecta. Es candidata a revisión.

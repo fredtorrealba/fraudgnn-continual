@@ -47,6 +47,9 @@ Los dos dinámicos existen por el caché de Optuna:
   que no se pueden escribir como constantes. Antes no figuraban como salidas:
   `--status` no las veía y `--force` no las borraba, de modo que una corrida
   «forzada» reutilizaba en silencio hiperparámetros de otra búsqueda.
+  La etapa `graph` también lo usa: `processed/grados_entidad.parquet` solo
+  existe con `graph.features_derivadas` activo — declararlo fijo dejaría la
+  etapa eternamente pendiente al apagarlo.
 - **`limpiar_dyn`** → `reports/optuna_{arq}.db`. No marcan el paso como hecho —un
   estudio a medias también los crea— pero `--force` tiene que llevárselos: si
   no, `load_if_exists=True` retoma la búsqueda anterior sin decirlo.
@@ -97,6 +100,13 @@ pipeline creería que las etapas están hechas con datos sintéticos.
 Reduce `epochs 2 · seeds [42] · optuna_trials 2`, y **también
 `optuna_presupuesto_min: 0`** — ese presupuesto MANDA sobre `optuna_trials`, así
 que sin anularlo el smoke se pondría a buscar una hora por arquitectura.
+
+**Desde 2026-08-16 corre también `tests/run.sh` como paso [5/5]**, dentro del
+sandbox y sobre los artefactos sintéticos recién construidos. El pipeline solo
+demuestra que nada revienta; los invariantes cazan respuestas equivocadas sin
+reventar. En el pod eso incluye COMPLETOS los dos tests que en macOS se saltan
+por `pyg-lib` (causalidad y recencia del muestreo), antes de gastar horas en la
+corrida real. `set -e` corta el smoke si algún invariante falla.
 
 Ha detectado bugs reales que habrían costado horas de GPU. El último: el caché
 SQLite compartido entre los dos procesos de Optuna.

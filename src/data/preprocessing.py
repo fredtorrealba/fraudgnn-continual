@@ -29,6 +29,12 @@ from src.utils.common import ensure_dirs, get_logger, load_config, resolve
 
 log = get_logger("preprocessing")
 
+# Umbral para fabricar un flag de ausencia `<col>__na`. Por debajo, el flag es
+# casi constante y no aporta; por encima, la imputación por mediana está
+# borrando una señal real (la tabla identity falta en ~76% de las filas y ESO
+# es información: el patrón de NaN de las V agrupa las columnas por origen).
+UMBRAL_FLAG_NA = 0.20
+
 # Columnas que se usan para construir ARISTAS del grafo: se conservan crudas
 # (además de su versión codificada) porque el builder del grafo las necesita.
 def edge_raw_cols(cfg: dict) -> list[str]:
@@ -68,9 +74,12 @@ def _delta_tarjeta(df: pd.DataFrame) -> pd.Series:
     Segundos desde la transacción anterior de la MISMA card1, en log1p.
 
     CAUSAL: `diff()` sobre el orden temporal mira solo hacia atrás, nunca al
-    futuro. La primera compra de cada tarjeta no tiene anterior y se marca con
-    -1, un valor fuera del rango de log1p (que empieza en 0) para que el modelo
-    pueda distinguir "hace mucho" de "no hay anterior".
+    futuro. La primera compra de cada tarjeta no tiene anterior y queda en NaN:
+    el flag `__tiene_anterior` guarda esa información y la imputación general
+    la rellena con la mediana de train. Antes se marcaba con -1, pero para la
+    GNN ese centinela es un punto más de la recta —tras normalizar queda pegado
+    a "hace muy poco"— y mezclaba dos significados en una columna. Un árbol lo
+    rodeaba partiendo en -0.5; la red no puede.
 
     NO REORDENA el DataFrame. El índice de fila de full.parquet es el índice de
     nodo del grafo (contrato implícito que protegen los asserts de hybrid/), así
@@ -81,7 +90,7 @@ def _delta_tarjeta(df: pd.DataFrame) -> pd.Series:
     tmp = df.iloc[orden]
     delta = tmp.groupby("card1")["TransactionDT"].diff()
     delta = delta.reindex(df.index)
-    return np.log1p(delta).fillna(-1.0)
+    return np.log1p(delta)
 
 
 def add_temporal_columns(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
@@ -89,6 +98,8 @@ def add_temporal_columns(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     # assign() en vez de dos asignaciones sueltas: insertar columnas una a una
     # en un DataFrame de 400+ columnas lo fragmenta y dispara PerformanceWarning.
     dt = df["TransactionDT"].astype("float64")
+    hora = (dt % 86400) / 86400.0
+    delta = _delta_tarjeta(df)
     return df.assign(
         # El reloj. Va AQUÍ y no en build_graph porque no tiene nada de grafo, y
         # porque calculado allí no llegaba al parquet: la GNN sabía la hora y las
@@ -101,12 +112,25 @@ def add_temporal_columns(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
         # da un valor único por fila y permite memorizar. Medido: los meses
         # in-sample subieron de 0.53 a 0.86 de PR-AUC y el mes 5 no se movió.
         # La hora del día sí generaliza: se solapa al 99.9% entre splits.
-        __hora_dia=(dt % 86400) / 86400.0,
+        __hora_dia=hora,
+        # La MISMA hora en seno/coseno, porque [0,1] rompe el ciclo justo en la
+        # medianoche: 23:59 y 00:01 quedan en los extremos opuestos de la recta.
+        # A un árbol le basta con partir dos veces; para `W·x` de la GNN esa
+        # discontinuidad es artificial y cae de madrugada, donde vive el fraude.
+        # La lineal se conserva: a los árboles les da cortes más simples.
+        __hora_sin=np.sin(2 * np.pi * hora),
+        __hora_cos=np.cos(2 * np.pi * hora),
         # Segundos desde la compra ANTERIOR de la misma tarjeta, en log.
         # Es lo que daba D1 y que la ablación quitó, y a diferencia de la
         # posición absoluta SÍ generaliza: "hace 2 horas" significa lo mismo en
         # enero que en junio, así que el valor cae dentro del rango aprendido.
-        __delta_anterior=_delta_tarjeta(df),
+        # NaN si no hay anterior; lo rellena la imputación general con la
+        # mediana de train, y el flag de abajo conserva la distinción.
+        __delta_anterior=delta,
+        # "¿Existe una compra anterior de esta tarjeta?" — separado del delta
+        # para que ni la red ni SMOTE confundan "no hay anterior" con un valor
+        # real (ver _delta_tarjeta).
+        __tiene_anterior=delta.notna().astype(np.float32),
         month=(df["TransactionDT"] // spm).astype(int) + 1,
         # Semana relativa dentro del mes (simula el "futuro que llega" en test)
         week_in_month=(((df["TransactionDT"] % spm) // (spm // 4)) + 1)
@@ -146,7 +170,45 @@ def encode_and_impute(df: pd.DataFrame, train_mask: pd.Series, cfg: dict):
         mapping = {v: i for i, v in enumerate(sorted(cats))}
         df[c] = df[c].astype(str).fillna("__NA__").map(mapping).fillna(-1).astype(np.int32)
 
-    # Numéricas: mediana de train; flag adicional de NA para columnas muy vacías
+    # FLAGS DE AUSENCIA, antes de imputar — la imputación por mediana coloca el
+    # faltante en el centro de la distribución, que es donde más se confunde
+    # con un valor real. Un árbol puede rodearlo; la red no distingue "no había
+    # dato" de "el dato era la mediana". Las categóricas no lo necesitan: su
+    # "__NA__" ya es una categoría propia.
+    #
+    # DEDUPLICADOS por patrón: las V comparten ~15 patrones de NaN en bloque
+    # (vienen de las mismas tablas de origen — el 1er lugar de Kaggle las
+    # agrupó exactamente así), y 300 flags idénticos no aportan nada y diluyen
+    # los splits. Se emite UN flag por patrón, con el nombre de su primera
+    # columna: `V12__na` representa a todo su bloque. El nombre hereda el
+    # prefijo a propósito: así la ablación ["V","C","D"] se lleva también sus
+    # flags y no devuelve por la ventana lo que quita la puerta.
+    #
+    # La TASA se mide en train (elegir columnas mirando el examen sería fuga);
+    # el VALOR del flag es un hecho por fila y no se ajusta con nada.
+    tr = train_mask.values
+    vistos: dict[bytes, str] = {}
+    flags: dict[str, np.ndarray] = {}
+    for c in num_cols:
+        if c.startswith("__"):          # derivadas propias: su ausencia ya
+            continue                    # tiene flag dedicado (__tiene_anterior)
+        na = df[c].isna().values
+        if na[tr].mean() <= UMBRAL_FLAG_NA:
+            continue
+        patron = np.packbits(na).tobytes()
+        if patron in vistos:
+            continue
+        vistos[patron] = c
+        flags[f"{c}__na"] = na.astype(np.float32)
+    if flags:
+        df = pd.concat([df, pd.DataFrame(flags, index=df.index)], axis=1)
+        feature_cols = feature_cols + list(flags)
+        log.info("Flags de ausencia: %d patrones distintos entre las columnas "
+                 "con más de %.0f%% de NaN en train -> %s%s",
+                 len(flags), 100 * UMBRAL_FLAG_NA, sorted(flags)[:6],
+                 " ..." if len(flags) > 6 else "")
+
+    # Numéricas: mediana de train (el patrón de ausencia ya quedó en los flags)
     for c in num_cols:
         med = df.loc[train_mask, c].median()
         df[c] = df[c].fillna(0.0 if np.isnan(med) else med)
