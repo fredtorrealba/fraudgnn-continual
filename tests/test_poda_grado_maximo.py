@@ -96,14 +96,19 @@ def main() -> int:
     import json
     cols = json.load(open(resolve(cfg, "graph_dir") / "graph_meta.json"))["feature_cols_gnn"]
     if tope <= 0 and "__grado_card" in cols:
-        v = data[TXN].x[:, cols.index("__grado_card")].numpy()
+        # Sobre `x_crudo`, NO sobre `x`: desde la normalización, `x` guarda
+        # z-scores y compararlos contra log1p(500) no significa nada. Este
+        # test lo detectó en cuanto se normalizó — y es exactamente para lo
+        # que se conserva el crudo.
+        fuente = ("x_crudo" if "x_crudo" in data[TXN] else "x")
+        v = data[TXN][fuente][:, cols.index("__grado_card")].numpy()
         techo = float(np.log1p(500))
         if v.max() <= techo + 1e-6:
             fallos.append(
                 f"__grado_card llega como mucho a {v.max():.3f} = log1p(500). "
                 f"Sigue topada por la poda vieja.")
         else:
-            print(f"  [OK ] __grado_card máx {v.max():.2f} "
+            print(f"  [OK ] __grado_card máx {v.max():.2f} en {fuente} "
                   f"(el techo de la poda era {techo:.2f})")
 
     if fallos:

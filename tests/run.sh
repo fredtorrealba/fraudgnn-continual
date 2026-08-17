@@ -43,6 +43,8 @@ correr() {
 
 correr "E0 · el embedding de vecinos contiene vecinos" \
        tests/test_embedding_vecinos.py
+correr "normalización · ninguna columna domina la entrada" \
+       tests/test_normalizacion.py "necesita el grafo construido"
 correr "E1 · la primera transacción de una entidad no recibe de ella" \
        tests/test_grado_minimo_entidad.py "necesita el grafo construido"
 correr "E2 · el grafo tiene las aristas que dicen los datos" \

@@ -146,7 +146,11 @@ def main():
     data = HeteroData()
 
     # --- nodos transacción: los ÚNICOS con features propias ------------------
-    data["transaction"].x = torch.tensor(df[feature_cols].values, dtype=torch.float32)
+    # Se guardan CRUDAS de momento: la normalización va al final, cuando ya
+    # estén también las `__grado_*` que se calculan más abajo. Normalizar aquí
+    # dejaría esas cinco columnas sin tipificar — lo cazó el test la primera vez.
+    data["transaction"].x = torch.tensor(df[feature_cols].values,
+                                         dtype=torch.float32)
     data["transaction"].y = torch.tensor(df["isFraud"].values, dtype=torch.float32)
     # time_attr del muestreo temporal: debe ser int64 y estar en el nodo
     data["transaction"].time = torch.tensor(df["TransactionDT"].values, dtype=torch.long)
@@ -357,8 +361,35 @@ def main():
         log.info("Grados de entidad añadidos como features: %s",
                  sorted(grados_extra))
 
+    # ── NORMALIZACIÓN, con TODAS las columnas ya presentes ──────────────────
+    # Va aquí y no al cargar el grafo a propósito: si se hiciera al entrar a la
+    # red habría que acordarse en cada punto de entrada (`train_gnn`, `embed`, y
+    # el CL cuando vuelva), y uno que se olvide entrenaría con datos crudos sin
+    # que nadie se entere. Es el mismo patrón que ya falló con `sin_aristas`.
+    #
+    # Y va DESPUÉS de añadir los `__grado_*`: normalizarlo antes dejaba esas
+    # cinco columnas sin tipificar, y `__grado_card` se quedaba con el 6,5% de
+    # la varianza. Lo cazó `tests/test_normalizacion.py` en su primera pasada.
+    #
+    # Sin esto, `id_02` se llevaba el 99,55% de la varianza y la red no veía
+    # nada más. Ver src/data/normalizacion.py para el diagnóstico completo.
+    from src.data.normalizacion import normalizar
+    from src.utils.ventanas import mascara
+    _crudo = data["transaction"].x.numpy()
+    _entrena = mascara(cfg, "gnn_entrena", df["month"].values,
+                       df["week_in_month"].values)
+    _norm, _par_norm = normalizar(_crudo, feature_cols, _entrena, log=log)
+    data["transaction"].x = torch.tensor(_norm, dtype=torch.float32)
+    # El crudo se conserva para AUDITAR qué se transformó y para probar otra
+    # normalización sin reconstruir el grafo. Un grafo normalizado sin su
+    # original es una caja negra.
+    data["transaction"].x_crudo = torch.tensor(_crudo, dtype=torch.float32)
+
     meta["feature_cols_gnn"] = feature_cols
     meta["n_features_gnn"] = len(feature_cols)
+    # Los parámetros de normalización viajan con el grafo: sin ellos no se
+    # puede saber qué se le hizo a cada columna ni deshacerlo.
+    meta["normalizacion"] = _par_norm
 
     # --- las aristas deben ir ORDENADAS por tiempo del origen ---------------
     # `temporal_strategy="last"` (gnn/sampling.py) exige que, para cada nodo
