@@ -526,6 +526,16 @@ def aplicar_hiperparametros(cfg, best: dict) -> dict:
         # enqueue_trial incompleto) se construiría una GNN de una capa, que en
         # el grafo heterogéneo no llega a propagar nada y muere en build_model.
         g["hidden_dims"] = [best["ancho"]] * max(2, int(best.get("capas", 2)))
+    # EXPERIMENTO ancho-del-embedding (ver config). Se aplica AQUÍ y no en
+    # cfg_arquitectura a propósito: esto decide cómo se ENTRENA una red nueva;
+    # cfg_arquitectura reconstruye una YA entrenada y debe respetar su
+    # checkpoint, o load_state_dict reventaría por dimensiones.
+    forzar = int(g.get("forzar_mlp_head_dim", 0) or 0)
+    if forzar:
+        log.warning("EXPERIMENTO: mlp_head_dim FORZADO a %d (Optuna eligió %s). "
+                    "Devuelve gnn.forzar_mlp_head_dim a 0 al terminar.",
+                    forzar, best.get("mlp_head_dim"))
+        g["mlp_head_dim"] = forzar
     return cfg
 
 

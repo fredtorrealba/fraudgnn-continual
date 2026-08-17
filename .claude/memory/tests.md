@@ -11,7 +11,7 @@ reventar**, que es peor.
 Cada test guarda un fallo que **ya ocurrió** y que no producía ningún síntoma:
 ni excepción, ni warning, ni número raro. Solo un resultado plausible y falso.
 
-## Los nueve
+## Los diez
 
 | Test | Qué guarda | Necesita |
 |---|---|---|
@@ -22,6 +22,7 @@ ni excepción, ni warning, ni número raro. Solo un resultado plausible y falso.
 | `test_poda_grado_maximo.py` | E2 · el grafo tiene las aristas que dicen los datos | grafo + parquet |
 | `test_salud_grafo.py` | ninguna entidad se cayó en silencio · **+ el informe** | el grafo |
 | `test_smote.py` | SMOTE solo sintetiza fraude y respeta el ratio | la etapa `embed` |
+| `test_consistencia_embedding.py` | ninguna columna del embedding se invierte en el tiempo (MEJORAS punto 6) — falla solo con inversión FUERTE | la etapa `embed` |
 | `test_causalidad_muestreo.py` | A2 · el muestreo solo mira hacia atrás | **`pyg-lib`** |
 | `test_seleccion_vecinos.py` | baja las N más recientes anteriores | parcial sin `pyg-lib` |
 

@@ -412,9 +412,18 @@ el problema y hay que replantear la entidad.
 
 ---
 
-## [ ] 6 · Consistencia temporal de las columnas del embedding
+## [x] 6 · Consistencia temporal de las columnas del embedding — HECHO 2026-08-17
 
 **Esfuerzo:** bajo. Es un test, no un cambio.
+
+> **Resultado (embedding 64d de graphsage 256×3):** la hipótesis NO se cumple.
+> `embv_` mediana 0.6515→0.6169, `emb_` 0.7349→0.6884; solo 1 y 2 inversiones
+> DÉBILES respectivamente, cero fuertes. La degradación es pareja en las 64
+> columnas — no hay dimensiones que arrastren al resto y la poda no aplica. El
+> aporte negativo (−0.0207) queda explicado por redundancia con lo tabular +
+> drift uniforme, no por columnas invertidas. Queda como invariante permanente:
+> `tests/test_consistencia_embedding.py` falla si un embedding futuro trae
+> inversiones fuertes (>0.55 entrenan, <0.5 validan).
 
 Un truco de selección de features del 1º lugar, aplicable tal cual a nuestro
 embedding:

@@ -28,8 +28,8 @@ bash scripts/run_pipeline.sh --from gnn
 bash scripts/run_pipeline.sh --archive "hetero-v2"   # archiva y deja en cero
 bash scripts/run_pipeline.sh --history
 
-bash tests/run.sh                          # los 9 invariantes, segundos
-bash scripts/smoke_test.sh                 # las 7 etapas + los 9 invariantes, con datos sintéticos
+bash tests/run.sh                          # los 10 invariantes, segundos
+bash scripts/smoke_test.sh                 # las 7 etapas + los 10 invariantes, con datos sintéticos
 ```
 
 `--force` es un **modificador**: rehace lo que dejen `--only/--skip/--from`.
@@ -189,10 +189,10 @@ una lleva el mapa de acoplamiento y los fallos ya cometidos.
 |---|---|
 | [`data.md`](.claude/memory/data.md) | `data/download_ieee_cis.py`, `data/preprocessing.py`, `data/build_graph.py` |
 | [`gnn.md`](.claude/memory/gnn.md) | `gnn/models.py`, `gnn/sampling.py`, `gnn/train_gnn.py`, `gnn/compare_gnns.py`, `gnn/refit.py` |
-| [`hybrid.md`](.claude/memory/hybrid.md) | `hybrid/embed.py`, `hybrid/head.py`, `hybrid/train_head.py`, `hybrid/features.py`, `hybrid/system.py`, `hybrid/oof.py`, `hybrid/head_cl.py` |
+| [`hybrid.md`](.claude/memory/hybrid.md) | `hybrid/embed.py`, `hybrid/head.py`, `hybrid/train_head.py`, `hybrid/system.py`, `hybrid/head_cl.py` |
 | [`comparison.md`](.claude/memory/comparison.md) | `comparison/final_comparison.py`, `comparison/resumen.py` · **y los resultados** |
 | [`pipeline.md`](.claude/memory/pipeline.md) | `pipeline.py`, `scripts/*` |
-| [`tests.md`](.claude/memory/tests.md) | `tests/*` — los nueve invariantes y qué fallo guarda cada uno |
+| [`tests.md`](.claude/memory/tests.md) | `tests/*` — los diez invariantes y qué fallo guarda cada uno |
 | [`utils.md`](.claude/memory/utils.md) | `utils/common.py`, `utils/metrics.py`, `utils/omp.py`, `utils/ventanas.py` |
 | [`baseline_xgboost.md`](.claude/memory/baseline_xgboost.md) | `baseline_xgboost/smote_pipeline.py`, `baseline_xgboost/train_xgboost.py` |
 | [`continual_learning.md`](.claude/memory/continual_learning.md) | `continual_learning/*` — desactivado, se conserva |

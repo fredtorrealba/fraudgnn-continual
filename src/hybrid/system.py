@@ -1,11 +1,16 @@
 """
-El sistema híbrido en operación: GNN + columnas del grafo + cabeza XGBoost.
+El sistema híbrido en operación: GNN + cabeza XGBoost. DORMIDO con el CL.
 
-    transacción ──┬─► 431 features propias        (ya están en data.x)
-                  ├─► 8 columnas estructurales    (graph_features.parquet)
-                  └─► gnn_score                   (la red puntúa)
+    transacción ──┬─► features propias            (ya están en data.x)
+                  └─► gnn_score / embedding       (la red puntúa)
                               ↓
                         cabeza XGBoost  ──►  P(fraude)
+
+OJO al reactivar: se escribió para el esquema de 4 variantes numeradas y las
+8 columnas estructurales, que SE RETIRARON (2026-08-17, medidas en −0.0013).
+`score()` todavía las espera en `self.struct`; hay que portarlo al esquema de
+tres cabezas + `grados_entidad.parquet` — está en la deuda de
+`continual_learning.md`.
 
 Expone la MISMA interfaz que `score_nodes`: una función que recibe índices de
 nodo y devuelve un vector alineado. Eso permite que el ciclo de continual
@@ -79,14 +84,17 @@ class HybridSystem:
 
 
 def cargar_struct(cfg) -> np.ndarray | None:
-    """Las 8 columnas estructurales, o None si el paso `graph` es antiguo."""
-    from src.hybrid.features import load_struct, ruta
-    if not ruta(cfg).exists():
-        log.warning("Falta %s: el sistema opera en modo GNN sola",
-                    ruta(cfg).name)
-        return None
-    struct, _ = load_struct(cfg)
-    return struct
+    """
+    Siempre None: las 8 columnas estructurales SE RETIRARON (2026-08-17).
+
+    Medidas en su momento: −0.0013 de PR-AUC — una versión pobre de lo que ya
+    calcula la GNN, duplicando C1-C14 y D1-D15. `features.py` se eliminó (está
+    en el historial de git si hiciera falta); esta función se conserva porque
+    `HybridSystem` ya acepta `struct=None` y así el CL no necesita cambios al
+    reactivarse. El equivalente vigente y medido son los `__grado_*` de
+    `grados_entidad.parquet`, que las cabezas ya reciben vía `cargar_tabla`.
+    """
+    return None
 
 
 def cargar_cabeza(cfg, nombre: str = "hybrid_head_prod.json"):

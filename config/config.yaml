@@ -245,6 +245,15 @@ gnn:
   # [256,128,64] daría un vector de 64 — más estrecho que el de una sola capa.
   #
   mlp_head_dim: 32                 # cabeza clasificadora: última capa -> 32 -> 1
+  # EXPERIMENTO ancho-del-embedding. Si > 0, PISA el mlp_head_dim que haya
+  # elegido Optuna, SOLO al entrenar (aplicar_hiperparametros); los checkpoints
+  # ya entrenados conservan el suyo. Motivo: la corrida 2026-08-17 salió con
+  # embedding de 64 columnas (Optuna) y aporte −0.0207 significativo; el embv_
+  # de 16 columnas de la fase anterior aportaba +0.0053. Este flag mide si el
+  # daño escala con el ancho. Uniforme para todas las arquitecturas — no viola
+  # la regla de "nada de hiperparámetros a mano PARA UNA CABEZA": esto es de la
+  # GNN y las tres cabezas lo heredan por igual. DEVOLVER A 0 al terminar.
+  forzar_mlp_head_dim: 0
   dropout: 0.2
   fanouts: [15, 10, 5]             # vecinos por salto; se usan los primeros N
   # Lotes pequeños dan gradientes más ruidosos, que ayudan a escapar de

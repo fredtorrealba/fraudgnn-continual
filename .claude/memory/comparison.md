@@ -57,32 +57,54 @@ llamarlo antes de los imports pesados o el intérprete muere con SIGSEGV.
 
 # RESULTADOS
 
-## ⚠️ La corrida 2026-08-17 está CONTAMINADA — repetir embed→heads→final
+## El estado actual (corrida 2026-08-17, entrada v2 + fix de fanouts en embed)
 
-El veredicto de abajo (−0.0201 significativo) se midió con un embedding
-DEFECTUOSO: `embed.py` pasaba el cfg global a `embed_and_score_nodes`, así que
-el loader muestreó los 2 saltos del config mientras la red ganadora (256×3,
-primera vez que gana 3 capas) esperaba 3. Entrenó viendo 3 saltos y describió
-viendo 2: la tercera capa agregó vecindarios truncados. Arreglado en embed.py
-(pasa `c` de `cfg_arquitectura`) con guarda en `validate.py` que ahora revienta
-ante el mismatch. **Los números de la GNN (sección 1) siguen siendo válidos**
-— el bug solo afecta al parquet del embedding, no al entrenamiento ni a la
-selección (`compare_gnns` ya hacía `cfg = c`). Rehacer solo embed→heads→final.
-
-## El estado de la corrida 2026-08-17 (entrada v2 — veredicto PENDIENTE de repetir)
+La primera pasada de esta corrida salió con un embedding DEFECTUOSO: `embed.py`
+pasaba el cfg global a `embed_and_score_nodes` y el loader muestreó los 2
+saltos del config mientras la ganadora (256×3, primera vez que gana 3 capas)
+esperaba 3. Latente mientras ganaban redes de 2 capas; lo cazó el usuario. Se
+arregló (embed pasa el cfg de `cfg_arquitectura`; guarda en `validate.py` que
+revienta ante el mismatch) y se repitió embed→heads→final. **El veredicto casi
+no se movió** (−0.0201 → −0.0207): el truncamiento afectaba sobre todo a
+`embv_`, y el resultado negativo es robusto al fix. `control` salió idéntico
+(no toca el embedding) y `gnn_score` casi idéntico (el camino completo lo
+dominan las features propias, que el truncamiento no tocaba) — dos coherencias
+internas que validan la repetición.
 
 ```
 EXAMEN — 21.284 txn · 876 fraudes (4,12%)
 
                    PR-AUC   ROC      recall@2%
 control            0.3341   0.8321     0.2614
-gnn_mas_tabular    0.3140   0.8241     0.2352
-solo_gnn           0.2078   0.7375     0.1884
+gnn_mas_tabular    0.3134   0.8246     0.2352
+solo_gnn           0.2041   0.7370     0.1884
 gnn_sola           0.2024   0.7166     0.1667
 
-APORTE DEL GRAFO   -0.0201   IC95 [-0.0349, -0.0043]   SIGNIFICATIVO (negativo)
-                   P(delta > 0) = 0.013
+APORTE DEL GRAFO   -0.0207   IC95 [-0.0359, -0.0039]   SIGNIFICATIVO (negativo)
+                   P(delta > 0) = 0.007
 ```
+
+**El corte por historial refuerza el diagnóstico de drift/redundancia** y
+descarta la objeción de MEJORAS punto 0 en esta configuración: el híbrido no
+pierde solo en clientes nuevos — pierde MÁS donde el grafo más sabe:
+
+```
+              n      control   híbrido   delta
+nuevo       9.186     0.349     0.338    -0.011
+conocido    5.201     0.139     0.135    -0.004
+habitual    6.897     0.374     0.325    -0.049   ← el peor, con >=3 previas
+```
+
+Y en `nuevo`, `gnn_sola` (0.352) EMPATA con control (0.349): la red sola
+compite justo donde "no debería" poder. La señal existe; combinarla resta.
+
+**La consistencia temporal por columna (MEJORAS punto 6) también quedó
+medida** y descarta la otra hipótesis barata: `embv_` mediana 0.6515→0.6169,
+solo 1 inversión débil de 64, cero fuertes. No hay dimensiones que arrastren:
+la degradación es PAREJA, así que la poda no aplica. Lo que queda vivo:
+redundancia (0.65 de AUC por dimensión es el régimen «redundante con lo
+tabular» de gnn.md) + drift uniforme + 64 columnas donde antes eran 16. El
+siguiente control es `mlp_head_dim: 16` (reentrenar solo la ganadora, en pod).
 
 **Dos hechos a la vez, y no se contradicen:**
 
@@ -132,7 +154,8 @@ La historia importa porque el primer número parecía concluyente y era falso.
 | sin overrides (A1) | −0.0110 | [−0.0210, −0.0017] | **sí** |
 | + `optuna_modo: compartido` (A3) | −0.0012 | [−0.0093, +0.0060] | no |
 | + E0/E1/E2, hiperparámetros nuevos | −0.0058 | [−0.0209, +0.0089] | no |
-| + entrada v2 (normalización causal, flags, grados, embedding 64d) | −0.0201 | [−0.0349, −0.0043] | **CONTAMINADA** (embed con 2 saltos para red de 3 capas) |
+| + entrada v2 (normalización causal, flags, grados, embedding 64d) | −0.0201 | [−0.0349, −0.0043] | contaminada (embed con 2 saltos para red de 3 capas) |
+| + fix fanouts en embed (3 saltos completos) | −0.0207 | [−0.0359, −0.0039] | **sí (negativo)** |
 
 La última fila NO es un artefacto de medición como las dos primeras: la
 simetría se mantuvo (misma ablación, Optuna compartido, grados a las tres). Lo

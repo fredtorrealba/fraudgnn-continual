@@ -16,8 +16,10 @@ toda la señal.
 POR QUÉ NO HAY COLUMNAS ESTRUCTURALES
 Las 8 de `features.py` (n_vecinos, monto_medio_vecinos...) se midieron y dieron
 -0,0013 de PR-AUC: son una versión pobre de lo que ya calcula la GNN y duplican
-las columnas C1-C14 y D1-D15 del propio dataset. Se retiran para que la
-comparación tenga UNA sola diferencia entre `control` y `gnn_mas_tabular`.
+las columnas C1-C14 y D1-D15 del propio dataset. Se retiraron para que la
+comparación tenga UNA sola diferencia entre `control` y `gnn_mas_tabular`, y
+el archivo se eliminó (historial de git). El sustituto vigente y medido son
+los `__grado_*` de `grados_entidad.parquet`, para las TRES cabezas.
 """
 import json
 import sys
@@ -128,15 +130,14 @@ def cargar_tabla(cfg, oof_window: str | None) -> tuple[pd.DataFrame, list[str]]:
         cols_base = json.load(f)["feature_cols"]
 
     if oof_window:
-        # `embed` (una red) o `gnn_oof_*` (el esquema antiguo de K redes). Se
-        # prefiere el primero: el del OOF mezclaba los ejes de varias redes en
-        # las mismas 32 columnas y hundía las cabezas.
+        # Solo `embed` (una red). El fallback al parquet del OOF (K redes) se
+        # eliminó en 2026-08-17: cada red aprendía SUS ejes latentes y mezclar
+        # K sistemas de coordenadas en las mismas columnas hundía las cabezas
+        # (medido: la cabeza mixta cortó en 2 árboles contra 517 del control).
+        # Mejor fallar aquí con instrucción que degradar en silencio.
         ruta = proc / "gnn_embed.parquet"
         if not ruta.exists():
-            ruta = proc / f"gnn_oof_{oof_window}.parquet"
-            log.warning("Usando el parquet del OOF (%s): sus 32 columnas vienen "
-                        "de K redes distintas y NO son comparables entre sí. "
-                        "Corre la etapa `embed`.", ruta.name)
+            raise SystemExit(f"Falta {ruta.name}: corre la etapa `embed`.")
         oof = pd.read_parquet(ruta)
         # EL CONTRATO: `node_idx` es el índice de FILA de full.parquet, que a su
         # vez es el índice de nodo del grafo. La unión de abajo es posicional,

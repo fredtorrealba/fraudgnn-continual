@@ -41,7 +41,7 @@ dimensión 7 de la red A no significa lo mismo que la dimensión 7 de la red B, 
 mezclarlas en las mismas columnas hundía las cabezas — medido: la cabeza mixta
 cortó en **2 árboles** contra 517 del control.
 
-`oof.py` se conserva pero **no está en el pipeline**. Si algún día hace falta
+`oof.py` **se eliminó** (2026-08-17, está en git). Si algún día hace falta
 refit con ventanas cortas, el camino no es resucitar el OOF de embeddings sino
 usar un **escalar calibrado** (`gnn_score`): una probabilidad sí es comparable
 entre redes, las dimensiones crudas no.
@@ -167,10 +167,19 @@ Optuna con techo de 1000 y paraba solo en 379.
 
 El código ya avisaba y nadie leyó el WARNING. Si lo pones, ponlo en las **tres**.
 
-## features.py
+## Eliminados en 2026-08-17 — lo que no funcionó no se queda
 
-Las columnas estructurales que consume la cabeza sin cargar torch. Van a parquet
-y no al grafo porque quien las consume es XGBoost.
+- **`features.py`** (las 8 columnas estructurales): medidas en −0.0013 de
+  PR-AUC y retiradas del diseño hacía tiempo; el archivo seguía y hasta
+  referenciaba `graph.max_edges_per_node`, una clave del grafo homogéneo que
+  ya no existe. El sustituto vigente son los `__grado_*` de
+  `grados_entidad.parquet`. `system.cargar_struct()` devuelve `None` (con el
+  porqué en su docstring) para que el CL no necesite cambios al reactivarse.
+- **`oof.py`** (K redes describiendo folds): lo sustituyó `embed` — K redes
+  aprenden K sistemas de ejes y mezclarlos hundía las cabezas (la mixta cortó
+  en 2 árboles contra 517). También se quitó el fallback a `gnn_oof_*` en
+  `cargar_tabla`: ahora sin `gnn_embed.parquet` FALLA con instrucción, en vez
+  de degradar con un warning que nadie lee. Ambos están en el historial de git.
 
 ## system.py / head_cl.py — dormidos con el CL
 
@@ -180,7 +189,7 @@ constante.
 
 Ninguno de los dos está en el pipeline actual (`CL_ACTIVO = False`). Al
 reactivarlos hay que revisarlos contra el esquema de tres cabezas: se escribieron
-para el de cuatro variantes numeradas.
+para el de cuatro variantes numeradas y `score()` aún espera `self.struct`.
 
 ## Si tocas esto, revisa
 

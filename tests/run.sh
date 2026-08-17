@@ -55,6 +55,8 @@ correr "salud · ninguna entidad se cayó en silencio" \
        tests/test_salud_grafo.py "necesita el grafo construido"
 correr "SMOTE · solo sintetiza fraude y respeta el ratio" \
        tests/test_smote.py "necesita la etapa embed"
+correr "embedding · ninguna columna se invierte en el tiempo" \
+       tests/test_consistencia_embedding.py "necesita la etapa embed"
 correr "A2 · el muestreo solo mira hacia atrás" \
        tests/test_causalidad_muestreo.py "necesita el grafo construido"
 correr "recencia · baja las N más recientes anteriores" \
