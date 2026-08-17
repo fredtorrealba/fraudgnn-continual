@@ -356,7 +356,14 @@ def buscar_hiperparametros(model_name: str, cfg) -> dict:
         # rechaza con un ValueError). El rango 1-2 venía del grafo homogéneo,
         # donde una capa sí tenía sentido; aquí hacía fallar el primer trial.
         g["hidden_dims"] = [ancho] * trial.suggest_int("capas", 2, 3)
-        g["mlp_head_dim"] = trial.suggest_categorical("mlp_head_dim", [16, 32, 64])
+        # Con el ancho del embedding DECIDIDO (forzar_mlp_head_dim, ver config)
+        # el trial no lo sortea: si lo sorteara, lr y dropout se afinarían bajo
+        # un ancho que aplicar_hiperparametros va a pisar después, y la
+        # búsqueda optimizaría una red que nunca se entrena. OJO: cambiar el
+        # flag invalida el caché de Optuna (reports/optuna_*) por lo mismo.
+        forzar = int(g.get("forzar_mlp_head_dim", 0) or 0)
+        g["mlp_head_dim"] = forzar or trial.suggest_categorical(
+            "mlp_head_dim", [16, 32, 64])
         g["in_dim"] = data["transaction"].x.shape[1]
         wd = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
         # épocas cortas: la búsqueda compara configuraciones, no exprime cada una
@@ -532,9 +539,10 @@ def aplicar_hiperparametros(cfg, best: dict) -> dict:
     # checkpoint, o load_state_dict reventaría por dimensiones.
     forzar = int(g.get("forzar_mlp_head_dim", 0) or 0)
     if forzar:
-        log.warning("EXPERIMENTO: mlp_head_dim FORZADO a %d (Optuna eligió %s). "
-                    "Devuelve gnn.forzar_mlp_head_dim a 0 al terminar.",
-                    forzar, best.get("mlp_head_dim"))
+        log.info("mlp_head_dim = %d por decisión adoptada (config: "
+                 "forzar_mlp_head_dim; Optuna había elegido %s). Ver el "
+                 "porqué medido en config.yaml.",
+                 forzar, best.get("mlp_head_dim", "—"))
         g["mlp_head_dim"] = forzar
     return cfg
 

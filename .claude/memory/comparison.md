@@ -101,10 +101,53 @@ compite justo donde "no debería" poder. La señal existe; combinarla resta.
 **La consistencia temporal por columna (MEJORAS punto 6) también quedó
 medida** y descarta la otra hipótesis barata: `embv_` mediana 0.6515→0.6169,
 solo 1 inversión débil de 64, cero fuertes. No hay dimensiones que arrastren:
-la degradación es PAREJA, así que la poda no aplica. Lo que queda vivo:
-redundancia (0.65 de AUC por dimensión es el régimen «redundante con lo
-tabular» de gnn.md) + drift uniforme + 64 columnas donde antes eran 16. El
-siguiente control es `mlp_head_dim: 16` (reentrenar solo la ganadora, en pod).
+la degradación es PAREJA, así que la poda no aplica.
+
+## El experimento del ancho (2026-08-17, `forzar_mlp_head_dim: 16`) — cierra el mecanismo
+
+Misma búsqueda de Optuna, misma arquitectura (256×3), solo el embedding pasa
+de 64 a 16 columnas. Reentrenó solo graphsage; experimento DECLARADO (el
+examen ya se había consultado en esta fase).
+
+```
+                           embedding 64d          embedding 16d
+aporte del grafo           −0.0207                −0.0040
+IC95                       [−0.0359, −0.0039]     [−0.0187, +0.0110]
+significativo              SÍ (negativo)          NO
+% ganancia del embedding   46.7%                  23.7%
+gnn_mas_tabular examen     0.3134                 0.3301   (control 0.3341)
+```
+
+**El daño escala con el ancho**: 64 columnas correlacionadas y decadentes son
+material de sobreajuste para XGBoost; con 16 el daño desaparece — pero NO se
+vuelve aporte. El resultado del capstone queda cerrado en dos frases:
+
+> La señal del grafo existe y es real (la red sola: ROC 0.73, PR-AUC 0.20 en
+> el examen, 4× lo que valía sin normalizar). Pero en una ventana de 2 meses
+> es redundante con lo tabular: combinarla aporta cero en el mejor caso
+> (16d, −0.0040 n.s.) y resta de forma medible cuando el embedding es ancho
+> (64d, −0.0207 significativo).
+
+**El matiz por historial que merece ir en la memoria** (16d): el híbrido GANA
+en clientes nuevos (0.3659 vs 0.3492, +0.017) y PIERDE en habituales (0.3293
+vs 0.3737, −0.044). Lo contrario de la intuición de MEJORAS punto 0: donde hay
+historial, lo tabular ya lo tiene todo (las V/C/D eran agregados de cliente) y
+el embedding solo mete ruido decadente; donde NO hay historial, los patrones
+generales que la red aprendió del grafo sí añaden algo. Si el grafo tiene un
+futuro en este dataset, es como señal para clientes NUEVOS — justo donde el
+punto 0 asumía que no podía hacer nada.
+
+Con `mlp_head_dim` 16, `solo_gnn` baja a 0.1925 (menos capacidad sola) pero el
+combinado sube: menos es más cuando la cabeza es un modelo de árboles con una
+ventana corta. Optuna eligió 64 optimizando la RED aislada — lo que optimiza a
+la red no es lo que optimiza al sistema.
+
+**DECISIÓN ADOPTADA:** `gnn.forzar_mlp_head_dim: 16` queda como configuración
+del proyecto (config.yaml, con el porqué). La justificación NO usa el examen:
+16d también gana en `cabezas_validan` (0.3862 vs 0.3812), que es la ventana
+legítima de decisión, y coincide con la evidencia de la fase anterior; el
+examen solo confirmó. En la memoria del capstone se reportan LAS DOS corridas
+(la protocolar de Optuna-64 y la de 16): juntas son el hallazgo.
 
 **Dos hechos a la vez, y no se contradicen:**
 
@@ -156,6 +199,7 @@ La historia importa porque el primer número parecía concluyente y era falso.
 | + E0/E1/E2, hiperparámetros nuevos | −0.0058 | [−0.0209, +0.0089] | no |
 | + entrada v2 (normalización causal, flags, grados, embedding 64d) | −0.0201 | [−0.0349, −0.0043] | contaminada (embed con 2 saltos para red de 3 capas) |
 | + fix fanouts en embed (3 saltos completos) | −0.0207 | [−0.0359, −0.0039] | **sí (negativo)** |
+| + `forzar_mlp_head_dim: 16` (experimento de ancho, declarado) | −0.0040 | [−0.0187, +0.0110] | no |
 
 La última fila NO es un artefacto de medición como las dos primeras: la
 simetría se mantuvo (misma ablación, Optuna compartido, grados a las tres). Lo

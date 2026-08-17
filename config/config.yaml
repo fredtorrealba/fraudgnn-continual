@@ -217,8 +217,13 @@ gnn:
   # ablación y de las features derivadas, así que no intentes cuadrarlo.
   in_dim: 70                       # 63 tabulares + hora/posición + grados
   # --- PROFUNDIDAD: cada capa es un SALTO en el grafo -------------------------
-  # Descomenta UNA. El número de capas es len(hidden_dims) y los `fanouts` se
-  # recortan solos a esa longitud (src/gnn/sampling.py: fanouts()).
+  # Descomenta UNA. El número de capas es len(hidden_dims), y el muestreo trae
+  # exactamente esa cantidad de saltos: fanouts_hetero (src/gnn/sampling.py)
+  # construye [graph.vecinos_por_entidad] * len(hidden_dims) por tipo de
+  # arista. Los trials de Optuna y el entrenamiento final usan SU copia del
+  # cfg con sus capas, así que capas y saltos no pueden descuadrarse — el
+  # único camino que lo rompía (embed con el cfg global) tiene guarda desde
+  # 2026-08-17.
   #
   # Homofilia medida sobre este dataset (separación fraude vs legítima):
   #     1 salto  ->  3.9x   <- toda la señal está aquí
@@ -245,17 +250,24 @@ gnn:
   # [256,128,64] daría un vector de 64 — más estrecho que el de una sola capa.
   #
   mlp_head_dim: 32                 # cabeza clasificadora: última capa -> 32 -> 1
-  # EXPERIMENTO ancho-del-embedding. Si > 0, PISA el mlp_head_dim que haya
-  # elegido Optuna, SOLO al entrenar (aplicar_hiperparametros); los checkpoints
-  # ya entrenados conservan el suyo. Motivo: la corrida 2026-08-17 salió con
-  # embedding de 64 columnas (Optuna) y aporte −0.0207 significativo; el embv_
-  # de 16 columnas de la fase anterior aportaba +0.0053. Este flag mide si el
-  # daño escala con el ancho. Uniforme para todas las arquitecturas — no viola
-  # la regla de "nada de hiperparámetros a mano PARA UNA CABEZA": esto es de la
-  # GNN y las tres cabezas lo heredan por igual. DEVOLVER A 0 al terminar.
-  forzar_mlp_head_dim: 0
+  # ANCHO DEL EMBEDDING — DECISIÓN ADOPTADA (2026-08-17), no un experimento.
+  # Si > 0, PISA el mlp_head_dim que elija Optuna, SOLO al entrenar
+  # (aplicar_hiperparametros); los checkpoints ya entrenados conservan el suyo.
+  #
+  # Por qué 16 y no lo que diga Optuna: Optuna optimiza la RED aislada y eligió
+  # 64, pero lo que consume el embedding es una cabeza de ÁRBOLES con ventana
+  # corta, y 64 columnas correlacionadas y con drift son material de
+  # sobreajuste. Medido (mismos hiperparámetros, solo cambia el ancho):
+  #     64d  cabezas_validan 0.3812 · aporte examen −0.0207 SIGNIFICATIVO
+  #     16d  cabezas_validan 0.3862 · aporte examen −0.0040 n.s.
+  # La decisión se tomó en cabezas_validan (la ventana legítima); el examen la
+  # confirmó. Coincide con la fase anterior: embv 16d +0.0053, emb 64d −0.0325.
+  #
+  # Uniforme para todas las arquitecturas — no viola la regla de "nada de
+  # hiperparámetros a mano PARA UNA CABEZA": esto es de la GNN y las tres
+  # cabezas lo heredan por igual. Con 0 vuelve a mandar Optuna.
+  forzar_mlp_head_dim: 16
   dropout: 0.2
-  fanouts: [15, 10, 5]             # vecinos por salto; se usan los primeros N
   # Lotes pequeños dan gradientes más ruidosos, que ayudan a escapar de
   # mínimos locales. Con balanceo de semillas, 256 son 128 fraudes + 128
   # normales por lote.

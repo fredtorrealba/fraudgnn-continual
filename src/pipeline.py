@@ -341,7 +341,11 @@ def archivar(cfg, nombre: str | None = None,
         "archivos": movidos,
         "config": {
             "capas": len(g["hidden_dims"]), "hidden_dims": g["hidden_dims"],
-            "fanouts": g["fanouts"], "batch_size": g["batch_size"],
+            # Lo que MANDA en el muestreo heterogéneo. La clave vieja
+            # `gnn.fanouts` era del grafo homogéneo: el sampler actual la
+            # ignoraba y archivarla sugería un control que no existía.
+            "vecinos_por_entidad": (cfg.get("graph") or {}).get("vecinos_por_entidad"),
+            "batch_size": g["batch_size"],
             "epochs": g["epochs"], "patience": g["patience"],
             "num_workers": g.get("num_workers"), "seeds": g["seeds"],
             "n_jobs": (cfg.get("compute") or {}).get("n_jobs"),
@@ -478,8 +482,12 @@ def listar_historial(cfg):
         c = meta.get("config", {})
         print(f"  {d.name}")
         if c:
+            # Los metas nuevos guardan `vecinos_por_entidad` (lo que manda en
+            # el sampler heterogéneo); los archivados antes de 2026-08-17
+            # traían la clave vieja `fanouts` del grafo homogéneo.
+            vec = c.get("vecinos_por_entidad") or c.get("fanouts")
             print(f"    capas={c.get('capas')} {c.get('hidden_dims')} "
-                  f"fanouts={c.get('fanouts')} batch={c.get('batch_size')}")
+                  f"vecinos={vec} batch={c.get('batch_size')}")
         r = meta.get("resumen", {})
         if "gnn" in r:
             g = r["gnn"]
