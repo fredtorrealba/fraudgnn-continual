@@ -101,6 +101,35 @@ def main(escribir_json: bool):
             n_f = ex.get("n_fraud", 0)
             print(f"   {k:<20}{v:>9.4f}   {int(v * n_f):>4} de {n_f} fraudes")
 
+    # ── 4b. por historial del cliente ────────────────────────────────────
+    # El grafo SOLO puede aportar donde el cliente tiene transacciones
+    # anteriores. Un promedio sobre toda la población lo diluye con las filas
+    # donde el grafo no tiene nada que decir.
+    hist = ex.get("por_historial") or []
+    if hist:
+        out["por_historial"] = hist
+        print(f"\n  POR HISTORIAL DEL CLIENTE (uid)")
+        print("  " + "-" * 72)
+        modelos = list(hist[0]["modelos"])
+        print(f"   {'grupo':<11}{'txn':>7}{'fraudes':>9}{'%fr':>7}"
+              + "".join(f"{m[:14]:>15}" for m in modelos))
+        for f in hist:
+            fila = "".join(
+                f"{(f['modelos'][m]['pr_auc'] if f['modelos'][m]['pr_auc'] is not None else 0):>15.4f}"
+                for m in modelos)
+            print(f"   {f['grupo']:<11}{f['n']:>7}{f['n_fraud']:>9}"
+                  f"{f['pct_fraude']:>6.1f}%{fila}")
+        if "control" in modelos and "gnn_mas_tabular" in modelos:
+            print(f"\n   aporte del grafo por grupo:")
+            for f in hist:
+                c = f["modelos"]["control"]["pr_auc"]
+                g = f["modelos"]["gnn_mas_tabular"]["pr_auc"]
+                if c is not None and g is not None:
+                    print(f"     {f['grupo']:<11}{g - c:+.4f}"
+                          f"   ({f['modelos']['gnn_mas_tabular']['capturados']} "
+                          f"contra {f['modelos']['control']['capturados']} "
+                          f"fraudes capturados de {f['n_fraud']})")
+
     # ── 5. el veredicto ──────────────────────────────────────────────────
     a = fc.get("atribucion")
     if a:

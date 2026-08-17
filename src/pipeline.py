@@ -233,7 +233,8 @@ COMPARTIDAS = [("models_dir", "xgboost_baseline.json"),
                ("reports_dir", "xgboost_val_metrics.json")]
 
 
-def archivar(cfg, nombre: str | None = None) -> Path:
+def archivar(cfg, nombre: str | None = None,
+             borrar_raw: bool = False) -> Path:
     """
     MUEVE los resultados de la corrida actual a historial/<fecha>_<nombre>/.
 
@@ -241,9 +242,9 @@ def archivar(cfg, nombre: str | None = None) -> Path:
     config.yaml que los produjo — sin esa copia, un resultado antiguo no se
     puede interpretar (¿cuántas capas tenía? ¿qué batch_size?).
 
-    Y se BORRA data/ entero: archivar cierra la corrida y deja el repositorio
-    en cero. No se copia porque pesa GB y es determinista — con el config
-    archivado se reconstruye igual, y la huella del grafo lo verifica.
+    Después se borra lo DERIVADO de data/ (processed/ y graph/), que es
+    determinista a partir de raw/ + config. `raw/` se conserva salvo que se
+    pida `borrar_raw`: son ~650 MB que solo vuelven descargándolos de Kaggle.
     """
     import re, shutil, subprocess
     from datetime import datetime
@@ -279,17 +280,34 @@ def archivar(cfg, nombre: str | None = None) -> Path:
 
     # feature_cols.json (5 KB) define QUÉ vio el modelo: sin él un resultado
     # archivado no se puede reinterpretar. Barato y necesario.
-    fc = resolve(cfg, "processed_dir") / "feature_cols.json"
-    if fc.exists():
-        shutil.copy2(fc, destino / "feature_cols.json")
+    # Estos dos describen QUÉ vio el modelo y sobre qué grafo. Juntos pesan
+    # unos 10 KB y sin ellos un resultado archivado no se puede reinterpretar:
+    # feature_cols dice las columnas, graph_meta las entidades, sus grados y
+    # qué podas estaban activas.
+    for clave, nombre_f in (("processed_dir", "feature_cols.json"),
+                            ("graph_dir", "graph_meta.json")):
+        f = resolve(cfg, clave) / nombre_f
+        if f.exists():
+            shutil.copy2(f, destino / nombre_f)
 
-    # graph_scored.pt lo PRODUCE la corrida (paso cl) pero cae en data/, así que
-    # se mueve aquí igual que los reports. graph.pt NO: es determinista a partir
-    # de full.parquet + la sección graph: del config, y pesa 1.3 GB.
-    gs = resolve(cfg, "graph_dir") / "graph_scored.pt"
-    if gs.exists():
-        shutil.move(str(gs), str(destino / "graph_scored.pt"))
-        movidos += 1
+    # RESULTADOS que caen en data/ pero NO son datos de entrada. Se mueven con
+    # el resto: son salidas de una etapa y sin ellas el archivo no se puede
+    # reinterpretar ni reejecutar `final`.
+    #
+    #   gnn_embed.parquet  lo produce `embed`. Regenerarlo exige el sampler
+    #                      nativo (pyg-lib) y por tanto una máquina con GPU;
+    #                      dejarlo fuera obligaba a volver al pod solo para eso.
+    #   graph_scored.pt    lo produce el CL (hoy desactivado).
+    #
+    # graph.pt y full.parquet NO: son deterministas a partir de raw/ + config,
+    # y pesan cientos de MB. La huella del grafo en meta.json permite verificar
+    # que el reconstruido es el mismo.
+    for clave, nombre_f in (("graph_dir", "graph_scored.pt"),
+                            ("processed_dir", "gnn_embed.parquet")):
+        f = resolve(cfg, clave) / nombre_f
+        if f.exists():
+            shutil.move(str(f), str(destino / nombre_f))
+            movidos += 1
 
     # El log se MUEVE (no se copia): así cada archivo conserva el suyo y la
     # corrida siguiente arranca con pipeline.log limpio, sin arrastrar el
@@ -332,12 +350,21 @@ def archivar(cfg, nombre: str | None = None) -> Path:
         log.info("   %d copiadas (no movidas): el baseline XGBoost se conserva "
                  "para que no haya que reentrenarlo", copiados)
 
-    # data/ se borra ENTERO: archivar significa cerrar la corrida y dejar el
-    # repositorio en cero. Es reproducible porque el config.yaml viaja con el
-    # archivo, y la huella del grafo (nodos/aristas/features) permite verificar
-    # que el reconstruido es el mismo.
+    # Se borra lo DERIVADO, no lo descargado.
+    #
+    # `raw/` se conserva a propósito: son ~650 MB que solo se recuperan
+    # volviendo a Kaggle, con credenciales y red. Borrarlo convertía un
+    # `--archive` en media hora de trabajo para volver al punto de partida —
+    # pasó el 16/08. `processed/` y `graph/` sí se van: son deterministas a
+    # partir de raw/ + config, y el config viaja dentro del archivo.
+    #
+    # Con `--archive-todo` se borra también raw/, para cuando de verdad se
+    # quiera liberar el disco del pod antes de terminarlo.
+    borrar = ["processed_dir", "graph_dir"]
+    if borrar_raw:
+        borrar.append("raw_dir")
     borrados, bytes_ = 0, 0
-    for clave in ("raw_dir", "processed_dir", "graph_dir"):
+    for clave in borrar:
         for f in resolve(cfg, clave).iterdir():
             if f.name == ".gitkeep" or f.name.startswith("."):
                 continue
@@ -345,11 +372,14 @@ def archivar(cfg, nombre: str | None = None) -> Path:
             f.unlink()
             borrados += 1
     if borrados:
-        log.info("data/ vaciado: %d archivos, %.1f GB liberados",
-                 borrados, bytes_ / 1073741824)
+        log.info("Borrado lo derivado: %d archivos, %.1f GB liberados%s",
+                 borrados, bytes_ / 1073741824,
+                 "" if borrar_raw else " (raw/ se conserva)")
 
     log.info("Todo limpio. La corrida siguiente arranca desde cero:")
-    log.info("  bash scripts/run_pipeline.sh          (~7 min de datos + entrenamiento)")
+    log.info("  bash scripts/run_pipeline.sh          %s",
+             "(~7 min de datos + entrenamiento)" if borrar_raw
+             else "(raw/ conservado: se salta la descarga)")
     return destino
 
 
@@ -522,10 +552,14 @@ def main():
                    help="Mostrar en qué va y salir (no ejecuta nada)")
     p.add_argument("--steps", action="store_true",
                    help="Explicar qué hace cada etapa y salir (no ejecuta nada)")
+    p.add_argument("--archive-todo", action="store_true",
+                   help="con --archive, borra también data/raw (~650 MB que "
+                        "solo se recuperan descargándolos de Kaggle)")
     p.add_argument("--archive", nargs="?", const="", metavar="NOMBRE",
-                   help="Archivar la corrida en historial/ (con el config que "
-                        "la produjo) y dejar models/, reports/, artifacts/ y "
-                        "data/ en cero. Sale sin ejecutar nada")
+                   help="Archivar la corrida en historial/ (con el config, el "
+                        "embedding y la huella del grafo) y dejar models/, "
+                        "reports/, artifacts/ y lo derivado de data/ en cero. "
+                        "raw/ se conserva. Sale sin ejecutar nada")
     p.add_argument("--history", action="store_true",
                    help="Listar las corridas archivadas y salir")
     p.add_argument("--only", metavar="PASOS",
@@ -562,7 +596,8 @@ def main():
         return 0
 
     if args.archive is not None:
-        archivar(cfg, args.archive or None)
+        archivar(cfg, args.archive or None,
+                 borrar_raw=getattr(args, 'archive_todo', False))
         return 0
 
     if args.steps:

@@ -44,6 +44,8 @@ from src.utils.common import (ensure_dirs, get_logger, load_config,  # noqa: E40
 from sklearn.metrics import average_precision_score  # noqa: E402
 from src.utils.metrics import full_report  # noqa: E402
 from src.utils.ventanas import verificar  # noqa: E402
+from src.data.build_graph import (_previas_por_entidad,  # noqa: E402
+                                  clave_entidad)
 
 log = get_logger("comparison")
 
@@ -73,6 +75,42 @@ def recall_at_precision(y, s, objetivo: float):
         return None, 0
     k = int(ok[-1]) + 1
     return float(tp[k - 1] / max(np.sum(y), 1)), k
+
+
+def historial_uid(df, cfg) -> np.ndarray:
+    """
+    Cuántas transacciones ANTERIORES tiene el `uid` de cada fila.
+
+    Se recalcula aquí en vez de leerlo del grafo para que el informe no dependa
+    de que `graph.pt` siga en disco, y con las MISMAS funciones que construyen
+    las aristas — si la clave cambia, este corte cambia con ella.
+
+    Causal por construcción: `_previas_por_entidad` cuenta lo que había ANTES,
+    nunca el total. Contar el total sería usar el futuro para decidir si un
+    cliente era conocido.
+    """
+    spec = (cfg["graph"]["entidades"] or {}).get("uid")
+    if not spec:
+        return np.zeros(len(df), dtype=np.int64)
+    claves = clave_entidad(df, spec)
+    pres = claves.notna()
+    prev = np.zeros(len(df), dtype=np.int64)
+    if pres.any():
+        import pandas as pd
+        cod, _ = pd.factorize(claves[pres], sort=False)
+        filas = np.where(pres.values)[0]
+        prev[filas] = _previas_por_entidad(cod, df["TransactionDT"].values[filas])
+    return prev
+
+
+# El hallazgo del 1er lugar de Kaggle: sus modelos daban AUC 0.997 en clientes
+# CONOCIDOS y 0.921 en desconocidos — ocho puntos de diferencia. Un promedio
+# sobre las dos poblaciones esconde eso.
+#
+# Y aquí importa el doble: el grafo SOLO puede aportar donde el cliente tiene
+# historial. Con el 62% de los uid en una sola transacción, el número global
+# mide el aporte del grafo mayormente donde el grafo no puede hacer nada.
+GRUPOS_HISTORIAL = (("nuevo", 0, 0), ("conocido", 1, 2), ("habitual", 3, None))
 
 
 def _confusion(y, s, thr):
@@ -256,6 +294,16 @@ def main():
     # dos ventanas que no entrenaron: `cabezas_validan` (diagnóstico) y `examen`
     # (el veredicto).
 
+    # Cuántas anteriores tiene el uid de cada fila. Se calcula UNA vez sobre el
+    # dataset entero: el historial de un cliente no depende de qué bloque se
+    # esté mirando.
+    historial = historial_uid(df, cfg)
+    log.info("Historial por uid: %d sin anteriores (%.1f%%), %d con 1-2, "
+             "%d con 3+", int((historial == 0).sum()),
+             100 * float((historial == 0).mean()),
+             int(((historial >= 1) & (historial <= 2)).sum()),
+             int((historial >= 3).sum()))
+
     cortes = (("cabezas_validan", "cabezas_validan"), ("examen", "examen"))
     for etiqueta, clave in cortes:
         sel = _v[clave]
@@ -290,6 +338,52 @@ def main():
             bloque["presupuesto"].append(fila)
             log.info("     %6d alertas (%5.1f%%) | %s", k, p,
                      " | ".join(f"{v} {fila[v]:.4f}" for v in scores))
+
+        # ── por HISTORIAL del cliente ──────────────────────────────────────
+        # El umbral es el GLOBAL del bloque, no uno por grupo: el equipo de
+        # revisión tiene UN presupuesto, no uno por tipo de cliente. Lo que se
+        # mide es dónde caen esas alertas.
+        prev = historial[sel]
+        bloque["por_historial"] = []
+        log.info("  -- por HISTORIAL del cliente (uid) --")
+        for nombre, lo, hi in GRUPOS_HISTORIAL:
+            g = (prev >= lo) if hi is None else ((prev >= lo) & (prev <= hi))
+            if g.sum() < 30 or y[g].sum() < 5:
+                log.info("     %-9s %6d txn — muy pocos para medir", nombre,
+                         int(g.sum()))
+                continue
+            fila = {"grupo": nombre, "previas": f">={lo}" if hi is None
+                    else (f"{lo}" if lo == hi else f"{lo}-{hi}"),
+                    "n": int(g.sum()), "n_fraud": int(y[g].sum()),
+                    "pct_fraude": round(100 * float(y[g].mean()), 2),
+                    "modelos": {}}
+            for v, s in scores.items():
+                sg = s[sel][g]
+                thr_v = bloque["modelos"][v]["umbral_usado"]
+                m = sg >= thr_v
+                tp = int((m & (y[g] == 1)).sum())
+                fila["modelos"][v] = {
+                    "pr_auc": round(float(average_precision_score(y[g], sg)), 4)
+                    if y[g].sum() and y[g].sum() < g.sum() else None,
+                    "alertas": int(m.sum()),
+                    "capturados": tp,
+                    "recall": round(tp / max(1, int(y[g].sum())), 4)}
+            bloque["por_historial"].append(fila)
+            log.info("     %-9s %6d txn · %4d fraudes (%4.1f%%) | %s",
+                     nombre, fila["n"], fila["n_fraud"], fila["pct_fraude"],
+                     " | ".join(f"{v} PR {fila['modelos'][v]['pr_auc']}"
+                                for v in scores
+                                if fila["modelos"][v]["pr_auc"] is not None))
+
+        # La comparación que responde la pregunta: ¿aporta el grafo MÁS donde el
+        # cliente tiene historial? Si el híbrido gana en `habitual` y pierde en
+        # `nuevo`, el promedio global estaba escondiendo el resultado.
+        if "control" in scores and "gnn_mas_tabular" in scores:
+            log.info("     %-9s %s", "aporte",
+                     " · ".join(
+                         f"{f['grupo']} {f['modelos']['gnn_mas_tabular']['pr_auc'] - f['modelos']['control']['pr_auc']:+.4f}"
+                         for f in bloque["por_historial"]
+                         if f["modelos"]["control"]["pr_auc"] is not None))
 
         log.info("  -- a IGUAL precisión --")
         for objetivo in PRECISIONES:
