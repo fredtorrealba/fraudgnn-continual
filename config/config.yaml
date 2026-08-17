@@ -258,8 +258,9 @@ gnn:
   # los fraudes concretos del entrenamiento. No se estaba aplicando en el
   # bucle principal, solo dentro de la búsqueda de Optuna.
   weight_decay: 0.0005
-  epochs: 50
-  patience: 10             # early stopping sobre PR-AUC de validación                      # early stopping sobre AUC de validación
+  epochs: 10
+  patience: 4              # con epochs 10, una paciencia de 10 nunca dispara:
+                           # el early stopping quedaba desactivado de facto
   # Épocas del paso `refit`. Vacío = usar el pico de la corrida ganadora, que
   # compare_gnns anota en selected_model.json. Poner un número aquí permite
   # relanzar SOLO el refit con otra cantidad, sin repetir las 6 corridas.
