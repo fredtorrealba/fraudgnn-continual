@@ -1,0 +1,42 @@
+# =============================================================================
+# FraudGNN — dependencias para macOS (Apple Silicon)
+#
+# USO (en dos pasos, el orden importa):
+#
+#   1) python3 -m venv .venv && .venv/bin/python -m pip install -r requirements-mac.txt
+#
+#   2) las DOS extensiones que no pueden vivir en un requirements —sus builds
+#      necesitan torch ya instalado y pip las aísla del entorno al compilar—
+#      se instalan aparte, en este orden:
+#
+#         .venv/bin/python -m pip install --no-build-isolation torch_scatter torch_sparse
+#
+# POR QUÉ ESTE ARCHIVO EXISTE APARTE DEL requirements.txt:
+#   · pyg_lib no está en PyPI: vive en el índice de PyG y su rueda depende de
+#     la versión EXACTA de torch. La línea --find-links de abajo apunta a las
+#     ruedas de macOS/CPU; si cambias de torch, cambia el número de la URL.
+#   · En Linux/pod nada de esto aplica: scripts/setup_runpod.sh detecta el
+#     torch y el CUDA de la imagen y elige las ruedas solo.
+#
+# Verificación al terminar:
+#   .venv/bin/python -c "import pyg_lib, torch_scatter, torch_sparse; print('sampler OK')"
+#
+# Con esto el Mac corre TODO: pipeline, cuaderno y los 10 invariantes
+# (entrenamiento en CPU — funcional, más lento que una GPU).
+# =============================================================================
+
+# todo lo común (numpy, pandas, torch-geometric, xgboost, optuna...)
+-r requirements.txt
+
+# torch para macOS: la rueda de PyPI ya trae soporte de Apple Silicon.
+# FIJADO a la serie que calza con la URL de pyg_lib de abajo.
+torch>=2.13,<2.14
+
+# el sampler nativo del grafo heterogéneo — ruedas OFICIALES para macOS arm64
+# (existen desde pyg_lib ~0.6; antes había que compilar y solía fallar)
+--find-links https://data.pyg.org/whl/torch-2.13.0+cpu.html
+pyg_lib
+
+# barras de progreso bonitas en Jupyter (el cuaderno las usa vía tqdm)
+ipywidgets>=8.0
+jupyter>=1.0

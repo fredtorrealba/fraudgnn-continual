@@ -136,10 +136,14 @@ duplicados**: dos transacciones con el mismo vecindario dan el mismo embedding,
 así que interpolar entre ellas devuelve ese vector. No es un fallo —solo pasa con
 columnas densas— pero está medido, y el umbral queda en 5%.
 
-### A2 y recencia — solo completos en el pod
+### A2 y recencia — completos donde esté el sampler nativo
 
-`pyg-lib` no tiene wheel para macOS arm64, y sin él PyG cae a un sampler que solo
-sabe grafos homogéneos. No es velocidad ni GPU: es una librería que falta.
+**Actualización 2026-08-18:** desde pyg_lib ~0.6 SÍ hay ruedas oficiales para
+macOS arm64 — `pip install pyg_lib -f https://data.pyg.org/whl/torch-<TORCH>+cpu.html`
+— y con ellas estos dos tests corren COMPLETOS en Mac (verificado: 32.386
+vecinos, 0 posteriores; 0 fuera de las 10 más recientes). El texto de abajo era
+cierto cuando se escribió; el `SALTADO` de run.sh solo aparece ya si el sampler
+no está instalado.
 
 En el pod, verificados:
 
