@@ -16,6 +16,7 @@ data/raw/*
 data/processed/*
 data/graph/*
 models/*
+runpod
 artifacts/*
 reports/*
 historial/*
